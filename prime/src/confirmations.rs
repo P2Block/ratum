@@ -2,7 +2,7 @@ use crate::server::Server;
 use log::{error, info, warn};
 use ratum::lock;
 use ratum_prime::ledger::{ConfirmationReading, Ledger};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const INTERVAL: Duration = Duration::from_secs(5 * ratum::SECS_PER_MINUTE);
@@ -33,9 +33,17 @@ fn due(ledger: &Ledger) -> Vec<[u8; 32]> {
 }
 
 fn check_once(server: &Server) {
-    for hash in due(&lock(&server.ledger)) {
+    check_blocks(&server.ledger, |display| server.node.block_confirmations(display));
+}
+
+fn check_blocks<E: std::fmt::Display>(
+    ledger: &Mutex<Ledger>,
+    read: impl Fn(&str) -> Result<Option<i64>, E>,
+) {
+    let pending = due(&lock(ledger));
+    for hash in pending {
         let display = hex::encode(hash);
-        let confirmations = match server.node.block_confirmations(&display) {
+        let confirmations = match read(&display) {
             Ok(Some(c)) => c,
             Ok(None) => {
                 warn!(
@@ -50,7 +58,7 @@ fn check_once(server: &Server) {
             }
         };
         let state = ConfirmationReading { checked_at: ratum::unix_now(), confirmations };
-        let mut l = lock(&server.ledger);
+        let mut l = lock(ledger);
         let previous = match l.record_confirmations(hash, state) {
             Ok(previous) => previous,
             Err(e) => {
@@ -171,5 +179,23 @@ mod tests {
         );
         assert!(ConfirmationReading { checked_at: 1, confirmations: 6 }.on_best_chain());
         assert!(!ConfirmationReading { checked_at: 1, confirmations: -1 }.on_best_chain());
+    }
+
+    #[test]
+    fn a_pass_records_every_reading_and_does_not_hold_the_ledger_lock_across_the_loop() {
+        let ledger = Arc::new(Mutex::new(with_blocks(&[(1, None), (2, Some(3))])));
+        let (finished, done) = std::sync::mpsc::channel();
+        let shared = Arc::clone(&ledger);
+        std::thread::spawn(move || {
+            check_blocks(&shared, |_| Ok::<_, String>(Some(7)));
+            finished.send(()).unwrap();
+        });
+        done.recv_timeout(Duration::from_secs(5)).expect(
+            "the pass did not finish: it locks the ledger inside the loop, so holding the lock \
+             across the loop deadlocks the thread",
+        );
+        let l = lock(&ledger);
+        assert_eq!(l.confirmations(&hash(1)).map(|s| s.confirmations), Some(7));
+        assert_eq!(l.confirmations(&hash(2)).map(|s| s.confirmations), Some(7));
     }
 }
