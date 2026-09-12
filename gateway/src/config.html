@@ -140,6 +140,13 @@
       payout address, not per connection. 3600 to 604800; 86400 is a day.</div>
   </div>
   <div class="field">
+    <label for="datum_gateway_fee_ramp_state_file">Ramp state file</label>
+    <input name="datum_gateway_fee_ramp_state_file" id="datum_gateway_fee_ramp_state_file" maxlength="200">
+    <div class="tip">Where each address's position in the window is kept, so a restart does not
+      put every address back at the base fee. Empty: <code>gateway.feeramp</code> in the
+      working directory. Nothing is written while the ramp maximum is 0.</div>
+  </div>
+  <div class="field">
     <label for="datum_gateway_fee_address">Fee address</label>
     <input name="datum_gateway_fee_address" id="datum_gateway_fee_address" maxlength="100">
     <div class="tip">Empty: the Bitcoin address above.</div>

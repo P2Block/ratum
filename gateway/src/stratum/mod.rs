@@ -122,6 +122,7 @@ impl Server {
         let seen_share_hashes =
             SeenShareHashes::new(config.seen_share_hashes_capacity(), config.stale_window());
         let ramp_window_secs = config.datum.gateway_fee_ramp_window_seconds;
+        let ramp_state_path = config.fee_ramp_state_path();
         Arc::new(Self {
             config,
             pool,
@@ -135,7 +136,7 @@ impl Server {
             refuse_while_pool_unreachable: AtomicBool::new(false),
             network_hashps: Mutex::new(None),
             node_warnings: Mutex::new(Vec::new()),
-            fee_ramp: crate::feeramp::Ramp::new(ramp_window_secs),
+            fee_ramp: crate::feeramp::Ramp::new(ramp_window_secs, ramp_state_path),
             fee_tally: Mutex::new(Tally::default()),
             extra_nodes,
             listening: AtomicBool::new(false),

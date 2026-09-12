@@ -332,6 +332,9 @@ fn main() {
     );
     let template_error: Arc<template::LastError> = Arc::default();
 
+    server.fee_ramp.restore(ratum::unix_now());
+    feeramp::save_periodically(Arc::clone(&server));
+
     start_node_info_thread(handles.node.clone(), Arc::clone(&server));
 
     if handles.config.bitcoind.notify_fallback {

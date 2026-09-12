@@ -214,6 +214,7 @@ pub struct DatumConfig {
     pub gateway_fee_bps: u32,
     pub gateway_fee_ramp_max_bps: u32,
     pub gateway_fee_ramp_window_seconds: u64,
+    pub gateway_fee_ramp_state_file: String,
     pub gateway_fee_address: String,
     pub always_pay_self: Option<bool>,
     pub pooled_mining_only: bool,
@@ -234,6 +235,7 @@ impl Default for DatumConfig {
             gateway_fee_bps: 0,
             gateway_fee_ramp_max_bps: 0,
             gateway_fee_ramp_window_seconds: ratum::SECS_PER_DAY,
+            gateway_fee_ramp_state_file: String::new(),
             gateway_fee_address: String::new(),
             always_pay_self: None,
             pooled_mining_only: true,
@@ -258,6 +260,8 @@ pub struct Config {
     #[serde(skip)]
     pub pool_output_script: Vec<u8>,
 }
+
+pub const FEE_RAMP_STATE_FILE: &str = "gateway.feeramp";
 
 pub const MAX_COINBASE_TAG_SPACE: usize = 86;
 pub const WIDE_PRIME_PUSH_EXTRA_BYTES: usize = 4;
@@ -549,6 +553,16 @@ impl Config {
         }
     }
 
+    pub fn fee_ramp_state_path(&self) -> Option<std::path::PathBuf> {
+        self.fee_ramp_max_bps()?;
+        let configured = self.datum.gateway_fee_ramp_state_file.trim();
+        Some(std::path::PathBuf::from(if configured.is_empty() {
+            FEE_RAMP_STATE_FILE
+        } else {
+            configured
+        }))
+    }
+
     pub fn fee_ramp_max_bps(&self) -> Option<u32> {
         let max = self.datum.gateway_fee_ramp_max_bps;
         (max > 0).then_some(max)
@@ -641,6 +655,31 @@ mod tests {
         let c = Config::parse(&text).unwrap();
         assert_eq!(c.fee_ramp_max_bps(), Some(500));
         assert_eq!(c.datum.gateway_fee_ramp_window_seconds, 86400);
+    }
+
+    #[test]
+    fn the_fee_ramp_state_path_defaults_to_a_fixed_name_in_the_working_directory() {
+        let c = Config::parse(&minimal()).unwrap();
+        assert_eq!(c.fee_ramp_state_path(), None, "nothing is written while the ramp is off");
+
+        let with_ramp = |extra: &str| {
+            Config::parse(&minimal().replace(
+                "\"pooled_mining_only\": false",
+                &format!("\"pooled_mining_only\": false, \"gateway_fee_ramp_max_bps\": 500{extra}"),
+            ))
+            .unwrap()
+            .fee_ramp_state_path()
+        };
+        assert_eq!(
+            with_ramp("").unwrap(),
+            std::path::PathBuf::from("gateway.feeramp"),
+            "an empty key is a fixed name in the working directory, as the pool's key file is"
+        );
+        assert_eq!(
+            with_ramp(", \"gateway_fee_ramp_state_file\": \"/var/lib/ratum/ramp\"").unwrap(),
+            std::path::PathBuf::from("/var/lib/ratum/ramp"),
+            "a configured path is used as given"
+        );
     }
 
     #[test]

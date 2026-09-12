@@ -4,7 +4,10 @@
 # ratum-prime.key is written to the working directory when ratum-prime runs without --data-dir
 # or --key; shares.redb is the ledger's name inside --data-dir, listed for a data directory set
 # to the working directory (with neither --data-dir nor --ledger no ledger file is written).
+# gateway.feeramp is the gateway's fee ramp state, written to the working directory while
+# datum.gateway_fee_ramp_max_bps is set and datum.gateway_fee_ramp_state_file is empty.
 # Runtime state, never committed.
 /ratum-prime.key
 /shares.redb
+/gateway.feeramp
 prime-data/

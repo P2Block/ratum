@@ -108,6 +108,14 @@ const FIELDS: &[Field] = &[
         current: |c| json!(c.datum.gateway_fee_ramp_window_seconds),
     },
     Field {
+        name: "datum_gateway_fee_ramp_state_file",
+        label: "Fee ramp state file",
+        section: "datum",
+        key: "gateway_fee_ramp_state_file",
+        kind: FieldKind::Text,
+        current: |c| json!(c.datum.gateway_fee_ramp_state_file),
+    },
+    Field {
         name: "datum_gateway_fee_address",
         label: "Gateway fee address",
         section: "datum",
@@ -455,9 +463,9 @@ pub fn apply(
     Ok(Some(text))
 }
 
-pub fn write_file(path: &str, text: &str) -> std::io::Result<()> {
+pub fn write_file(path: &str, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
     let tmp = format!("{path}.new");
-    std::fs::write(&tmp, text)?;
+    std::fs::write(&tmp, contents)?;
     std::fs::rename(&tmp, path)
 }
 
