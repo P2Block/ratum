@@ -95,24 +95,37 @@ fn block_hash_arg(flag: &str, arg: &str, also: &str) -> [u8; 32] {
     }
 }
 
-fn print_or_refuse(arg: &str, record: Option<ledger::OwedBlock>) {
+fn print_or_refuse(
+    arg: &str,
+    record: Option<ledger::OwedBlock>,
+    state: Option<ledger::ChainState>,
+) {
     let Some(owed) = record else {
         fatal!("no owed block under {arg}; --settle-block list prints them")
     };
-    print_owed(&owed);
+    print_owed(&owed, state);
 }
 
-fn print_owed(o: &ledger::OwedBlock) {
+fn chain_state_text(state: Option<ledger::ChainState>) -> String {
+    match state {
+        Some(s) if s.on_best_chain() => format!(" {} confirmations", s.confirmations),
+        Some(s) => format!(" NOT ON THE BEST CHAIN as of {}", s.checked_at),
+        None => String::new(),
+    }
+}
+
+fn print_owed(o: &ledger::OwedBlock, state: Option<ledger::ChainState>) {
     let status = match o.settled_at {
         Some(at) => format!("settled at {at}"),
         None => "unsettled".to_string(),
     };
     println!(
-        "height {} block {} found {} total {} sats {status}",
+        "height {} block {} found {} total {} sats {status}{}",
         o.height,
         hex::encode(o.block_hash),
         o.at,
-        o.total
+        o.total,
+        chain_state_text(state)
     );
     for (identity, sats) in &o.entries {
         println!("  {identity} {sats}");
@@ -167,7 +180,7 @@ fn record_owed(location: &LedgerLocation, arg: &str, entries: &[String]) -> io::
     };
     if let Some(existing) = ledger.owed().iter().find(|o| o.block_hash == hash) {
         eprintln!("block {arg} already has an owed record; --void-block removes it first:");
-        print_owed(existing);
+        print_owed(existing, ledger.chain_state(&hash));
         std::process::exit(crate::cli::USAGE_EXIT);
     }
     let entries = owed_entries(entries);
@@ -189,7 +202,7 @@ fn record_owed(location: &LedgerLocation, arg: &str, entries: &[String]) -> io::
         entries,
     };
     ledger.record_owed(owed.clone())?;
-    print_owed(&owed);
+    print_owed(&owed, ledger.chain_state(&hash));
     Ok(())
 }
 
@@ -200,19 +213,31 @@ fn settle_block(location: &LedgerLocation, arg: &str) -> io::Result<()> {
             println!("no owed blocks");
         }
         for o in ledger.owed() {
-            print_owed(o);
+            print_owed(o, ledger.chain_state(&o.block_hash));
         }
         return Ok(());
     }
     let hash = block_hash_arg("--settle-block", arg, " or 'list'");
-    print_or_refuse(arg, ledger.settle_owed(&hash, ratum::unix_now())?);
+    let state = ledger.chain_state(&hash);
+    if let Some(s) = state.filter(|s| !s.on_best_chain()) {
+        if let Some(owed) = ledger.owed().iter().find(|o| o.block_hash == hash) {
+            print_owed(owed, state);
+        }
+        fatal!(
+            "block {arg} was not on the node's best chain when the pool last read it at {}              (the node answered {} confirmations), so its coinbase pays nobody and the amounts              against it are not owed; --void-block {arg} removes the record. Re-run the pool              to re-read the block if you believe the chain has changed since.",
+            s.checked_at,
+            s.confirmations
+        );
+    }
+    print_or_refuse(arg, ledger.settle_owed(&hash, ratum::unix_now())?, state);
     Ok(())
 }
 
 fn void_block(location: &LedgerLocation, arg: &str) -> io::Result<()> {
     let mut ledger = location.open("--void-block")?;
     let hash = block_hash_arg("--void-block", arg, "");
-    print_or_refuse(arg, ledger.void_owed(&hash)?);
+    let state = ledger.chain_state(&hash);
+    print_or_refuse(arg, ledger.void_owed(&hash)?, state);
     Ok(())
 }
 

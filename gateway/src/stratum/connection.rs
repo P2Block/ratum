@@ -613,27 +613,14 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datum;
     use crate::job::Builder;
-    use crate::template::tests::{config, template};
+    use crate::stratum::tests::test_server;
+    use crate::template::tests::template;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::thread::JoinHandle;
 
     const DEADLINE: Duration = Duration::from_millis(250);
-
-    fn test_server() -> Arc<Server> {
-        let config = Arc::new(config());
-        let notify = Arc::new(crate::template::Notify::default());
-        let shared = Arc::new(datum::Pool::new(
-            config.datum.protocol_job_slots,
-            64,
-            Arc::clone(&notify),
-            None,
-        ));
-        let node = ratum::rpc::Client::new("http://127.0.0.1:1", "u", "p").unwrap();
-        Server::new(config, shared, node, notify)
-    }
 
     fn a_job(server: &Server) -> Arc<Job> {
         let mut builder = Builder::new(Arc::clone(&server.config));

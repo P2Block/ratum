@@ -1,4 +1,6 @@
-use super::{FoundBlock, HASH_SIZE, MAX_SHARES, OwedBlock, ReadBack, SHARES_PER_KEEP_UNIT, Share};
+use super::{
+    ChainState, FoundBlock, HASH_SIZE, MAX_SHARES, OwedBlock, ReadBack, SHARES_PER_KEEP_UNIT, Share,
+};
 use bytes::BufMut as _;
 use ratum::cursor::Cursor;
 use redb::{
@@ -11,6 +13,7 @@ const SHARES: TableDefinition<u64, &[u8]> = TableDefinition::new("shares");
 const BY_HASH: TableDefinition<&[u8], u64> = TableDefinition::new("by_hash");
 const BLOCKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("blocks");
 const OWED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("owed");
+const CHAIN_STATE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("chain_state");
 
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 const META_CHAIN: &str = "chain";
@@ -139,6 +142,23 @@ fn unpack_block(hash: &[u8], bytes: &[u8]) -> Option<FoundBlock> {
     })
 }
 
+fn pack_chain_state(c: &ChainState) -> Vec<u8> {
+    let mut v = Vec::with_capacity(CHAIN_STATE_LEN);
+    v.put_u64_le(c.checked_at);
+    v.put_i64_le(c.confirmations);
+    v
+}
+
+const CHAIN_STATE_LEN: usize = size_of::<u64>() + size_of::<i64>();
+
+fn unpack_chain_state(hash: &[u8], bytes: &[u8]) -> Option<([u8; HASH_SIZE], ChainState)> {
+    let block_hash: [u8; HASH_SIZE] = hash.try_into().ok()?;
+    let mut c = Cursor::new(bytes);
+    let checked_at = c.u64("checked_at").ok()?;
+    let confirmations = i64::from_le_bytes(c.arr("confirmations").ok()?);
+    Some((block_hash, ChainState { checked_at, confirmations }))
+}
+
 trait DbResult<T> {
     fn db(self) -> io::Result<T>;
 }
@@ -202,6 +222,7 @@ impl Store {
             w.open_table(BY_HASH).db()?;
             w.open_table(OWED).db()?;
             w.open_table(BLOCKS).db()?;
+            w.open_table(CHAIN_STATE).db()?;
             let mut meta = w.open_table(META).db()?;
             if let Some(chain) = chain {
                 let stored = meta.get(META_CHAIN).db()?.map(|v| v.value().to_string());
@@ -365,6 +386,24 @@ impl Store {
         Ok(out)
     }
 
+    pub(super) fn write_chain_state(
+        &self,
+        hash: &[u8; HASH_SIZE],
+        state: &ChainState,
+    ) -> io::Result<()> {
+        self.write(|w| {
+            w.open_table(CHAIN_STATE)
+                .db()?
+                .insert(hash.as_slice(), pack_chain_state(state).as_slice())
+                .db()?;
+            Ok(())
+        })
+    }
+
+    pub(super) fn read_chain_states(&self) -> io::Result<Vec<([u8; HASH_SIZE], ChainState)>> {
+        self.read_packed(CHAIN_STATE, "a chain state", unpack_chain_state)
+    }
+
     pub(super) fn dump(&self) -> io::Result<Vec<Share>> {
         let r = self.db.begin_read().db()?;
         let shares = r.open_table(SHARES).db()?;
@@ -383,6 +422,25 @@ impl Store {
 mod tests {
     use super::*;
     use crate::ledger::tests::{Scratch, found, hash, owed};
+
+    #[test]
+    fn packs_and_unpacks_a_chain_state() {
+        for confirmations in [-1i64, 0, 1, 100, i64::MAX, i64::MIN] {
+            let state = ChainState { checked_at: 1_750_000_000, confirmations };
+            let packed = pack_chain_state(&state);
+            assert_eq!(packed.len(), CHAIN_STATE_LEN);
+            assert_eq!(unpack_chain_state(&hash(3), &packed), Some((hash(3), state)));
+        }
+        assert_eq!(unpack_chain_state(&hash(3), &[]), None, "a truncated row does not unpack");
+        assert_eq!(
+            unpack_chain_state(
+                &[0u8; 4],
+                &pack_chain_state(&ChainState { checked_at: 1, confirmations: 1 })
+            ),
+            None,
+            "a key that is not a block hash does not unpack"
+        );
+    }
 
     #[test]
     fn packs_and_unpacks_a_share() {

@@ -113,6 +113,14 @@ const FIELDS: &[Field] = &[
         current: |c| json!(c.stratum.vardiff_min),
     },
     Field {
+        name: "stratum_max_network_share_bps",
+        label: "Network hashrate limit",
+        section: "stratum",
+        key: "max_network_share_bps",
+        kind: FieldKind::Int(0, ratum::BASIS_POINTS_PER_UNIT as i64),
+        current: |c| json!(c.stratum.max_network_share_bps),
+    },
+    Field {
         name: "stratum_fingerprint_miners",
         label: "Fingerprint miners",
         section: "stratum",
@@ -517,6 +525,8 @@ mod tests {
         assert_eq!(e, ["Unique gateway ID must be between 0 and 65535"]);
         let e = apply(&c, FILE, &form(&[("datum_pool_port", "x")])).unwrap_err();
         assert_eq!(e, ["Pool port must be a whole number"]);
+        let e = apply(&c, FILE, &form(&[("stratum_max_network_share_bps", "20000")])).unwrap_err();
+        assert_eq!(e, ["Network hashrate limit must be between 0 and 10000"]);
     }
 
     #[test]

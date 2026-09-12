@@ -37,6 +37,18 @@ pub struct OwedBlock {
     pub entries: Vec<(String, u64)>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainState {
+    pub checked_at: u64,
+    pub confirmations: i64,
+}
+
+impl ChainState {
+    pub fn on_best_chain(&self) -> bool {
+        self.confirmations >= 0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct FoundBlock {
     pub at: u64,
@@ -60,6 +72,7 @@ pub struct Ledger {
     store: Option<Store>,
     owed: Vec<OwedBlock>,
     blocks: Vec<FoundBlock>,
+    chain_state: HashMap<[u8; HASH_SIZE], ChainState>,
     cumulative_work: u128,
     count_capped: bool,
 }
@@ -76,6 +89,7 @@ impl Ledger {
             store: None,
             owed: Vec::new(),
             blocks: Vec::new(),
+            chain_state: HashMap::new(),
             cumulative_work: 0,
             count_capped: false,
         }
@@ -94,6 +108,7 @@ impl Ledger {
         ledger.fill(shares);
         ledger.owed = store.read_owed()?;
         ledger.blocks = store.read_blocks()?;
+        ledger.chain_state = store.read_chain_states()?.into_iter().collect();
         ledger.cumulative_work = store.cumulative_work;
         ledger.store = Some(store);
         Ok((ledger, read_back))
@@ -223,6 +238,21 @@ impl Ledger {
 
     pub fn blocks(&self) -> &[FoundBlock] {
         &self.blocks
+    }
+
+    pub fn chain_state(&self, hash: &[u8; HASH_SIZE]) -> Option<ChainState> {
+        self.chain_state.get(hash).copied()
+    }
+
+    pub fn record_chain_state(
+        &mut self,
+        hash: [u8; HASH_SIZE],
+        state: ChainState,
+    ) -> io::Result<Option<ChainState>> {
+        if let Some(store) = &self.store {
+            store.write_chain_state(&hash, &state)?;
+        }
+        Ok(self.chain_state.insert(hash, state))
     }
 
     pub fn record_owed(&mut self, owed: OwedBlock) -> io::Result<()> {
@@ -829,6 +859,37 @@ mod tests {
         let (l, _) = open(&scratch, u128::MAX, None);
         assert_eq!(l.owed()[0].settled_at, Some(5_000), "settlement is durable");
         assert_eq!(l.owed()[1].settled_at, None);
+    }
+
+    #[test]
+    fn the_chain_state_of_a_block_is_durable_and_reports_what_it_replaced() {
+        let scratch = Scratch::new("chain-state");
+        let on_chain = ChainState { checked_at: 1_000, confirmations: 3 };
+        let orphaned = ChainState { checked_at: 2_000, confirmations: -1 };
+        {
+            let (mut l, _) = open(&scratch, u128::MAX, None);
+            assert_eq!(l.chain_state(&hash(1)), None, "nothing has been read yet");
+
+            assert_eq!(l.record_chain_state(hash(1), on_chain).unwrap(), None, "the first reading");
+            assert_eq!(l.chain_state(&hash(1)), Some(on_chain));
+
+            assert_eq!(
+                l.record_chain_state(hash(1), orphaned).unwrap(),
+                Some(on_chain),
+                "the reading it replaced, which is how a block leaving the chain is reported"
+            );
+            assert_eq!(l.chain_state(&hash(1)), Some(orphaned));
+        }
+        let (l, _) = open(&scratch, u128::MAX, None);
+        assert_eq!(l.chain_state(&hash(1)), Some(orphaned), "the reading survives a reopen");
+        assert_eq!(l.chain_state(&hash(2)), None, "and no other block gained one");
+    }
+
+    #[test]
+    fn a_block_is_on_the_best_chain_at_zero_confirmations_and_not_below() {
+        assert!(ChainState { checked_at: 1, confirmations: 0 }.on_best_chain(), "the tip itself");
+        assert!(ChainState { checked_at: 1, confirmations: 100 }.on_best_chain());
+        assert!(!ChainState { checked_at: 1, confirmations: -1 }.on_best_chain());
     }
 
     #[test]

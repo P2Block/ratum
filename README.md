@@ -51,14 +51,24 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
   keys and the key order are kept), validates it as at startup, and restarts the gateway on
   the same command line to apply it: every change restarts, where the C gateway applies some
   without one. The field names and the `pool_host(old)` convention are the C gateway's;
-  `datum.pool_url`, the gateway fee, the stratum port, `stratum.vardiff_min` and
-  `stratum.require_address_username` are editable in addition to the C page's fields.
+  `datum.pool_url`, the gateway fee, the stratum port, `stratum.vardiff_min`,
+  `stratum.max_network_share_bps` and `stratum.require_address_username` are editable in
+  addition to the C page's fields.
 - A block share is charged the gateway fee like any other share when it passes the share
   checks (the C gateway exempts it); a block a check refuses is still sent under the miner's
   name.
 - One thread per stratum connection; `stratum.max_clients` limits the total and the
   per-thread settings size the duplicate-share table and share queue. `empty_thread`
   disconnects every client; `/threads` is not served.
+- New stratum connections are refused while the gateway's own miners measure above
+  `stratum.max_network_share_bps` of the network hashrate (not a C key; 500 basis points,
+  5%, by default; 0 refuses none). The gateway's hashrate is the sum of its clients'
+  measured windows; the network's is `getnetworkhashps` from the configured node, read once
+  a minute. Connections already established keep mining and no client is disconnected; the
+  status page and `/stats.json` report the share (`stratum.network_share`) whether or not it
+  is over. The limit applies on chain `main` alone, and is not enforced while the node has
+  answered no estimate: a node that does not serve `getnetworkhashps`, or a regtest chain,
+  leaves every connection accepted. The C gateway has no such limit.
 - The extranonce1 session id is the 32-bit connection counter, so it never repeats for a live
   connection.
 - A new tip builds three immutable jobs (empty, priority, coinbaser) where C rewrites one, so
@@ -66,6 +76,14 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
 - The type 2 coinbase puts every output after the OP_RETURN extranonce output and keeps that
   output with an empty split; it pays the same, the txid differs from C's.
 - `mining.pool_address` and `datum.pool_pubkey` are checked at startup.
+- The node's `getmininginfo` is read once a minute, for the network hashrate the connection
+  limit above applies to and for the node's `warnings`, which the status page shows one line
+  each (a node before Bitcoin Core 29 answers a single string in place of the array; both
+  read back). The C gateway shows neither.
+- A block the node accepts is checked once, two minutes later, with `getblockheader`: the log
+  says whether it is still on the best chain and at what depth, or that another block won the
+  height. `submitblock` answering null means the node accepted the block, not that it stayed
+  in the chain. The C gateway does not check.
 - Log level 5 keeps errors; higher silences the sink. Timestamps are UTC.
 - Every message to the pool is padded, the block-transactions response included.
 - A refused template is logged once per reason.
@@ -258,6 +276,17 @@ received its value) is removed with `--void-block <block-hash>`, and `--record-o
 <block-hash> --owed <identity>=<sats> ...` adds a record from command-line values for a block in the
 history that has none.
 
+The pool finds an orphaned block itself: every five minutes it asks the node
+(`getblockheader`) for the confirmation count of each recorded block under 100 confirmations,
+at most 32 per pass, oldest first, and stores the answer. A block the node answers with a
+negative count is on a branch the best chain does not include, which is logged as an error
+naming the amounts owed against it, and shown in `/stats.json` as `confirmations` on both the
+block and its owed record (null until the pool has read it). `--settle-block` refuses a block
+whose last reading was off the best chain and names `--void-block` instead, so a payout is
+not recorded against a coinbase that pays nobody. `submitblock` answering null means the node
+accepted the block, not that it stayed in the chain, and nothing else in the pool re-read
+that.
+
 ### Stats interface
 
 `--stats-listen <address>` serves one endpoint, the read-only snapshot at `/stats.json`;
@@ -267,7 +296,8 @@ at 2^32 hashes per difficulty unit, for the pool and per miner) and each miner's
 window with `payable`, `unpayable_reason` and `tag` (the secondary coinbase tag of the
 miner's newest share in the window, the gateway's `mining.coinbase_tag_secondary`). Every
 accepted block is recorded in the ledger's `blocks` table and listed with its coinbase
-amounts, finder, and the secondary coinbase tag its coinbase carried; from the record and
+amounts, finder, the secondary coinbase tag its coinbase carried, and the confirmation count
+the node last answered for it (see "Owed blocks"); from the record and
 a cumulative work counter it derives a luck figure (blocks found over blocks
 expected), and from the observed block spacing an expected time to the pool's next block and
 the next difficulty adjustment (height, countdown, estimated factor). It also carries the
@@ -276,6 +306,14 @@ gateway at the pool; `--advertise-address host[:port]` sets the address when the
 differs. `--public-gateway <url>` names a gateway that accepts miners who do not run their
 own (a value without a scheme is read as `https://`); unset, the field is null. It is
 unauthenticated: bind it to `127.0.0.1` unless it is behind a reverse proxy.
+
+The node is read for `getmininginfo` once a minute alongside the tip: `hashrate.network_hs`
+is its estimate of the network's hashes per second and `hashrate.pool_share` is
+`pool_hs / network_hs`, the fraction of the chain this pool directs (null while the node has
+given no estimate). `node_warnings` carries the node's `warnings`, one entry each and empty
+when it reports none; a change is logged as it happens, since on a chain that has just
+hardforked this is where a node that does not know the new rules says so, which decides
+whether the blocks the pool relays are accepted.
 
 The response carries `X-Robots-Tag: noindex`, so the snapshot is not a search result of its
 own. Rendering it is the job of a separate frontend project, which serves the snapshot from

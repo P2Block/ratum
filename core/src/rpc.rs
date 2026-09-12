@@ -35,6 +35,13 @@ impl Error {
             _ => false,
         }
     }
+
+    pub fn is_not_found(&self) -> bool {
+        match self {
+            Self::Rpc(m) => m.contains(r#""code":-5"#) || m.contains("not found"),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +90,26 @@ pub struct Tip {
 pub struct NextBlock {
     pub coinbase_value: u64,
     pub bits: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MiningInfo {
+    pub chain: Chain,
+    pub network_hashps: f64,
+    pub warnings: Vec<String>,
+}
+
+fn warnings_of(v: &serde_json::Value) -> Vec<String> {
+    match v {
+        serde_json::Value::Array(a) => a
+            .iter()
+            .filter_map(|w| w.as_str())
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect(),
+        serde_json::Value::String(s) if !s.is_empty() => vec![s.clone()],
+        _ => Vec::new(),
+    }
 }
 
 #[derive(Clone)]
@@ -258,6 +285,29 @@ impl Client {
         Ok(NextBlock { coinbase_value, bits })
     }
 
+    pub fn mining_info(&self) -> Result<MiningInfo, Error> {
+        let v = self.call("getmininginfo", serde_json::json!([]))?;
+        let chain =
+            Chain::parse(v["chain"].as_str().ok_or_else(|| Error::BadResponse("no chain".into()))?);
+        let network_hashps = v["networkhashps"]
+            .as_f64()
+            .ok_or_else(|| Error::BadResponse("no networkhashps".into()))?;
+        Ok(MiningInfo { chain, network_hashps, warnings: warnings_of(&v["warnings"]) })
+    }
+
+    pub fn block_confirmations(&self, hash_display_hex: &str) -> Result<Option<i64>, Error> {
+        let header = match self.call("getblockheader", serde_json::json!([hash_display_hex, true]))
+        {
+            Ok(h) => h,
+            Err(e) if e.is_not_found() => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        header["confirmations"]
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| Error::BadResponse("no confirmations in getblockheader".into()))
+    }
+
     pub fn submit_block(&self, block: &[u8]) -> Result<Option<String>, Error> {
         let result = self.call("submitblock", serde_json::json!([hex::encode(block)]))?;
         Ok(match result {
@@ -318,6 +368,39 @@ mod tests {
         ] {
             assert!(!other.is_unauthorized(), "{other} is not a refused credential");
         }
+    }
+
+    #[test]
+    fn recognizes_a_hash_the_node_stores_no_block_under() {
+        let missing = Error::Rpc(r#"{"code":-5,"message":"Block not found"}"#.to_string());
+        assert!(missing.is_not_found());
+
+        for other in [
+            Error::Rpc(r#"{"code":-8,"message":"Block height out of range"}"#.to_string()),
+            Error::Rpc(r#"{"code":-32601,"message":"Method not found"}"#.to_string()),
+            Error::Http(404, String::new()),
+            Error::BadResponse("no confirmations in getblockheader".into()),
+        ] {
+            let missing_method = other.is_method_not_found();
+            assert_eq!(other.is_not_found(), missing_method, "{other}");
+        }
+    }
+
+    #[test]
+    fn warnings_read_back_from_either_shape() {
+        use serde_json::json;
+        assert_eq!(
+            warnings_of(&json!(["unknown new rules activated"])),
+            ["unknown new rules activated"]
+        );
+        assert_eq!(
+            warnings_of(&json!("a pre-29 node answers one string")),
+            ["a pre-29 node answers one string"]
+        );
+        assert!(warnings_of(&json!([])).is_empty(), "an array with no warning");
+        assert!(warnings_of(&json!("")).is_empty(), "the empty string is no warning");
+        assert!(warnings_of(&json!(null)).is_empty(), "a node that reports no field");
+        assert_eq!(warnings_of(&json!(["", "second"])), ["second"], "empty entries are dropped");
     }
 
     #[test]

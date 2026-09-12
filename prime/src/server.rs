@@ -19,8 +19,12 @@ pub(crate) struct NodeView {
     pub(crate) coinbase_value: Mutex<Option<u64>>,
     pub(crate) next_bits: Mutex<Option<u32>>,
     pub(crate) tip_history: Mutex<VecDeque<(u32, u64)>>,
+    pub(crate) network_hashps: Mutex<Option<f64>>,
+    pub(crate) warnings: Mutex<Vec<String>>,
     wakers: Mutex<Vec<Arc<Waker>>>,
 }
+
+const MINING_INFO_INTERVAL: Duration = Duration::from_secs(ratum::SECS_PER_MINUTE);
 
 pub(crate) const TIP_HISTORY_CAP: usize = 64;
 
@@ -72,6 +76,28 @@ fn exit_on_wrong_chain(t: &rpc::Tip, expected: Option<rpc::Chain>) {
     std::process::exit(1);
 }
 
+fn refresh_mining_info(node: &rpc::Client, view: &NodeView) {
+    let info = match node.mining_info() {
+        Ok(info) => info,
+        Err(e) => {
+            warn!("could not read getmininginfo: {e}");
+            return;
+        }
+    };
+    *lock(&view.network_hashps) = (info.network_hashps > 0.0).then_some(info.network_hashps);
+    let mut held = lock(&view.warnings);
+    if *held == info.warnings {
+        return;
+    }
+    for warning in &info.warnings {
+        warn!("the node reports: {warning}");
+    }
+    if info.warnings.is_empty() {
+        info!("the node reports no warnings");
+    }
+    *held = info.warnings;
+}
+
 fn refresh_next_block(node: &rpc::Client, view: &NodeView) -> bool {
     match node.next_block() {
         Ok(n) => {
@@ -101,7 +127,12 @@ pub(crate) fn watch_node(
     let mut last: Option<[u8; 32]> = None;
     let mut have_template = false;
     let mut wait_for_blocks = true;
+    let mut last_mining_info: Option<Instant> = None;
     loop {
+        if last_mining_info.is_none_or(|t| t.elapsed() >= MINING_INFO_INTERVAL) {
+            last_mining_info = Some(Instant::now());
+            refresh_mining_info(&node, &view);
+        }
         let height = match node.tip() {
             Ok(t) => {
                 exit_on_wrong_chain(&t, expected_chain);

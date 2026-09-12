@@ -3,7 +3,7 @@ use log::warn;
 use ratum::hashrate::{self, History};
 use ratum::http;
 use ratum::lock;
-use ratum_prime::ledger::{self, FoundBlock};
+use ratum_prime::ledger::{self, ChainState, FoundBlock};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -107,7 +107,14 @@ fn network_json(
     })
 }
 
-fn owed_json(owed: &[ledger::OwedBlock]) -> (u64, Vec<Value>, Vec<Value>) {
+fn confirmations_json(state: Option<&ChainState>) -> Value {
+    state.map_or(Value::Null, |s| json!(s.confirmations))
+}
+
+fn owed_json(
+    owed: &[ledger::OwedBlock],
+    chain_state: &HashMap<[u8; 32], ChainState>,
+) -> (u64, Vec<Value>, Vec<Value>) {
     let mut unsettled: u64 = 0;
     let mut unsettled_per_identity: HashMap<String, u64> = HashMap::new();
     let blocks: Vec<Value> = owed
@@ -125,6 +132,7 @@ fn owed_json(owed: &[ledger::OwedBlock]) -> (u64, Vec<Value>, Vec<Value>) {
                 "found_at": o.at,
                 "total_sats": o.total,
                 "settled_at": o.settled_at,
+                "confirmations": confirmations_json(chain_state.get(&o.block_hash)),
                 "miners": o.entries.iter().map(|(identity, sats)| {
                     json!({ "identity": identity, "sats": sats })
                 }).collect::<Vec<_>>(),
@@ -184,6 +192,7 @@ struct LedgerView {
     payout_sats: HashMap<String, u64>,
     owed: Vec<ledger::OwedBlock>,
     blocks: Vec<FoundBlock>,
+    chain_state: HashMap<[u8; 32], ChainState>,
     recent_work: u128,
     recent_by_identity: HashMap<String, u128>,
 }
@@ -204,13 +213,23 @@ impl LedgerView {
                 .collect(),
             owed: l.owed().to_vec(),
             blocks: l.blocks().to_vec(),
+            chain_state: l
+                .owed()
+                .iter()
+                .map(|o| o.block_hash)
+                .chain(l.blocks().iter().map(|b| b.block_hash))
+                .filter_map(|hash| l.chain_state(&hash).map(|state| (hash, state)))
+                .collect(),
             recent_work,
             recent_by_identity,
         }
     }
 }
 
-fn recent_blocks_json(blocks: &[FoundBlock]) -> Vec<Value> {
+fn recent_blocks_json(
+    blocks: &[FoundBlock],
+    chain_state: &HashMap<[u8; 32], ChainState>,
+) -> Vec<Value> {
     blocks
         .iter()
         .rev()
@@ -224,6 +243,7 @@ fn recent_blocks_json(blocks: &[FoundBlock]) -> Vec<Value> {
                 "paid_to_pool": b.paid_to_pool,
                 "finder": b.finder,
                 "tag": b.tag,
+                "confirmations": confirmations_json(chain_state.get(&b.block_hash)),
             })
         })
         .collect()
@@ -246,7 +266,7 @@ fn snapshot(server: &Server, history: &Mutex<History>) -> Value {
     let l = LedgerView::read(server, coinbase_value);
 
     let (luck, luck_blocks) = luck_percent(&l.blocks);
-    let (owed_unsettled, owed_by_identity, owed_blocks) = owed_json(&l.owed);
+    let (owed_unsettled, owed_by_identity, owed_blocks) = owed_json(&l.owed, &l.chain_state);
     let miners = miners_json(
         server,
         &l.work_by_identity,
@@ -256,6 +276,8 @@ fn snapshot(server: &Server, history: &Mutex<History>) -> Value {
         &l.tags,
     );
     let network = network_json(tip, coinbase_value, observed_block_seconds(server));
+    let pool_hs = hashes_per_second(l.recent_work, HASHRATE_SPAN_SECS);
+    let network_hashps = *lock(&server.node_view.network_hashps);
 
     json!({
         "pool": {
@@ -280,7 +302,11 @@ fn snapshot(server: &Server, history: &Mutex<History>) -> Value {
         },
         "hashrate": {
             "span_seconds": HASHRATE_SPAN_SECS,
-            "pool_hs": hashes_per_second(l.recent_work, HASHRATE_SPAN_SECS),
+            "pool_hs": pool_hs,
+            "network_hs": network_hashps,
+            "pool_share": network_hashps
+                .filter(|hs| *hs > 0.0)
+                .map(|hs| pool_hs / hs),
             "interval_seconds": hashrate::INTERVAL_SECS,
             "history": lock(history)
                 .iter()
@@ -303,8 +329,9 @@ fn snapshot(server: &Server, history: &Mutex<History>) -> Value {
             "found": l.blocks.len(),
             "luck_percent": luck,
             "luck_blocks": luck_blocks,
-            "recent": recent_blocks_json(&l.blocks),
+            "recent": recent_blocks_json(&l.blocks, &l.chain_state),
         },
+        "node_warnings": lock(&server.node_view.warnings).clone(),
         "generated_at": ratum::unix_now(),
     })
 }

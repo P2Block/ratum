@@ -3,6 +3,9 @@ use crate::stratum::Server;
 use log::{debug, error, info, warn};
 use ratum::rpc;
 use std::sync::Arc;
+use std::time::Duration;
+
+const CONFIRM_AFTER: Duration = Duration::from_secs(2 * ratum::SECS_PER_MINUTE);
 
 pub fn found_block(
     server: &Server,
@@ -25,6 +28,32 @@ pub fn found_block(
     }
     if submit_to(&server.node, "upstream node", &block, hash_hex) {
         server.notify.raise_for(hash_hex);
+        spawn_confirmation(server.node.clone(), hash_hex);
+    }
+}
+
+fn spawn_confirmation(node: rpc::Client, hash_hex: &str) {
+    let hash_hex = hash_hex.to_string();
+    let spawned = ratum::thread::try_spawn("block-confirm", move || {
+        std::thread::sleep(CONFIRM_AFTER);
+        let secs = CONFIRM_AFTER.as_secs();
+        match node.block_confirmations(&hash_hex) {
+            Ok(Some(confirmations)) if confirmations >= 0 => {
+                info!(
+                    "Block {hash_hex} is on the best chain {secs}s later ({confirmations} confirmations)"
+                )
+            }
+            Ok(Some(_)) => error!(
+                "Block {hash_hex} is NOT on the best chain {secs}s after the node accepted it: another block won the height and this one pays nothing"
+            ),
+            Ok(None) => warn!(
+                "the node stores no block under {hash_hex} {secs}s after accepting it; it cannot be checked against the best chain"
+            ),
+            Err(e) => warn!("could not check block {hash_hex} against the best chain: {e}"),
+        }
+    });
+    if let Err(e) = spawned {
+        warn!("could not start the block confirmation thread: {e}");
     }
 }
 

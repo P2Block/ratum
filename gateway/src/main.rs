@@ -31,6 +31,8 @@ const NO_JOB_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const POOL_CONNECT_WAIT: Duration = Duration::from_secs(15);
 const POOL_CONNECT_POLL: Duration = Duration::from_millis(250);
 const FAILURES_BEFORE_SHUTDOWN: u32 = 2;
+const NODE_INFO_INTERVAL: Duration = Duration::from_secs(ratum::SECS_PER_MINUTE);
+const NODE_INFO_RETRY: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
 #[command(name = "ratum-gateway", version = ratum::VERSION, about = "DATUM Gateway for the Bitcoin Knots BLAKE2b hardfork")]
@@ -111,6 +113,62 @@ fn start_datum(rt: &Runtime) {
         error!(
             "Could not connect to the DATUM pool within {} seconds; datum.pooled_mining_only is set, so no work is served until it connects",
             POOL_CONNECT_WAIT.as_secs()
+        );
+    }
+}
+
+fn start_node_info_thread(node: ratum::rpc::Client, server: Arc<stratum::Server>) {
+    ratum::thread::spawn("node-info", move || {
+        let limit = server.config.max_network_share();
+        let mut announced = false;
+        let mut reported = false;
+        loop {
+            match node.mining_info() {
+                Ok(info) => {
+                    reported = false;
+                    server.set_node_warnings(info.warnings);
+                    if info.chain == ratum::rpc::Chain::Main {
+                        server.set_network_hashps(info.network_hashps);
+                    }
+                    if !announced {
+                        announced = true;
+                        announce_network_share_limit(limit, info.chain);
+                    }
+                }
+                Err(e) if e.is_method_not_found() => {
+                    error!(
+                        "the node does not serve getmininginfo ({e}), so the network share limit \
+                         on new stratum connections is not enforced and the node's warnings are \
+                         not shown"
+                    );
+                    return;
+                }
+                Err(e) if !reported => {
+                    reported = true;
+                    warn!(
+                        "could not read getmininginfo from the node ({e}); the network share \
+                         limit on new stratum connections keeps whatever estimate it has and the \
+                         node's warnings are not refreshed"
+                    );
+                }
+                Err(_) => {}
+            }
+            std::thread::sleep(if announced { NODE_INFO_INTERVAL } else { NODE_INFO_RETRY });
+        }
+    });
+}
+
+fn announce_network_share_limit(limit: Option<f64>, chain: ratum::rpc::Chain) {
+    let Some(limit) = limit else { return };
+    if chain == ratum::rpc::Chain::Main {
+        info!(
+            "Refusing new stratum connections while this gateway's miners are above {:.2}% of the network hashrate",
+            limit * 100.0
+        );
+    } else {
+        info!(
+            "The node is on chain {}, not main: new stratum connections are accepted whatever share of that chain's hashrate this gateway holds",
+            chain.name()
         );
     }
 }
@@ -270,6 +328,8 @@ fn main() {
         Arc::clone(&rt.notify),
     );
     let template_error: Arc<template::LastError> = Arc::default();
+
+    start_node_info_thread(rt.node.clone(), Arc::clone(&server));
 
     if rt.config.bitcoind.notify_fallback {
         let (node, notify) = (rt.node.clone(), Arc::clone(&rt.notify));

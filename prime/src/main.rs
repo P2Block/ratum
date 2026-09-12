@@ -1,5 +1,6 @@
 mod abw;
 mod admin;
+mod chainstate;
 mod cli;
 mod coinbaser;
 mod connection;
@@ -263,6 +264,8 @@ fn main() -> io::Result<()> {
         advertise: s.advertise_address,
         public_gateway: s.public_gateway,
     });
+
+    chainstate::watch(Arc::clone(&server));
 
     if let Some(addr) = &s.stats_listen {
         match stats::spawn(Arc::clone(&server), addr) {
