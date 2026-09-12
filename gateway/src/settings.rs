@@ -1,6 +1,6 @@
 use super::config::{
-    Config, Datum, GLOBAL_TIMEOUT_MARGIN_SECS, MAX_CONFIGURED_TAG, MAX_CONFIGURED_TAGS_TOTAL,
-    WORK_UPDATE_SECONDS_RANGE,
+    Config, Datum, FEE_RAMP_WINDOW_SECONDS_RANGE, GLOBAL_TIMEOUT_MARGIN_SECS, MAX_CONFIGURED_TAG,
+    MAX_CONFIGURED_TAGS_TOTAL, WORK_UPDATE_SECONDS_RANGE,
 };
 use serde_json::{Value, json};
 
@@ -87,6 +87,25 @@ const FIELDS: &[Field] = &[
         key: "gateway_fee_bps",
         kind: FieldKind::Int(0, ratum::BASIS_POINTS_PER_UNIT as i64),
         current: |c| json!(c.datum.gateway_fee_bps),
+    },
+    Field {
+        name: "datum_gateway_fee_ramp_max_bps",
+        label: "Fee ramp maximum",
+        section: "datum",
+        key: "gateway_fee_ramp_max_bps",
+        kind: FieldKind::Int(0, ratum::BASIS_POINTS_PER_UNIT as i64),
+        current: |c| json!(c.datum.gateway_fee_ramp_max_bps),
+    },
+    Field {
+        name: "datum_gateway_fee_ramp_window_seconds",
+        label: "Fee ramp window",
+        section: "datum",
+        key: "gateway_fee_ramp_window_seconds",
+        kind: FieldKind::Int(
+            *FEE_RAMP_WINDOW_SECONDS_RANGE.start() as i64,
+            *FEE_RAMP_WINDOW_SECONDS_RANGE.end() as i64,
+        ),
+        current: |c| json!(c.datum.gateway_fee_ramp_window_seconds),
     },
     Field {
         name: "datum_gateway_fee_address",

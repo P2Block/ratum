@@ -93,6 +93,7 @@ pub struct Server {
     pub rejecting: AtomicBool,
     network_hashps: Mutex<Option<f64>>,
     node_warnings: Mutex<Vec<String>>,
+    pub fee_ramp: crate::feeramp::Ramp,
     pub fee: Mutex<Tally>,
     pub extra_nodes: Vec<ratum::rpc::Client>,
     pub listening: AtomicBool,
@@ -118,6 +119,7 @@ impl Server {
             })
             .collect();
         let dupes = Dupes::new(config.dupe_table_capacity(), config.stale_window());
+        let ramp_window_secs = config.datum.gateway_fee_ramp_window_seconds;
         Arc::new(Self {
             config,
             datum,
@@ -131,6 +133,7 @@ impl Server {
             rejecting: AtomicBool::new(false),
             network_hashps: Mutex::new(None),
             node_warnings: Mutex::new(Vec::new()),
+            fee_ramp: crate::feeramp::Ramp::new(ramp_window_secs),
             fee: Mutex::new(Tally::default()),
             extra_nodes,
             listening: AtomicBool::new(false),
@@ -205,6 +208,24 @@ impl Server {
 
     pub fn set_node_warnings(&self, warnings: Vec<String>) {
         *ratum::lock(&self.node_warnings) = warnings;
+    }
+
+    pub fn fee_bps_for(&self, address: &str) -> u32 {
+        let base = self.config.datum.gateway_fee_bps;
+        match self.config.fee_ramp_max_bps() {
+            None => base,
+            Some(max) => crate::feeramp::bps(
+                self.fee_ramp.active_buckets(address, ratum::unix_now()),
+                base,
+                max,
+            ),
+        }
+    }
+
+    pub(in crate::stratum) fn record_and_fee_bps(&self, address: &str) -> u32 {
+        let base = self.config.datum.gateway_fee_bps;
+        let Some(max) = self.config.fee_ramp_max_bps() else { return base };
+        crate::feeramp::bps(self.fee_ramp.record(address, ratum::unix_now()), base, max)
     }
 
     pub fn network_share(&self) -> Option<f64> {
@@ -329,6 +350,7 @@ pub fn listen(server: Arc<Server>) -> io::Result<()> {
 pub(in crate::stratum) mod tests {
     use super::*;
     use crate::datum;
+    use crate::feeramp::BUCKETS;
     use crate::template::tests::config;
 
     pub(in crate::stratum) fn test_server() -> Arc<Server> {
@@ -449,6 +471,41 @@ pub(in crate::stratum) mod tests {
                 "6% of the network against a {bps} bps limit"
             );
         }
+    }
+
+    #[test]
+    fn a_fee_ramp_of_zero_charges_the_base_fee_and_records_nothing() {
+        for base in [0u32, 250] {
+            let server = test_server_with(|c| {
+                c.datum.gateway_fee_bps = base;
+                c.datum.gateway_fee_ramp_max_bps = 0;
+            });
+            assert_eq!(server.config.fee_ramp_max_bps(), None);
+            for _ in 0..100 {
+                assert_eq!(server.record_and_fee_bps("bc1qalice"), base);
+            }
+            assert_eq!(server.fee_bps_for("bc1qalice"), base);
+            assert_eq!(
+                server.fee_ramp.tracked_addresses(),
+                0,
+                "an address is not tracked while the ramp is off"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fee_ramp_charges_the_base_fee_until_an_address_has_mined() {
+        let server = test_server_with(|c| {
+            c.datum.gateway_fee_bps = 100;
+            c.datum.gateway_fee_ramp_max_bps = 500;
+        });
+        assert_eq!(server.fee_bps_for("bc1qalice"), 100, "an address that has not mined here");
+        assert_eq!(
+            server.record_and_fee_bps("bc1qalice"),
+            100 + (500 - 100) / BUCKETS as u32,
+            "its first share puts it in one bucket of the window's 64"
+        );
+        assert_eq!(server.fee_ramp.tracked_addresses(), 1);
     }
 
     #[test]

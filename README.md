@@ -51,12 +51,35 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
   keys and the key order are kept), validates it as at startup, and restarts the gateway on
   the same command line to apply it: every change restarts, where the C gateway applies some
   without one. The field names and the `pool_host(old)` convention are the C gateway's;
-  `datum.pool_url`, the gateway fee, the stratum port, `stratum.vardiff_min`,
+  `datum.pool_url`, the gateway fee and its ramp, the stratum port, `stratum.vardiff_min`,
   `stratum.max_network_share_bps` and `stratum.require_address_username` are editable in
   addition to the C page's fields.
 - A block share is charged the gateway fee like any other share when it passes the share
   checks (the C gateway exempts it); a block a check refuses is still sent under the miner's
   name.
+- `datum.gateway_fee_ramp_max_bps` (not a C key; 0 by default, which charges every address
+  `datum.gateway_fee_bps`) makes the fee rise per payout address with the time that address
+  has spent mining here. An address starts at `datum.gateway_fee_bps` and rises in proportion
+  to how much of the trailing `datum.gateway_fee_ramp_window_seconds` (3600 to 604800, a day
+  by default) it has mined in, reaching `gateway_fee_ramp_max_bps` once it has mined
+  throughout the window. Hashrate does not enter it: a 100 Th/s miner and a 1 Ph/s miner
+  reach the maximum at the same time. The maximum must be above `datum.gateway_fee_bps` and,
+  like it, requires `datum.pool_pass_full_users`.
+
+  The window is keyed on the payout address, not the connection, so disconnecting and
+  reconnecting carries the same position and only time ageing out of the window lowers it:
+  an address that stops mining is back at the base fee a whole window later. It is 64
+  buckets, each counted once however many shares it holds, so the ramp moves in
+  sixty-fourths of the window and an address that mines at all inside a bucket is counted for
+  that whole bucket. The state is held in memory: restarting the gateway (including a save
+  from the settings page, which restarts it) starts every address from its base fee again.
+  Nothing is recorded while the ramp is off, so turning it on starts every address from the
+  base fee as well. An address that splits its hashrate across several addresses it controls
+  ramps each of them separately, which is inherent to charging per address and costs the
+  miner a split payout.
+
+  `/stats.json` reports each address's current fee as `fee_bps` on the admin client rows and
+  on the miner lookup, alongside `fee_base_bps` and `fee_max_bps`.
 - One thread per stratum connection; `stratum.max_clients` limits the total and the
   per-thread settings size the duplicate-share table and share queue. `empty_thread`
   disconnects every client; `/threads` is not served.

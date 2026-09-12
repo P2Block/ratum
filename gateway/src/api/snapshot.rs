@@ -49,11 +49,12 @@ fn client_json(c: &ClientStats) -> Value {
     })
 }
 
-fn admin_client_json(cfg: &Config, c: &ClientStats) -> Value {
+fn admin_client_json(ctx: &Context, cfg: &Config, c: &ClientStats) -> Value {
     let unpayable = cfg.stratum.require_address_username && !username::is_payable(&c.username);
     super::with_fields(
         client_json(c),
         [
+            ("fee_bps", json!(ctx.server.fee_bps_for(username::address_of(&c.username)))),
             ("subscribed_seconds", json!(seconds_ago(c.subscribed_at))),
             ("id", json!(c.unique_id)),
             ("remote", json!(c.remote)),
@@ -132,7 +133,7 @@ pub(super) fn status_json(ctx: &Context, with_clients: bool) -> Value {
     let job = current.as_deref().map(job_json);
     let coinbaser = current.as_deref().map(coinbaser_json);
     let clients = with_clients.then(|| {
-        server.client_stats().iter().map(|c| admin_client_json(cfg, c)).collect::<Vec<_>>()
+        server.client_stats().iter().map(|c| admin_client_json(ctx, cfg, c)).collect::<Vec<_>>()
     });
     let summary = server.summary();
     json!({
@@ -159,6 +160,11 @@ pub(super) fn status_json(ctx: &Context, with_clients: bool) -> Value {
         "pool_min_diff": pool.as_ref().map(|p| p.min_difficulty),
         "pool_motd": datum_stats.motd,
         "gateway_fee_bps": cfg.datum.gateway_fee_bps,
+        "gateway_fee_ramp": cfg.fee_ramp_max_bps().map(|max_bps| json!({
+            "max_bps": max_bps,
+            "window_seconds": cfg.datum.gateway_fee_ramp_window_seconds,
+            "tracked_addresses": server.fee_ramp.tracked_addresses(),
+        })),
         "gateway_fee_address": if cfg.datum.gateway_fee_bps > 0 { json!(cfg.fee_address()) } else { Value::Null },
         "gateway_fee_collected": ratum::lock(&server.fee).json(),
         "stratum": {
@@ -211,7 +217,12 @@ pub(super) fn miner_lookup_json(ctx: &Context, addr: Option<&str>) -> Value {
         .collect();
     json!({
         "address": valid,
-        "fee_bps": cfg.datum.gateway_fee_bps,
+        "fee_bps": valid.map_or(cfg.datum.gateway_fee_bps, |a| ctx.server.fee_bps_for(a)),
+        "fee_base_bps": cfg.datum.gateway_fee_bps,
+        "fee_max_bps": cfg.fee_ramp_max_bps(),
+        "fee_ramp_window_seconds": cfg
+            .fee_ramp_max_bps()
+            .map(|_| cfg.datum.gateway_fee_ramp_window_seconds),
         "fee_address": if cfg.datum.gateway_fee_bps > 0 { cfg.fee_address() } else { "" },
         "connection_count": connections.len(),
         "connections": connections,

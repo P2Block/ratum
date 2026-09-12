@@ -9,6 +9,8 @@ const MIN_VARDIFF_TARGET_SHARES_MIN: u64 = 1;
 const MIN_VARDIFF_QUICKDIFF_COUNT: u64 = 4;
 const MIN_VARDIFF_QUICKDIFF_DELTA: u64 = 3;
 const SHARE_STALE_SECONDS_RANGE: std::ops::RangeInclusive<u64> = 60..=150;
+pub const FEE_RAMP_WINDOW_SECONDS_RANGE: std::ops::RangeInclusive<u64> =
+    ratum::SECS_PER_HOUR..=7 * ratum::SECS_PER_DAY;
 pub const DEFAULT_MAX_NETWORK_SHARE_BPS: u32 = 500;
 pub const GLOBAL_TIMEOUT_MARGIN_SECS: u64 = 5;
 
@@ -210,6 +212,8 @@ pub struct Datum {
     pub protocol_job_slots: usize,
     pub pool_pass_full_users: bool,
     pub gateway_fee_bps: u32,
+    pub gateway_fee_ramp_max_bps: u32,
+    pub gateway_fee_ramp_window_seconds: u64,
     pub gateway_fee_address: String,
     pub always_pay_self: Option<bool>,
     pub pooled_mining_only: bool,
@@ -228,6 +232,8 @@ impl Default for Datum {
             protocol_job_slots: 256,
             pool_pass_full_users: true,
             gateway_fee_bps: 0,
+            gateway_fee_ramp_max_bps: 0,
+            gateway_fee_ramp_window_seconds: ratum::SECS_PER_DAY,
             gateway_fee_address: String::new(),
             always_pay_self: None,
             pooled_mining_only: true,
@@ -447,6 +453,30 @@ impl Config {
                 );
             }
         }
+        if d.gateway_fee_ramp_max_bps > 0 {
+            if u64::from(d.gateway_fee_ramp_max_bps) > ratum::BASIS_POINTS_PER_UNIT {
+                return Err(format!(
+                    "datum.gateway_fee_ramp_max_bps must be 0..{}",
+                    ratum::BASIS_POINTS_PER_UNIT
+                ));
+            }
+            if d.gateway_fee_ramp_max_bps <= d.gateway_fee_bps {
+                return Err(
+                    "datum.gateway_fee_ramp_max_bps must be above datum.gateway_fee_bps, which is the fee an address pays before the ramp rises; set it to 0 to charge every address the same"
+                        .into(),
+                );
+            }
+            if !d.pool_pass_full_users {
+                return Err("datum.gateway_fee_ramp_max_bps requires datum.pool_pass_full_users, since a fee share is credited to the fee address in place of the miner's own username".into());
+            }
+            if !FEE_RAMP_WINDOW_SECONDS_RANGE.contains(&d.gateway_fee_ramp_window_seconds) {
+                return Err(format!(
+                    "datum.gateway_fee_ramp_window_seconds must be {}..{}",
+                    FEE_RAMP_WINDOW_SECONDS_RANGE.start(),
+                    FEE_RAMP_WINDOW_SECONDS_RANGE.end()
+                ));
+            }
+        }
         if !d.pool_host.is_empty() {
             crate::datum::parse_pool_pubkey(&d.pool_pubkey)
                 .map_err(|e| format!("datum.pool_pubkey: {e}"))?;
@@ -517,6 +547,11 @@ impl Config {
             0 => None,
             bps => Some(f64::from(bps) / ratum::BASIS_POINTS_PER_UNIT as f64),
         }
+    }
+
+    pub fn fee_ramp_max_bps(&self) -> Option<u32> {
+        let max = self.datum.gateway_fee_ramp_max_bps;
+        (max > 0).then_some(max)
     }
 
     pub fn fee_address(&self) -> &str {
@@ -590,6 +625,50 @@ mod tests {
             "\"pooled_mining_only\": false, \"pool_url\": \"https://pool.example\"",
         );
         assert_eq!(Config::parse(&text).unwrap().datum.pool_url, "https://pool.example");
+    }
+
+    #[test]
+    fn the_fee_ramp_is_off_unless_a_maximum_is_set() {
+        let c = Config::parse(&minimal()).unwrap();
+        assert_eq!(c.datum.gateway_fee_ramp_max_bps, 0);
+        assert!(c.fee_ramp_max_bps().is_none(), "no maximum leaves every address at the base");
+
+        let text = minimal().replace(
+            "\"pooled_mining_only\": false",
+            "\"pooled_mining_only\": false, \"gateway_fee_bps\": 100, \
+             \"gateway_fee_ramp_max_bps\": 500, \"gateway_fee_ramp_window_seconds\": 86400",
+        );
+        let c = Config::parse(&text).unwrap();
+        assert_eq!(c.fee_ramp_max_bps(), Some(500));
+        assert_eq!(c.datum.gateway_fee_ramp_window_seconds, 86400);
+    }
+
+    #[test]
+    fn a_fee_ramp_is_checked_against_the_base_fee_and_its_own_range() {
+        let with = |extra: &str| {
+            Config::parse(&minimal().replace(
+                "\"pooled_mining_only\": false",
+                &format!("\"pooled_mining_only\": false, {extra}"),
+            ))
+        };
+
+        let e = with("\"gateway_fee_bps\": 500, \"gateway_fee_ramp_max_bps\": 500").unwrap_err();
+        assert!(e.contains("must be above datum.gateway_fee_bps"), "{e}");
+        let e = with("\"gateway_fee_bps\": 600, \"gateway_fee_ramp_max_bps\": 500").unwrap_err();
+        assert!(e.contains("must be above datum.gateway_fee_bps"), "{e}");
+
+        let e = with("\"gateway_fee_ramp_max_bps\": 10001").unwrap_err();
+        assert!(e.contains("gateway_fee_ramp_max_bps must be 0..10000"), "{e}");
+
+        let e =
+            with("\"gateway_fee_ramp_max_bps\": 500, \"pool_pass_full_users\": false").unwrap_err();
+        assert!(e.contains("pool_pass_full_users"), "{e}");
+
+        let e = with("\"gateway_fee_ramp_max_bps\": 500, \"gateway_fee_ramp_window_seconds\": 60")
+            .unwrap_err();
+        assert!(e.contains("gateway_fee_ramp_window_seconds must be"), "{e}");
+
+        assert!(with("\"gateway_fee_ramp_max_bps\": 500").is_ok(), "the defaults fill the rest");
     }
 
     #[test]

@@ -4,6 +4,7 @@ mod coinbase;
 mod config;
 mod datum;
 mod dupes;
+mod feeramp;
 mod job;
 mod logger;
 mod publish;
