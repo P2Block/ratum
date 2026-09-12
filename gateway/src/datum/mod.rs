@@ -2,17 +2,17 @@ mod session;
 mod validation;
 
 use crate::config::Config;
-use crate::job::{Abw, Job, PoolConfig};
+use crate::job::{AbwAssignment, Job, PoolConfig};
 use crate::tally::Tally;
-use crate::template::Notify;
+use crate::template::TemplateWaker;
 use log::{debug, error, info, warn};
 use mio::Waker;
 use ratum::datum::abw;
 use ratum::datum::handshake::{KeyPairs, PUBKEY_LEN};
 use ratum::datum::messages::{ClientConfig, ClientConfigV3, CoinbaserResponse, ResumeToken};
 use ratum::datum::share;
-use ratum::datum::validation::{JOB_INDEX_INVALID, Status};
-use ratum::header::HeaderV2;
+use ratum::datum::validation::{JOB_INDEX_INVALID, TxnListStatus};
+use ratum::header::BlockHeaderV2;
 use ratum::target;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -20,34 +20,34 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 const COINBASER_WAIT: Duration = Duration::from_secs(5);
-const COINBASER_MIN_VALUE: u64 = 31_250_000;
+const MIN_COINBASER_VALUE: u64 = 31_250_000;
 const MIN_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Default)]
-pub(in crate::datum) struct AbwSlots {
-    keys: [Option<[u8; 32]>; abw::ASSIGNMENT_SLOTS as usize],
+pub(in crate::datum) struct AbwAssignments {
+    key_hashes: [Option<[u8; 32]>; abw::ASSIGNMENT_SLOTS as usize],
     active: Option<u8>,
 }
 
-impl AbwSlots {
-    fn assignment(&self) -> Option<Abw> {
+impl AbwAssignments {
+    fn assignment(&self) -> Option<AbwAssignment> {
         let slot = self.active?;
-        Some(Abw { slot, key_hash: self.keys[slot as usize]? })
+        Some(AbwAssignment { slot, key_hash: self.key_hashes[slot as usize]? })
     }
 
-    pub(in crate::datum) fn holds(&self, a: Abw) -> bool {
-        self.keys[a.slot as usize] == Some(a.key_hash)
+    pub(in crate::datum) fn holds(&self, a: AbwAssignment) -> bool {
+        self.key_hashes[a.slot as usize] == Some(a.key_hash)
     }
 
     pub(in crate::datum) fn install(&mut self, slot: u8, key_hash: [u8; 32], active: bool) {
-        self.keys[slot as usize] = Some(key_hash);
+        self.key_hashes[slot as usize] = Some(key_hash);
         if active {
             self.active = Some(slot);
         }
     }
 
     pub(in crate::datum) fn activate(&mut self, slot: u8) -> bool {
-        if self.keys[slot as usize].is_none() {
+        if self.key_hashes[slot as usize].is_none() {
             return false;
         }
         self.active = Some(slot);
@@ -55,12 +55,12 @@ impl AbwSlots {
     }
 
     pub(in crate::datum) fn reveal(&mut self, slot: u8, xor_key: &abw::XorKey) -> bool {
-        if let Some(hash) = self.keys[slot as usize]
+        if let Some(hash) = self.key_hashes[slot as usize]
             && !abw::key_matches_hash(xor_key, &hash)
         {
             return false;
         }
-        self.keys[slot as usize] = None;
+        self.key_hashes[slot as usize] = None;
         if self.active == Some(slot) {
             self.active = None;
         }
@@ -101,10 +101,9 @@ impl PoolConfig {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct Stats {
+pub struct ShareTallies {
     pub accepted: Tally,
     pub rejected: Tally,
-    pub motd: String,
 }
 
 #[derive(Clone)]
@@ -115,7 +114,7 @@ pub struct QueuedShare {
     pub subsidy_only: bool,
     pub quickdiff: bool,
     pub target_byte: u8,
-    pub header: HeaderV2,
+    pub header: BlockHeaderV2,
     pub username: String,
 }
 
@@ -127,48 +126,50 @@ pub struct CoinbaserRequestState {
     pub superseded: AtomicBool,
 }
 
-pub struct Pool {
-    pub(in crate::datum) config: Mutex<Option<PoolConfig>>,
+pub struct PoolConnectionState {
+    pub(in crate::datum) pool_config: Mutex<Option<PoolConfig>>,
     min_difficulty: AtomicU64,
-    pub stats: Mutex<Stats>,
+    pub tallies: Mutex<ShareTallies>,
+    pub motd: Mutex<String>,
     pub(in crate::datum) queue: Mutex<VecDeque<QueuedShare>>,
     queue_capacity: usize,
-    pub(in crate::datum) coinbaser: Mutex<Option<Arc<CoinbaserRequestState>>>,
-    pub slots: Mutex<Vec<Option<Arc<Job>>>>,
-    pub(in crate::datum) abw: Mutex<AbwSlots>,
+    pub(in crate::datum) coinbaser_request: Mutex<Option<Arc<CoinbaserRequestState>>>,
+    pub job_slots: Mutex<Vec<Option<Arc<Job>>>>,
+    pub(in crate::datum) abw: Mutex<AbwAssignments>,
     pub(in crate::datum) resume_token: Mutex<Option<ResumeToken>>,
     pub(in crate::datum) node: Option<ratum::rpc::Client>,
-    pub notify: Arc<Notify>,
-    pub failures: AtomicU32,
-    pub(in crate::datum) waker: Mutex<Option<Arc<Waker>>>,
+    pub template_waker: Arc<TemplateWaker>,
+    pub connect_failures: AtomicU32,
+    pub(in crate::datum) session_waker: Mutex<Option<Arc<Waker>>>,
 }
 
-impl Pool {
+impl PoolConnectionState {
     pub fn new(
         slots: usize,
         queue_capacity: usize,
-        notify: Arc<Notify>,
+        template_waker: Arc<TemplateWaker>,
         node: Option<ratum::rpc::Client>,
     ) -> Self {
         Self {
-            config: Mutex::new(None),
+            pool_config: Mutex::new(None),
             min_difficulty: AtomicU64::new(0),
-            stats: Mutex::new(Stats::default()),
+            tallies: Mutex::new(ShareTallies::default()),
+            motd: Mutex::new(String::new()),
             queue: Mutex::new(VecDeque::new()),
             queue_capacity: queue_capacity.max(MIN_QUEUE_CAPACITY),
-            coinbaser: Mutex::new(None),
-            slots: Mutex::new(vec![None; slots]),
-            abw: Mutex::new(AbwSlots::default()),
+            coinbaser_request: Mutex::new(None),
+            job_slots: Mutex::new(vec![None; slots]),
+            abw: Mutex::new(AbwAssignments::default()),
             resume_token: Mutex::new(None),
             node,
-            notify,
-            failures: AtomicU32::new(0),
-            waker: Mutex::new(None),
+            template_waker,
+            connect_failures: AtomicU32::new(0),
+            session_waker: Mutex::new(None),
         }
     }
 
     fn wake(&self) {
-        if let Some(w) = ratum::lock(&self.waker).as_ref()
+        if let Some(w) = ratum::lock(&self.session_waker).as_ref()
             && let Err(e) = w.wake()
         {
             debug!("could not wake the DATUM session thread: {e}");
@@ -176,10 +177,10 @@ impl Pool {
     }
 
     pub fn require_abw(&self) -> bool {
-        ratum::lock(&self.config).as_ref().is_some_and(|c| c.protocol_v3 && !c.abw_disabled)
+        ratum::lock(&self.pool_config).as_ref().is_some_and(|c| c.protocol_v3 && !c.abw_disabled)
     }
 
-    pub fn abw_assignment(&self) -> Option<Abw> {
+    pub fn abw_assignment(&self) -> Option<AbwAssignment> {
         ratum::lock(&self.abw).assignment()
     }
 
@@ -188,15 +189,15 @@ impl Pool {
     }
 
     pub fn is_active(&self) -> bool {
-        ratum::lock(&self.config).is_some()
+        ratum::lock(&self.pool_config).is_some()
     }
 
     pub fn pool_config(&self) -> Option<PoolConfig> {
-        ratum::lock(&self.config).clone()
+        ratum::lock(&self.pool_config).clone()
     }
 
     pub fn payout_script(&self) -> Option<Vec<u8>> {
-        ratum::lock(&self.config).as_ref().map(|c| c.payout_script.clone())
+        ratum::lock(&self.pool_config).as_ref().map(|c| c.payout_script.clone())
     }
 
     pub fn min_difficulty(&self) -> u64 {
@@ -205,27 +206,27 @@ impl Pool {
 
     pub(in crate::datum) fn set_config(&self, config: PoolConfig) -> Option<PoolConfig> {
         self.min_difficulty.store(config.min_difficulty, Ordering::Relaxed);
-        ratum::lock(&self.config).replace(config)
+        ratum::lock(&self.pool_config).replace(config)
     }
 
     fn disconnected(&self) -> bool {
-        *ratum::lock(&self.waker) = None;
-        let was_active = ratum::lock(&self.config).take().is_some();
-        let waiting = ratum::lock(&self.coinbaser).take();
+        *ratum::lock(&self.session_waker) = None;
+        let was_active = ratum::lock(&self.pool_config).take().is_some();
+        let waiting = ratum::lock(&self.coinbaser_request).take();
         if let Some(state) = waiting {
             state.done.notify_all();
         }
         ratum::lock(&self.queue).clear();
-        *ratum::lock(&self.abw) = AbwSlots::default();
+        *ratum::lock(&self.abw) = AbwAssignments::default();
         was_active
     }
 
-    pub(in crate::datum) fn slot(&self, index: u8) -> Result<Arc<Job>, (u8, Status)> {
-        let slots = ratum::lock(&self.slots);
+    pub(in crate::datum) fn job_slot(&self, index: u8) -> Result<Arc<Job>, (u8, TxnListStatus)> {
+        let slots = ratum::lock(&self.job_slots);
         if index as usize >= slots.len() {
-            return Err((JOB_INDEX_INVALID, Status::BadJobIndex));
+            return Err((JOB_INDEX_INVALID, TxnListStatus::BadJobIndex));
         }
-        slots[index as usize].clone().ok_or((index, Status::JobEmpty))
+        slots[index as usize].clone().ok_or((index, TxnListStatus::JobEmpty))
     }
 
     pub fn submit(&self, share: QueuedShare) {
@@ -244,7 +245,7 @@ impl Pool {
     }
 
     pub fn fetch_coinbaser(&self, value: u64, prev_hash: [u8; 32]) -> Option<CoinbaserResponse> {
-        if !self.is_active() || value < COINBASER_MIN_VALUE {
+        if !self.is_active() || value < MIN_COINBASER_VALUE {
             return None;
         }
         let state = Arc::new(CoinbaserRequestState {
@@ -254,7 +255,7 @@ impl Pool {
             done: Condvar::new(),
             superseded: AtomicBool::new(false),
         });
-        let superseded = ratum::lock(&self.coinbaser).replace(Arc::clone(&state));
+        let superseded = ratum::lock(&self.coinbaser_request).replace(Arc::clone(&state));
         if let Some(old) = superseded {
             old.superseded.store(true, Ordering::SeqCst);
             old.done.notify_all();
@@ -270,7 +271,7 @@ impl Pool {
         let response = guard.clone();
         drop(guard);
         {
-            let mut waiting = ratum::lock(&self.coinbaser);
+            let mut waiting = ratum::lock(&self.coinbaser_request);
             if waiting.as_ref().is_some_and(|w| Arc::ptr_eq(w, &state)) {
                 *waiting = None;
             }
@@ -294,7 +295,7 @@ impl Pool {
 }
 
 #[derive(Clone)]
-pub struct Settings {
+pub struct PoolConnectionSettings {
     pub host: String,
     pub port: u16,
     pub pool_sign_pk: [u8; 32],
@@ -307,7 +308,7 @@ pub struct Settings {
     pub protocol_v3: bool,
 }
 
-impl Settings {
+impl PoolConnectionSettings {
     pub fn from_config(config: &Config) -> Self {
         let (pool_sign_pk, pool_box_pk) =
             parse_pool_pubkey(&config.datum.pool_pubkey).expect("validated");
@@ -326,7 +327,7 @@ impl Settings {
     }
 }
 
-pub fn wire_username(settings: &Settings, username: &str) -> String {
+pub fn wire_username(settings: &PoolConnectionSettings, username: &str) -> String {
     let full = if (!settings.pass_full_users && !settings.pass_workers) || username.is_empty() {
         settings.pool_address.clone()
     } else if settings.pass_full_users && !username.starts_with('.') {
@@ -335,7 +336,7 @@ pub fn wire_username(settings: &Settings, username: &str) -> String {
         let dot = if username.starts_with('.') { "" } else { "." };
         format!("{}{dot}{username}", settings.pool_address)
     };
-    let mut end = full.len().min(share::MAX_USERNAME);
+    let mut end = full.len().min(share::MAX_USERNAME_LEN);
     while !full.is_char_boundary(end) {
         end -= 1;
     }
@@ -359,7 +360,11 @@ pub fn user_agent() -> String {
 const RECONNECT_DELAY_MIN: Duration = Duration::from_secs(5);
 const RECONNECT_DELAY_SPREAD: Duration = Duration::from_secs(15);
 
-pub fn run_forever(settings: Settings, pool: Arc<Pool>, identity: KeyPairs) {
+pub fn run_forever(
+    settings: PoolConnectionSettings,
+    pool: Arc<PoolConnectionState>,
+    identity: KeyPairs,
+) {
     loop {
         info!("connecting to DATUM pool {}:{}", settings.host, settings.port);
         let outcome = session::run(&settings, &pool, &identity);
@@ -368,10 +373,10 @@ pub fn run_forever(settings: Settings, pool: Arc<Pool>, identity: KeyPairs) {
             error!("DATUM connection ended: {e}");
         }
         if was_active {
-            pool.failures.store(1, Ordering::Relaxed);
-            pool.notify.rebuild();
+            pool.connect_failures.store(1, Ordering::Relaxed);
+            pool.template_waker.rebuild();
         } else {
-            pool.failures.fetch_add(1, Ordering::Relaxed);
+            pool.connect_failures.fetch_add(1, Ordering::Relaxed);
         }
         let delay = RECONNECT_DELAY_MIN
             + Duration::from_millis(u64::from(

@@ -1,5 +1,6 @@
 pub mod abw;
 pub mod bulk;
+pub mod channel;
 pub mod client;
 pub(crate) mod codes;
 pub mod coinbase;

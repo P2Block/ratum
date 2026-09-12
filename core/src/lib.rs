@@ -1,15 +1,14 @@
 pub mod bitcoin;
-pub mod cursor;
 pub mod datum;
 #[cfg(feature = "test-support")]
 pub mod fixtures;
 pub mod hashrate;
 pub mod header;
 pub mod http;
-pub mod io;
 pub mod nonce;
 pub mod poll;
 pub mod rand;
+pub mod reader;
 pub mod rpc;
 pub mod target;
 pub mod thread;

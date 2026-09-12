@@ -8,6 +8,8 @@ const WAKE: Token = Token(1);
 
 const EVENT_CAPACITY: usize = 8;
 
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct PolledSocket {
     stream: TcpStream,
     poll: Poll,
@@ -115,5 +117,78 @@ impl PolledSocket {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{TcpListener, TcpStream};
+
+    fn pair() -> (TcpStream, PolledSocket) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (served, _) = listener.accept().unwrap();
+        (client, PolledSocket::new(served).unwrap())
+    }
+
+    #[test]
+    fn read_exact_times_out_on_a_slow_peer() {
+        let (mut client, mut socket) = pair();
+        let sender = std::thread::spawn(move || {
+            client.write_all(&[0x01]).unwrap();
+            std::thread::sleep(Duration::from_millis(600));
+            drop(client);
+        });
+        let started = Instant::now();
+        let mut buf = [0u8; 4];
+        let limit = Duration::from_millis(200);
+        let e = socket.read_exact(&mut buf, limit, limit).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2), "it returns near the deadline");
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn read_exact_reads_all_bytes_when_they_arrive() {
+        let (mut client, mut socket) = pair();
+        let sender = std::thread::spawn(move || {
+            client.write_all(&[1, 2]).unwrap();
+            std::thread::sleep(Duration::from_millis(60));
+            client.write_all(&[3, 4, 5, 6]).unwrap();
+        });
+        let mut buf = [0u8; 4];
+        let limit = Duration::from_secs(5);
+        socket.read_exact(&mut buf, limit, limit).unwrap();
+        assert_eq!(buf, [1, 2, 3, 4]);
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn read_exact_stalls_on_the_idle_limit_before_the_total() {
+        let (mut client, mut socket) = pair();
+        let sender = std::thread::spawn(move || {
+            client.write_all(&[0x01]).unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+            drop(client);
+        });
+        let started = Instant::now();
+        let mut buf = [0u8; 4];
+        let e = socket
+            .read_exact(&mut buf, Duration::from_millis(100), Duration::from_secs(5))
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1), "the idle limit ended the read");
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn a_peer_that_closes_mid_read_is_unexpected_eof() {
+        let (client, mut socket) = pair();
+        drop(client);
+        let mut buf = [0u8; 4];
+        let limit = Duration::from_secs(1);
+        let e = socket.read_exact(&mut buf, limit, limit).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

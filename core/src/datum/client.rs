@@ -1,7 +1,8 @@
-use super::framing::{self, Header, HeaderKeys, KeyRatchet, STRUCT_END, SessionNonces};
+use super::channel::{Channel, Error, Signature, strip_signature};
+use super::framing::{self, FrameHeader, HeaderKeyRatchet, HeaderKeys, STRUCT_END, SessionNonces};
 use super::handshake::{
-    Channel, Error, Generation, KEYS_LEN, KeyPairs, POOL_BOX_KEY_INDEX, POOL_SIGN_KEY_INDEX,
-    RESPONSE_KEYS_LEN, Signature, key_at, pubkey_at,
+    HELLO_PUBKEYS_LEN, KeyPairs, POOL_BOX_KEY_INDEX, POOL_SIGN_KEY_INDEX, ProtocolVersion,
+    RESPONSE_PUBKEYS_LEN, key_at, pubkey_at,
 };
 use bytes::BufMut as _;
 use dryoc::classic::crypto_box::{
@@ -12,17 +13,17 @@ use dryoc::classic::crypto_sign::{
 };
 use dryoc::constants::{CRYPTO_BOX_SEALBYTES, CRYPTO_SIGN_BYTES};
 
-const HELLO_PAD_MAX: usize = 200;
+const MAX_HELLO_PAD_LEN: usize = 200;
 
-const HELLO_TAIL_MAX: usize = 1
+const MAX_HELLO_TAIL_LEN: usize = 1
     + 1
     + size_of::<u32>()
     + super::handshake::DRS_TOKEN_AT
     + super::messages::RESUME_TOKEN_LEN
-    + HELLO_PAD_MAX
+    + MAX_HELLO_PAD_LEN
     + CRYPTO_SIGN_BYTES;
 
-pub struct Client {
+pub struct ClientChannel {
     long_term_keys: KeyPairs,
     session_keys: KeyPairs,
     nk: u32,
@@ -31,7 +32,7 @@ pub struct Client {
     motd: String,
 }
 
-impl Client {
+impl ClientChannel {
     pub fn with_key_pairs(long_term_keys: KeyPairs, session_keys: KeyPairs, nk: u32) -> Self {
         Self {
             long_term_keys,
@@ -48,7 +49,7 @@ impl Client {
     }
 
     pub fn hello(&mut self, pool_box_pk: &BoxPublicKey, user_agent: &str) -> Vec<u8> {
-        self.hello_with(pool_box_pk, user_agent, Generation::V1)
+        self.hello_with(pool_box_pk, user_agent, ProtocolVersion::V1)
     }
 
     pub fn hello_resumable(
@@ -57,16 +58,17 @@ impl Client {
         user_agent: &str,
         token: Option<&super::messages::ResumeToken>,
     ) -> Vec<u8> {
-        self.hello_with(pool_box_pk, user_agent, Generation::V3 { resume: token.copied() })
+        self.hello_with(pool_box_pk, user_agent, ProtocolVersion::V3 { resume: token.copied() })
     }
 
     fn hello_with(
         &mut self,
         pool_box_pk: &BoxPublicKey,
         user_agent: &str,
-        generation: Generation,
+        protocol_version: ProtocolVersion,
     ) -> Vec<u8> {
-        let mut body = Vec::with_capacity(KEYS_LEN + user_agent.len() + HELLO_TAIL_MAX);
+        let mut body =
+            Vec::with_capacity(HELLO_PUBKEYS_LEN + user_agent.len() + MAX_HELLO_TAIL_LEN);
         body.put_slice(&self.long_term_keys.sign_pk);
         body.put_slice(&self.long_term_keys.box_pk);
         body.put_slice(&self.session_keys.sign_pk);
@@ -75,7 +77,7 @@ impl Client {
         body.put_u8(0);
         body.put_u8(STRUCT_END);
         body.put_u32_le(self.nk);
-        if let Generation::V3 { resume } = generation {
+        if let ProtocolVersion::V3 { resume } = protocol_version {
             body.put_slice(&super::handshake::DRS_MARKER);
             match resume {
                 Some(t) => {
@@ -86,7 +88,7 @@ impl Client {
             }
         }
         let r = crate::rand::bytes::<2>();
-        let pad_len = 1 + usize::from(r[0]) % HELLO_PAD_MAX;
+        let pad_len = 1 + usize::from(r[0]) % MAX_HELLO_PAD_LEN;
         body.resize(body.len() + pad_len, r[1]);
 
         let mut sig: Signature = [0u8; CRYPTO_SIGN_BYTES];
@@ -96,7 +98,7 @@ impl Client {
         let mut sealed = vec![0u8; body.len() + CRYPTO_BOX_SEALBYTES];
         crypto_box_seal(&mut sealed, &body, pool_box_pk).expect("seal hello");
 
-        let header = Header {
+        let header = FrameHeader {
             cmd_len: sealed.len() as u32,
             is_signed: true,
             is_encrypted_pubkey: true,
@@ -110,8 +112,8 @@ impl Client {
         let keys = HeaderKeys::from_nk(self.nk);
         let nonces = SessionNonces::derive(self.nk, &self.session_keys.sign_pk);
         self.channel = Channel::new(
-            KeyRatchet::new(keys.client_to_server),
-            KeyRatchet::new(keys.server_to_client),
+            HeaderKeyRatchet::new(keys.client_to_server),
+            HeaderKeyRatchet::new(keys.server_to_client),
             nonces.client_sender,
             nonces.client_receiver,
             None,
@@ -146,7 +148,7 @@ impl Client {
         let mut plain = vec![0u8; ct.len() - CRYPTO_BOX_SEALBYTES];
         crypto_box_seal_open(&mut plain, ct, &self.session_keys.box_pk, &self.session_keys.box_sk)
             .map_err(|_| Error::Unseal)?;
-        if plain.len() < RESPONSE_KEYS_LEN + CRYPTO_SIGN_BYTES {
+        if plain.len() < RESPONSE_PUBKEYS_LEN + CRYPTO_SIGN_BYTES {
             return Err(Error::Truncated);
         }
 
@@ -166,7 +168,7 @@ impl Client {
 
         let pool_sign: SignPublicKey = pubkey_at(signed, POOL_SIGN_KEY_INDEX);
         let pool_box: BoxPublicKey = pubkey_at(signed, POOL_BOX_KEY_INDEX);
-        let motd = &signed[RESPONSE_KEYS_LEN..];
+        let motd = &signed[RESPONSE_PUBKEYS_LEN..];
         let end = motd.iter().position(|&b| b == 0).unwrap_or(motd.len());
         self.motd = String::from_utf8_lossy(&motd[..end]).into_owned();
         self.pool_session_sign_pk = Some(pool_sign);
@@ -181,16 +183,16 @@ impl Client {
         self.channel.encrypt(proto_cmd, payload, None)
     }
 
-    pub fn unmask_header(&mut self, bytes: [u8; framing::HEADER_LEN]) -> Header {
+    pub fn unmask_header(&mut self, bytes: [u8; framing::HEADER_LEN]) -> FrameHeader {
         self.channel.unmask_header(bytes)
     }
 
-    pub fn peek_handshake_header(&self, bytes: [u8; framing::HEADER_LEN]) -> Header {
+    pub fn peek_handshake_header(&self, bytes: [u8; framing::HEADER_LEN]) -> FrameHeader {
         let key = HeaderKeys::from_nk(self.nk).server_to_client;
-        Header::from_bytes((u32::from_le_bytes(bytes) ^ key).to_le_bytes())
+        FrameHeader::from_bytes((u32::from_le_bytes(bytes) ^ key).to_le_bytes())
     }
 
-    pub fn decrypt(&mut self, header: Header, ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
+    pub fn decrypt(&mut self, header: FrameHeader, ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
         let verify = self.pool_session_sign_pk.as_ref();
         match (header.is_encrypted_channel, header.is_encrypted_pubkey) {
             (true, false) => self.channel.decrypt(header, ciphertext, verify),
@@ -206,30 +208,18 @@ impl Client {
                     &self.session_keys.box_sk,
                 )
                 .map_err(|_| Error::Unseal)?;
-                super::handshake::strip_signature(plain, header, verify)
+                strip_signature(plain, header, verify)
             }
-            _ => super::handshake::strip_signature(ciphertext.to_vec(), header, verify),
+            _ => strip_signature(ciphertext.to_vec(), header, verify),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-
-    fn client_with_generated_keys(nk: u32) -> Client {
-        Client::with_key_pairs(KeyPairs::generate(), KeyPairs::generate(), nk)
-    }
     use super::*;
-    use crate::datum::handshake::{accept, open_hello};
-
-    fn server_read_hello(
-        wire: &[u8],
-        pool: &KeyPairs,
-    ) -> Result<crate::datum::handshake::Hello, Error> {
-        let mut rx = KeyRatchet::hello();
-        let header = rx.unmask(wire[..4].try_into().unwrap());
-        open_hello(header, &wire[4..4 + header.cmd_len as usize], pool)
-    }
+    use crate::datum::handshake::accept;
+    use crate::datum::handshake::tests::{client_with_generated_keys, server_read_hello};
 
     #[test]
     fn client_and_server_complete_a_handshake_and_exchange_messages_both_ways() {
@@ -272,7 +262,7 @@ mod tests {
         let mut client = client_with_generated_keys(9);
         let wire = client.hello(&pool.box_pk, "ua");
         let hello = server_read_hello(&wire, &pool).unwrap();
-        let motd = "m".repeat(crate::datum::handshake::MAX_MOTD);
+        let motd = "m".repeat(crate::datum::handshake::MAX_MOTD_LEN);
         let (response, _) = accept(hello, &pool, &motd).unwrap();
         client.read_handshake_response(&response, &pool.sign_pk).unwrap();
         assert_eq!(client.motd(), motd);
@@ -322,8 +312,11 @@ mod tests {
         let hello = server_read_hello(&wire, &pool).unwrap();
         let (response, _) = accept(hello, &pool, "hi").unwrap();
         for cut in [0, 1, 3, 4, 10, response.len() - 1] {
-            let mut c =
-                Client::with_key_pairs(KeyPairs::generate(), KeyPairs::generate(), client.nk);
+            let mut c = ClientChannel::with_key_pairs(
+                KeyPairs::generate(),
+                KeyPairs::generate(),
+                client.nk,
+            );
             let _ = c.hello(&pool.box_pk, "ua");
             assert!(
                 c.read_handshake_response(&response[..cut], &pool.sign_pk).is_err(),
@@ -336,7 +329,7 @@ mod tests {
     fn encrypting_or_decrypting_before_the_handshake_is_an_error_not_a_panic() {
         let mut client = client_with_generated_keys(1);
         assert!(matches!(client.encrypt(framing::cmd::MINING, b"x"), Err(Error::NoChannel)));
-        let header = Header { cmd_len: 4, is_encrypted_channel: true, ..Default::default() };
+        let header = FrameHeader { cmd_len: 4, is_encrypted_channel: true, ..Default::default() };
         assert!(matches!(client.decrypt(header, &[0u8; 32]), Err(Error::NoChannel)));
     }
 
@@ -349,15 +342,18 @@ mod tests {
         let (response, mut session) = accept(hello, &pool, "hi").unwrap();
         client.read_handshake_response(&response, &pool.sign_pk).unwrap();
 
-        let plain =
-            Header { cmd_len: 3, proto_cmd: framing::cmd::HELLO_OR_PING, ..Default::default() };
+        let plain = FrameHeader {
+            cmd_len: 3,
+            proto_cmd: framing::cmd::HELLO_OR_PING,
+            ..Default::default()
+        };
         assert_eq!(client.decrypt(plain, b"abc").unwrap(), b"abc");
 
         let wire = session.encrypt(framing::cmd::MINING, b"after", false).unwrap();
         let header = client.unmask_header(wire[..4].try_into().unwrap());
         assert_eq!(client.decrypt(header, &wire[4..]).unwrap(), b"after");
 
-        let signed = Header {
+        let signed = FrameHeader {
             cmd_len: 70,
             is_signed: true,
             proto_cmd: framing::cmd::INFO,

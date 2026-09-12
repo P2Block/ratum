@@ -1,4 +1,4 @@
-use crate::server::{Payability, Resolver, Server, owed_for_block};
+use crate::server::{AddressResolver, Payability, Server, owed_for_block};
 use log::{debug, error, info, warn};
 use ratum::datum::share::PowSubmit;
 use ratum::lock;
@@ -14,13 +14,13 @@ fn identity_suffix(count: usize) -> &'static str {
     if count == 1 { "y" } else { "ies" }
 }
 
-pub(crate) struct Crediting {
+pub(crate) struct CreditState {
     peer: SocketAddr,
     credited: HashMap<String, u64>,
     reported_unpayable: HashSet<String>,
 }
 
-impl Crediting {
+impl CreditState {
     pub(crate) fn new(peer: SocketAddr) -> Self {
         Self { peer, credited: HashMap::new(), reported_unpayable: HashSet::new() }
     }
@@ -53,17 +53,17 @@ impl Crediting {
         now: u64,
     ) {
         let peer = self.peer;
-        let difficulty = lock(&server.node_view.tip).map_or(0.0, |t| t.difficulty);
+        let network_difficulty = lock(&server.node_view.tip).map_or(0.0, |t| t.difficulty);
         let mut l = lock(&server.ledger);
         let block = ledger::FoundBlock {
             at: now,
-            height: a.work.height,
-            block_hash: a.work.block_hash,
-            paid_to_split: a.work.paid_to_split,
-            paid_to_pool: a.work.paid_to_pool,
+            height: a.rebuilt.height,
+            block_hash: a.rebuilt.block_hash,
+            paid_to_split: a.rebuilt.paid_to_split,
+            paid_to_pool: a.rebuilt.paid_to_pool,
             finder: ledger::identity_of(&s.username).to_string(),
-            tag: a.work.tag_secondary.clone(),
-            difficulty,
+            tag: a.rebuilt.tag_secondary.clone(),
+            network_difficulty,
             cumulative_work: l.cumulative_work(),
         };
         if let Err(e) = l.record_block(block) {
@@ -76,8 +76,8 @@ impl Crediting {
 
     pub(crate) fn record_owed_block(&self, server: &Server, a: &AcceptedShare, now: u64) {
         let peer = self.peer;
-        let value = a.work.paid_to_pool;
-        let Some(owed) = owed_for_block(server, a.work.height, a.work.block_hash, value, now)
+        let value = a.rebuilt.paid_to_pool;
+        let Some(owed) = owed_for_block(server, a.rebuilt.height, a.rebuilt.block_hash, value, now)
         else {
             warn!(
                 "[{peer}]   ** the block's {value} sats went to the pool's payout script and \
@@ -103,10 +103,10 @@ impl Crediting {
         now: u64,
     ) {
         let peer = self.peer;
-        let value = a.work.paid_to_split.saturating_add(a.work.paid_to_pool);
-        let fee = server.payout.fee_on(value);
-        let available = a.work.paid_to_pool.saturating_sub(fee);
-        let mut entries = verifier.unpaid_outputs(&a.work);
+        let value = a.rebuilt.paid_to_split.saturating_add(a.rebuilt.paid_to_pool);
+        let fee = server.payout_policy.fee_on(value);
+        let available = a.rebuilt.paid_to_pool.saturating_sub(fee);
+        let mut entries = verifier.unpaid_outputs(&a.rebuilt);
         let dictated: u64 = entries.iter().map(|(_, sats)| *sats).sum();
         if dictated > available {
             warn!(
@@ -126,8 +126,8 @@ impl Crediting {
         warn!(
             "[{peer}]   ** the block's coinbase left out {} of the dictated outputs; the pool's \
              payout script received {} sats of which {total} are owed to {} identit{}:",
-            a.work.unpaid.len(),
-            a.work.paid_to_pool,
+            a.rebuilt.unpaid_output_indexes.len(),
+            a.rebuilt.paid_to_pool,
             entries.len(),
             identity_suffix(entries.len()),
         );
@@ -135,8 +135,8 @@ impl Crediting {
             server,
             ledger::OwedBlock {
                 at: now,
-                height: a.work.height,
-                block_hash: a.work.block_hash,
+                height: a.rebuilt.height,
+                block_hash: a.rebuilt.block_hash,
                 total,
                 settled_at: None,
                 entries,
@@ -147,7 +147,7 @@ impl Crediting {
     pub(crate) fn is_unpayable(&mut self, server: &Server, username: &str) -> bool {
         let identity = ledger::identity_of(username);
         let Payability::Unpayable(why) =
-            Resolver::payability(&server.resolver, &server.node, identity)
+            AddressResolver::payability(&server.resolver, &server.node, identity)
         else {
             return false;
         };
@@ -182,8 +182,8 @@ impl Crediting {
             if let Some(d) = network {
                 let w = ledger::window_for_difficulty(
                     d,
-                    server.payout.window_multiple,
-                    server.payout.window_floor,
+                    server.payout_policy.window_multiple,
+                    server.payout_policy.window_floor,
                 );
                 if w != l.window() {
                     let re_read = l.set_window(w);
@@ -198,12 +198,12 @@ impl Crediting {
             if let Err(e) = l.record(
                 now,
                 &identity,
-                a.work.difficulty,
-                &a.work.block_hash,
-                &a.work.tag_secondary,
+                a.rebuilt.difficulty,
+                &a.rebuilt.block_hash,
+                &a.rebuilt.tag_secondary,
             ) {
                 drop(l);
-                lock(&server.replay).remove(&a.work.block_hash);
+                lock(&server.accepted_hashes).remove(&a.rebuilt.block_hash);
                 return Err(e);
             }
             let removed = l.take_removed();
@@ -216,23 +216,23 @@ impl Crediting {
         }
         let total = match self.credited.get_mut(&s.username) {
             Some(total) => {
-                *total = total.saturating_add(a.work.difficulty);
+                *total = total.saturating_add(a.rebuilt.difficulty);
                 *total
             }
             None => {
                 if self.credited.len() < MAX_CREDITED_NAMES {
-                    self.credited.insert(s.username.clone(), a.work.difficulty);
+                    self.credited.insert(s.username.clone(), a.rebuilt.difficulty);
                 }
-                a.work.difficulty
+                a.rebuilt.difficulty
             }
         };
         debug!(
             "[{peer}]   <- accepted diff={} hash={} height={} split={} pool={} sats; {} credited {}",
-            a.work.difficulty,
-            hex::encode(a.work.block_hash),
-            a.work.height,
-            a.work.paid_to_split,
-            a.work.paid_to_pool,
+            a.rebuilt.difficulty,
+            hex::encode(a.rebuilt.block_hash),
+            a.rebuilt.height,
+            a.rebuilt.paid_to_split,
+            a.rebuilt.paid_to_pool,
             s.username,
             total,
         );

@@ -43,8 +43,8 @@ fn client_json(c: &ClientStats) -> Value {
         "accepted_count": c.accepted.count,
         "rejected_diff": c.rejected.diff,
         "rejected_count": c.rejected.count,
-        "fee_diff": c.fee.diff,
-        "fee_count": c.fee.count,
+        "fee_diff": c.fee_shares.diff,
+        "fee_count": c.fee_shares.count,
         "hashrate_ths": c.hashrate_ths(),
     })
 }
@@ -60,7 +60,7 @@ fn admin_client_json(ctx: &Context, cfg: &Config, c: &ClientStats) -> Value {
             ("remote", json!(c.remote)),
             ("username", json!(c.username)),
             ("unpayable", json!(unpayable)),
-            ("useragent", json!(c.useragent)),
+            ("useragent", json!(c.user_agent)),
             ("subscribed", json!(c.subscribed)),
         ],
     )
@@ -103,8 +103,8 @@ fn coinbaser_json(j: &Job) -> Vec<Value> {
         .map(|r| {
             json!({
                 "value_btc": r.value as f64 / ratum::SATS_PER_BTC,
-                "address": address::output_script_to_display(&r.script),
-                "remainder": r.remainder,
+                "address": address::output_script_to_display(&r.script_pubkey),
+                "remainder": r.is_remainder,
             })
         })
         .collect()
@@ -113,8 +113,8 @@ fn coinbaser_json(j: &Job) -> Vec<Value> {
 pub(super) fn status_json(ctx: &Context, with_clients: bool) -> Value {
     let server = &ctx.server;
     let cfg = &server.config;
-    let datum_stats = ratum::lock(&server.datum.stats).clone();
-    let pool = server.datum.pool_config();
+    let pool_tallies = ratum::lock(&server.pool.tallies).clone();
+    let pool = server.pool.pool_config();
     let template_error = ratum::lock(&ctx.template_error).clone();
     let current = server.current_job();
     let status = if let Some(e) = &template_error {
@@ -123,7 +123,7 @@ pub(super) fn status_json(ctx: &Context, with_clients: bool) -> Value {
         "Non-Pooled Mode".to_string()
     } else if current.is_none() {
         "Initialising...".to_string()
-    } else if server.datum.is_active() {
+    } else if server.pool.is_active() {
         "Connected and Ready".to_string()
     } else if cfg.datum.pooled_mining_only {
         "Not Ready".to_string()
@@ -145,20 +145,20 @@ pub(super) fn status_json(ctx: &Context, with_clients: bool) -> Value {
         "stale_window_seconds": cfg.stale_window().as_secs(),
         "hashrate": {
             "interval_seconds": ratum::hashrate::INTERVAL_SECS,
-            "history": ratum::lock(&ctx.history)
+            "history": ratum::lock(&ctx.hashrate_history)
                 .iter()
                 .map(|(at, hs)| json!([at, hs.round()]))
                 .collect::<Vec<_>>(),
         },
-        "shares_accepted": datum_stats.accepted.json(),
-        "shares_rejected": datum_stats.rejected.json(),
+        "shares_accepted": pool_tallies.accepted.json(),
+        "shares_rejected": pool_tallies.rejected.json(),
         "pool_host": pool_host_json(cfg),
         "pool_url": or_null(&cfg.datum.pool_url),
         "pool_pubkey": cfg.datum.pool_pubkey,
         "pool_tag": pool.as_ref().map_or_else(|| cfg.mining.coinbase_tag_primary.clone(), |p| p.coinbase_tag.clone()),
         "secondary_tag": cfg.mining.coinbase_tag_secondary,
         "pool_min_diff": pool.as_ref().map(|p| p.min_difficulty),
-        "pool_motd": datum_stats.motd,
+        "pool_motd": ratum::lock(&server.pool.motd).clone(),
         "gateway_fee_bps": cfg.datum.gateway_fee_bps,
         "gateway_fee_ramp": cfg.fee_ramp_max_bps().map(|max_bps| json!({
             "max_bps": max_bps,
@@ -166,7 +166,7 @@ pub(super) fn status_json(ctx: &Context, with_clients: bool) -> Value {
             "tracked_addresses": server.fee_ramp.tracked_addresses(),
         })),
         "gateway_fee_address": if cfg.datum.gateway_fee_bps > 0 { json!(cfg.fee_address()) } else { Value::Null },
-        "gateway_fee_collected": ratum::lock(&server.fee).json(),
+        "gateway_fee_collected": ratum::lock(&server.fee_tally).json(),
         "stratum": {
             "listening": server.listening.load(Ordering::Relaxed),
             "connections": summary.connections,
@@ -188,7 +188,7 @@ pub(super) fn status_json(ctx: &Context, with_clients: bool) -> Value {
 struct MinerTotals {
     accepted: Tally,
     rejected: Tally,
-    fee: Tally,
+    fee_shares: Tally,
     hashrate_ths: f64,
 }
 
@@ -196,7 +196,7 @@ impl MinerTotals {
     fn add(&mut self, c: &ClientStats) {
         self.accepted.merge(&c.accepted);
         self.rejected.merge(&c.rejected);
-        self.fee.merge(&c.fee);
+        self.fee_shares.merge(&c.fee_shares);
         self.hashrate_ths += c.hashrate_ths().unwrap_or(0.0);
     }
 }
@@ -230,9 +230,9 @@ pub(super) fn miner_lookup_json(ctx: &Context, addr: Option<&str>) -> Value {
         "accepted_count": totals.accepted.count,
         "rejected_diff": totals.rejected.diff,
         "rejected_count": totals.rejected.count,
-        "fee_diff": totals.fee.diff,
-        "fee_count": totals.fee.count,
-        "accepted_under_address_diff": totals.accepted.diff.saturating_sub(totals.fee.diff),
+        "fee_diff": totals.fee_shares.diff,
+        "fee_count": totals.fee_shares.count,
+        "accepted_under_address_diff": totals.accepted.diff.saturating_sub(totals.fee_shares.diff),
         "hashrate_ths": totals.hashrate_ths,
         "stratum_port": cfg.stratum.listen_port,
         "require_address_username": cfg.stratum.require_address_username,

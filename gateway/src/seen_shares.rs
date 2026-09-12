@@ -6,13 +6,13 @@ const MIN_CAPACITY: usize = 1024;
 const MIN_FREED_PERCENT: usize = 5;
 const GROWTH_PERCENT: usize = 25;
 
-pub struct Dupes {
+pub struct SeenShareHashes {
     seen: HashMap<[u8; 32], Instant>,
     capacity: usize,
     window: Duration,
 }
 
-impl Dupes {
+impl SeenShareHashes {
     pub fn new(capacity: usize, window: Duration) -> Self {
         Self { seen: HashMap::new(), capacity: capacity.max(MIN_CAPACITY), window }
     }
@@ -29,7 +29,7 @@ impl Dupes {
             if freed < self.capacity * MIN_FREED_PERCENT / 100 {
                 self.capacity += self.capacity * GROWTH_PERCENT / 100;
                 info!(
-                    "duplicate-share table grown to {} entries: {freed} of {held} were stale",
+                    "seen-share-hash table grown to {} entries: {freed} of {held} were stale",
                     self.capacity
                 );
             }
@@ -51,7 +51,7 @@ mod tests {
 
     #[test]
     fn a_repeated_share_is_refused() {
-        let mut d = Dupes::new(1024, Duration::from_secs(160));
+        let mut d = SeenShareHashes::new(1024, Duration::from_secs(160));
         let now = Instant::now();
         assert!(d.insert(hash(1), now));
         assert!(!d.insert(hash(1), now));
@@ -60,7 +60,7 @@ mod tests {
 
     #[test]
     fn a_full_table_prunes_shares_of_jobs_outside_the_window_and_keeps_the_rest() {
-        let mut d = Dupes::new(1024, Duration::from_secs(160));
+        let mut d = SeenShareHashes::new(1024, Duration::from_secs(160));
         let old = Instant::now() - Duration::from_secs(200);
         let fresh = Instant::now();
         for i in 0..512 {
@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn a_full_table_of_fresh_shares_grows_and_forgets_nothing() {
-        let mut d = Dupes::new(1024, Duration::from_secs(160));
+        let mut d = SeenShareHashes::new(1024, Duration::from_secs(160));
         let fresh = Instant::now();
         for i in 0..1024 {
             assert!(d.insert(hash(i), fresh));

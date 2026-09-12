@@ -1,9 +1,9 @@
-use crate::server::{Resolver, Server, split_after_fee};
+use crate::server::{AddressResolver, Server, split_after_fee};
 use log::warn;
-use ratum::hashrate::{self, History};
+use ratum::hashrate::{self, HashrateHistory};
 use ratum::http;
 use ratum::lock;
-use ratum_prime::ledger::{self, ChainState, FoundBlock};
+use ratum_prime::ledger::{self, ConfirmationReading, FoundBlock};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -27,7 +27,7 @@ const MAX_RETARGET_FACTOR: f64 = 4.0;
 
 const RECENT_BLOCKS: usize = 50;
 
-fn sample_hashrate(server: &Server, history: &Mutex<History>) {
+fn sample_hashrate(server: &Server, history: &Mutex<HashrateHistory>) {
     let now = ratum::unix_now();
     let (work, _) = lock(&server.ledger).work_since(now.saturating_sub(HASHRATE_SPAN_SECS));
     hashrate::push_sample(&mut lock(history), now, hashes_per_second(work, HASHRATE_SPAN_SECS));
@@ -38,8 +38,8 @@ fn luck_percent(blocks: &[FoundBlock]) -> (Option<f64>, u32) {
     let mut counted = 0u32;
     for pair in blocks.windows(2) {
         let (prev, b) = (&pair[0], &pair[1]);
-        if b.difficulty > 0.0 && b.cumulative_work >= prev.cumulative_work {
-            expected += (b.cumulative_work - prev.cumulative_work) as f64 / b.difficulty;
+        if b.network_difficulty > 0.0 && b.cumulative_work >= prev.cumulative_work {
+            expected += (b.cumulative_work - prev.cumulative_work) as f64 / b.network_difficulty;
             counted += 1;
         }
     }
@@ -52,7 +52,7 @@ fn luck_percent(blocks: &[FoundBlock]) -> (Option<f64>, u32) {
 pub(crate) fn spawn(server: Arc<Server>, listen: &str) -> Result<SocketAddr, String> {
     let http = HttpServer::http(listen).map_err(|e| e.to_string())?;
     let addr = http.server_addr().to_ip().ok_or("no socket address")?;
-    let history = Arc::new(Mutex::new(History::new()));
+    let history = Arc::new(Mutex::new(HashrateHistory::new()));
     let (sampler, sampler_history) = (Arc::clone(&server), Arc::clone(&history));
     hashrate::sample_periodically("stats-sampler", move || {
         sample_hashrate(&sampler, &sampler_history);
@@ -65,7 +65,11 @@ pub(crate) fn spawn(server: Arc<Server>, listen: &str) -> Result<SocketAddr, Str
     Ok(addr)
 }
 
-fn handle(server: &Server, history: &Mutex<History>, request: Request) -> std::io::Result<()> {
+fn handle(
+    server: &Server,
+    history: &Mutex<HashrateHistory>,
+    request: Request,
+) -> std::io::Result<()> {
     if *request.method() != Method::Get {
         return request.respond(http::method_not_allowed());
     }
@@ -93,7 +97,7 @@ fn network_json(
     json!({
         "chain": t.chain.name(),
         "tip_height": t.height,
-        "tip_hash": ratum::header::u256_to_display_hex(&t.hash),
+        "tip_hash": ratum::header::hash_to_display_hex(&t.hash),
         "difficulty": t.difficulty,
         "coinbase_value": coinbase_value,
         "observed_block_seconds": observed_block_secs,
@@ -107,13 +111,13 @@ fn network_json(
     })
 }
 
-fn confirmations_json(state: Option<&ChainState>) -> Value {
+fn confirmations_json(state: Option<&ConfirmationReading>) -> Value {
     state.map_or(Value::Null, |s| json!(s.confirmations))
 }
 
 fn owed_json(
     owed: &[ledger::OwedBlock],
-    chain_state: &HashMap<[u8; 32], ChainState>,
+    confirmations: &HashMap<[u8; 32], ConfirmationReading>,
 ) -> (u64, Vec<Value>, Vec<Value>) {
     let mut unsettled: u64 = 0;
     let mut unsettled_per_identity: HashMap<String, u64> = HashMap::new();
@@ -132,7 +136,7 @@ fn owed_json(
                 "found_at": o.at,
                 "total_sats": o.total,
                 "settled_at": o.settled_at,
-                "confirmations": confirmations_json(chain_state.get(&o.block_hash)),
+                "confirmations": confirmations_json(confirmations.get(&o.block_hash)),
                 "miners": o.entries.iter().map(|(identity, sats)| {
                     json!({ "identity": identity, "sats": sats })
                 }).collect::<Vec<_>>(),
@@ -161,11 +165,12 @@ fn miners_json(
         .map(|(identity, work)| {
             let share_percent =
                 if total_work > 0 { *work as f64 / total_work as f64 * 100.0 } else { 0.0 };
-            let (payable, unpayable_reason) = match Resolver::cached(&server.resolver, identity) {
-                Some(Ok(_)) => (Some(true), None),
-                Some(Err(why)) => (Some(false), Some(why.to_string())),
-                None => (None, None),
-            };
+            let (payable, unpayable_reason) =
+                match AddressResolver::cached(&server.resolver, identity) {
+                    Some(Ok(_)) => (Some(true), None),
+                    Some(Err(why)) => (Some(false), Some(why.to_string())),
+                    None => (None, None),
+                };
             json!({
                 "identity": identity,
                 "work": work.to_string(),
@@ -192,7 +197,7 @@ struct LedgerView {
     payout_sats: HashMap<String, u64>,
     owed: Vec<ledger::OwedBlock>,
     blocks: Vec<FoundBlock>,
-    chain_state: HashMap<[u8; 32], ChainState>,
+    confirmations: HashMap<[u8; 32], ConfirmationReading>,
     recent_work: u128,
     recent_by_identity: HashMap<String, u128>,
 }
@@ -208,17 +213,17 @@ impl LedgerView {
             shares: l.len(),
             work_by_identity: l.work_by_identity(),
             tags: l.tags_by_identity(),
-            payout_sats: split_after_fee(&l, &server.payout, coinbase_value.unwrap_or(0))
+            payout_sats: split_after_fee(&l, &server.payout_policy, coinbase_value.unwrap_or(0))
                 .into_iter()
                 .collect(),
             owed: l.owed().to_vec(),
             blocks: l.blocks().to_vec(),
-            chain_state: l
+            confirmations: l
                 .owed()
                 .iter()
                 .map(|o| o.block_hash)
                 .chain(l.blocks().iter().map(|b| b.block_hash))
-                .filter_map(|hash| l.chain_state(&hash).map(|state| (hash, state)))
+                .filter_map(|hash| l.confirmations(&hash).map(|state| (hash, state)))
                 .collect(),
             recent_work,
             recent_by_identity,
@@ -228,7 +233,7 @@ impl LedgerView {
 
 fn recent_blocks_json(
     blocks: &[FoundBlock],
-    chain_state: &HashMap<[u8; 32], ChainState>,
+    confirmations: &HashMap<[u8; 32], ConfirmationReading>,
 ) -> Vec<Value> {
     blocks
         .iter()
@@ -243,7 +248,7 @@ fn recent_blocks_json(
                 "paid_to_pool": b.paid_to_pool,
                 "finder": b.finder,
                 "tag": b.tag,
-                "confirmations": confirmations_json(chain_state.get(&b.block_hash)),
+                "confirmations": confirmations_json(confirmations.get(&b.block_hash)),
             })
         })
         .collect()
@@ -259,14 +264,14 @@ fn observed_block_seconds(server: &Server) -> Option<f64> {
     }
 }
 
-fn snapshot(server: &Server, history: &Mutex<History>) -> Value {
+fn snapshot(server: &Server, history: &Mutex<HashrateHistory>) -> Value {
     let tip = *lock(&server.node_view.tip);
     let coinbase_value = *lock(&server.node_view.coinbase_value);
-    let operator_fee = coinbase_value.map_or(0, |v| server.payout.fee_on(v));
+    let operator_fee = coinbase_value.map_or(0, |v| server.payout_policy.fee_on(v));
     let l = LedgerView::read(server, coinbase_value);
 
     let (luck, luck_blocks) = luck_percent(&l.blocks);
-    let (owed_unsettled, owed_by_identity, owed_blocks) = owed_json(&l.owed, &l.chain_state);
+    let (owed_unsettled, owed_by_identity, owed_blocks) = owed_json(&l.owed, &l.confirmations);
     let miners = miners_json(
         server,
         &l.work_by_identity,
@@ -283,16 +288,16 @@ fn snapshot(server: &Server, history: &Mutex<History>) -> Value {
         "pool": {
             "motd": server.motd,
             "version": ratum::VERSION,
-            "coinbase_tag": server.policy.coinbase_tag,
-            "prime_id": server.policy.prime_id,
-            "payout_script": hex::encode(&server.policy.payout_script),
-            "fee_bps": server.payout.fee_bps,
-            "min_payout": server.payout.min_payout,
-            "window_multiple": server.payout.window_multiple,
-            "min_difficulty": server.policy.min_difficulty,
+            "coinbase_tag": server.share_policy.coinbase_tag,
+            "prime_id": server.share_policy.prime_id,
+            "payout_script": hex::encode(&server.share_policy.payout_script),
+            "fee_bps": server.payout_policy.fee_bps,
+            "min_payout": server.payout_policy.min_payout,
+            "window_multiple": server.payout_policy.window_multiple,
+            "min_difficulty": server.share_policy.min_difficulty,
             "datum_port": server.datum_port,
             "pubkey": server.pool_keys.pubkey_hex(),
-            "advertise": server.advertise,
+            "advertise": server.advertise_address,
             "public_gateway": server.public_gateway,
         },
         "network": network,
@@ -329,7 +334,7 @@ fn snapshot(server: &Server, history: &Mutex<History>) -> Value {
             "found": l.blocks.len(),
             "luck_percent": luck,
             "luck_blocks": luck_blocks,
-            "recent": recent_blocks_json(&l.blocks, &l.chain_state),
+            "recent": recent_blocks_json(&l.blocks, &l.confirmations),
         },
         "node_warnings": lock(&server.node_view.warnings).clone(),
         "generated_at": ratum::unix_now(),
@@ -340,7 +345,7 @@ fn snapshot(server: &Server, history: &Mutex<History>) -> Value {
 mod tests {
     use super::*;
 
-    fn block(n: u8, cumulative_work: u128, difficulty: f64) -> FoundBlock {
+    fn block(n: u8, cumulative_work: u128, network_difficulty: f64) -> FoundBlock {
         FoundBlock {
             at: u64::from(n),
             height: u32::from(n),
@@ -349,7 +354,7 @@ mod tests {
             paid_to_pool: 0,
             finder: "a".into(),
             tag: String::new(),
-            difficulty,
+            network_difficulty,
             cumulative_work,
         }
     }

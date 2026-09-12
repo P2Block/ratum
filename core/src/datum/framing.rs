@@ -3,9 +3,9 @@ pub const HEADER_LEN: usize = size_of::<u32>();
 const CMD_LEN_BITS: u32 = 22;
 pub const MAX_CMD_LEN: u32 = (1 << CMD_LEN_BITS) - 1;
 pub const MAX_CMD_DATA_SIZE: u32 = 1 << CMD_LEN_BITS;
-pub const INITIAL_HELLO_KEY: u32 = 0xDC87_1829;
+pub const INITIAL_HEADER_KEY: u32 = 0xDC87_1829;
 pub const NONCE_LEN: usize = 24;
-const WORD: usize = size_of::<u32>();
+const WORD_SIZE: usize = size_of::<u32>();
 const NONCE_SEED_AT: usize = 7;
 const NONCE_STEP: u32 = 42;
 const SENDER_MASK: u32 = 0x5757_5757;
@@ -28,7 +28,7 @@ const PROTO_CMD_SHIFT: u32 = 27;
 const PROTO_CMD_MASK: u32 = 0x1f;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Header {
+pub struct FrameHeader {
     pub cmd_len: u32,
     pub reserved: u8,
     pub is_signed: bool,
@@ -37,7 +37,7 @@ pub struct Header {
     pub proto_cmd: u8,
 }
 
-impl Header {
+impl FrameHeader {
     pub fn to_bytes(self) -> [u8; HEADER_LEN] {
         let v = (self.cmd_len & MAX_CMD_LEN)
             | ((u32::from(self.reserved) & RESERVED_MASK) << RESERVED_SHIFT)
@@ -80,29 +80,29 @@ pub fn feedback(i: u32) -> u32 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KeyRatchet {
+pub struct HeaderKeyRatchet {
     key: u32,
 }
 
-impl KeyRatchet {
+impl HeaderKeyRatchet {
     pub fn new(key: u32) -> Self {
         Self { key }
     }
 
-    pub fn hello() -> Self {
-        Self::new(INITIAL_HELLO_KEY)
+    pub fn initial() -> Self {
+        Self::new(INITIAL_HEADER_KEY)
     }
 
-    pub fn mask(&mut self, h: Header) -> [u8; HEADER_LEN] {
+    pub fn mask(&mut self, h: FrameHeader) -> [u8; HEADER_LEN] {
         let v = u32::from_le_bytes(h.to_bytes()) ^ self.key;
         self.key = feedback(self.key);
         v.to_le_bytes()
     }
 
-    pub fn unmask(&mut self, b: [u8; HEADER_LEN]) -> Header {
+    pub fn unmask(&mut self, b: [u8; HEADER_LEN]) -> FrameHeader {
         let v = u32::from_le_bytes(b) ^ self.key;
         self.key = feedback(self.key);
-        Header::from_bytes(v.to_le_bytes())
+        FrameHeader::from_bytes(v.to_le_bytes())
     }
 }
 
@@ -125,14 +125,15 @@ pub struct SessionNonces {
 }
 
 impl SessionNonces {
-    pub fn derive(nk: u32, session_pk_ed25519: &[u8; 32]) -> Self {
+    pub fn derive(nk: u32, session_sign_pk: &[u8; 32]) -> Self {
         let mut receiver = [0u8; NONCE_LEN];
         let mut sender = [0u8; NONCE_LEN];
-        let seed: [u8; WORD] =
-            session_pk_ed25519[NONCE_SEED_AT..NONCE_SEED_AT + WORD].try_into().expect("WORD bytes");
+        let seed: [u8; WORD_SIZE] = session_sign_pk[NONCE_SEED_AT..NONCE_SEED_AT + WORD_SIZE]
+            .try_into()
+            .expect("WORD_SIZE bytes");
         let mut n = nk.wrapping_sub(NONCE_STEP) ^ u32::from_le_bytes(seed);
-        let sender_words = sender.as_chunks_mut::<WORD>().0.iter_mut();
-        for (rx, tx) in receiver.as_chunks_mut::<WORD>().0.iter_mut().zip(sender_words) {
+        let sender_words = sender.as_chunks_mut::<WORD_SIZE>().0.iter_mut();
+        for (rx, tx) in receiver.as_chunks_mut::<WORD_SIZE>().0.iter_mut().zip(sender_words) {
             let r = feedback(n.wrapping_sub(NONCE_STEP));
             *rx = r.to_le_bytes();
             *tx = (r ^ SENDER_MASK).to_le_bytes();
@@ -143,7 +144,7 @@ impl SessionNonces {
 }
 
 pub fn increment_nonce(nonce: &mut [u8; NONCE_LEN]) {
-    for word in nonce.as_chunks_mut::<WORD>().0 {
+    for word in nonce.as_chunks_mut::<WORD_SIZE>().0 {
         let raised = u32::from_le_bytes(*word).wrapping_add(1);
         *word = raised.to_le_bytes();
         if raised != 0 {
@@ -158,9 +159,9 @@ mod tests {
 
     #[test]
     fn header_packing_matches_c() {
-        let cases: [(Header, &str, &str); 5] = [
+        let cases: [(FrameHeader, &str, &str); 5] = [
             (
-                Header {
+                FrameHeader {
                     cmd_len: 42,
                     is_signed: true,
                     is_encrypted_pubkey: true,
@@ -171,7 +172,7 @@ mod tests {
                 "031887d7",
             ),
             (
-                Header {
+                FrameHeader {
                     cmd_len: 1,
                     is_encrypted_channel: true,
                     proto_cmd: 5,
@@ -181,7 +182,7 @@ mod tests {
                 "281887f0",
             ),
             (
-                Header {
+                FrameHeader {
                     cmd_len: 4194303,
                     is_signed: true,
                     is_encrypted_pubkey: true,
@@ -192,9 +193,9 @@ mod tests {
                 "ffff3fff",
                 "d6e7b823",
             ),
-            (Header::default(), "00000000", "291887dc"),
+            (FrameHeader::default(), "00000000", "291887dc"),
             (
-                Header {
+                FrameHeader {
                     cmd_len: 1234567,
                     is_encrypted_pubkey: true,
                     proto_cmd: 7,
@@ -206,8 +207,8 @@ mod tests {
         ];
         for (h, raw, xored) in cases {
             assert_eq!(hex::encode(h.to_bytes()), raw, "raw encoding of {h:?}");
-            assert_eq!(Header::from_bytes(h.to_bytes()), h, "roundtrip of {h:?}");
-            let mut r = KeyRatchet::hello();
+            assert_eq!(FrameHeader::from_bytes(h.to_bytes()), h, "roundtrip of {h:?}");
+            let mut r = HeaderKeyRatchet::initial();
             assert_eq!(hex::encode(r.mask(h)), xored, "masked encoding of {h:?}");
         }
     }
@@ -275,10 +276,10 @@ mod tests {
 
     #[test]
     fn ratchet_is_symmetric() {
-        let mut tx = KeyRatchet::new(0x1234_5678);
-        let mut rx = KeyRatchet::new(0x1234_5678);
+        let mut tx = HeaderKeyRatchet::new(0x1234_5678);
+        let mut rx = HeaderKeyRatchet::new(0x1234_5678);
         for i in 0..64u32 {
-            let h = Header {
+            let h = FrameHeader {
                 cmd_len: i * 7,
                 is_encrypted_channel: true,
                 proto_cmd: (i % 32) as u8,
@@ -286,7 +287,7 @@ mod tests {
             };
             assert_eq!(rx.unmask(tx.mask(h)), h);
         }
-        let last = Header { cmd_len: 4095, proto_cmd: 31, ..Default::default() };
+        let last = FrameHeader { cmd_len: 4095, proto_cmd: 31, ..Default::default() };
         assert_eq!(rx.unmask(tx.mask(last)), last);
     }
 }

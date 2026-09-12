@@ -1,11 +1,12 @@
 mod rebuild;
 
 use crate::bounded::BoundedSet;
+use ratum::bitcoin::TxOut;
 use ratum::datum::abw::SlotKeys;
-use ratum::datum::messages::{ClientConfig, CoinbaseOutput, CoinbaserResponse, RejectReason};
+use ratum::datum::messages::{ClientConfig, CoinbaserResponse, RejectReason};
 use ratum::datum::share::{
     self, COINBASE_ID_SUBSIDY_ONLY, CoinbaseSection, JobSection, MAX_COINBASE_SECTION_BYTES,
-    MAX_JOBS, MAX_USERNAME, PowSubmit,
+    MAX_JOBS, MAX_USERNAME_LEN, PowSubmit,
 };
 use ratum::header;
 use ratum::target;
@@ -13,14 +14,14 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 const MAX_COINBASE_TYPES: u8 = 6;
-const MAX_SEEN: usize = 1 << 20;
+const MAX_ACCEPTED_HASHES: usize = crate::ledger::MAX_SHARES;
 
 const MAX_INSTALLED_COINBASE_BYTES: usize = 16 << 20;
 
 #[derive(Debug)]
-pub struct ReplayGuard(BoundedSet<[u8; 32]>);
+pub struct AcceptedShareHashes(BoundedSet<[u8; 32]>);
 
-impl ReplayGuard {
+impl AcceptedShareHashes {
     pub fn new(capacity: usize) -> Self {
         Self(BoundedSet::new(capacity))
     }
@@ -42,13 +43,13 @@ impl ReplayGuard {
     }
 }
 
-impl Default for ReplayGuard {
+impl Default for AcceptedShareHashes {
     fn default() -> Self {
-        Self::new(MAX_SEEN)
+        Self::new(MAX_ACCEPTED_HASHES)
     }
 }
 
-const DEFAULT_NTIME_WINDOW_SECS: u64 = 2 * 60 * 60;
+const DEFAULT_NTIME_WINDOW_SECS: u64 = 2 * ratum::SECS_PER_HOUR;
 
 const TIP_GRACE_SECS: u64 = 1;
 
@@ -57,7 +58,7 @@ const SPLIT_GRACE_SECS: u64 = 10;
 const MAX_RECENT_TIPS: usize = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PoolPolicy {
+pub struct SharePolicy {
     pub payout_script: Vec<u8>,
     pub prime_id: u64,
     pub coinbase_tag: String,
@@ -66,7 +67,7 @@ pub struct PoolPolicy {
     pub require_split: bool,
 }
 
-impl PoolPolicy {
+impl SharePolicy {
     pub fn from_config(c: &ClientConfig) -> Self {
         Self {
             payout_script: c.payout_script.clone(),
@@ -80,7 +81,7 @@ impl PoolPolicy {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SlotKey {
+enum SlotKeyStatus {
     Secret,
     Revealed,
 }
@@ -89,7 +90,7 @@ enum SlotKey {
 pub struct RebuiltShare {
     pub difficulty: u64,
     pub block_hash: [u8; 32],
-    pub raw_hash: [u8; 32],
+    pub raw_pow_hash: [u8; 32],
     pub prev_hash: [u8; 32],
     pub job_bits: u32,
     pub header: [u8; header::HEADER_V2_SIZE],
@@ -99,13 +100,13 @@ pub struct RebuiltShare {
     pub coinbaser_id: u8,
     pub paid_to_split: u64,
     pub paid_to_pool: u64,
-    pub unpaid: Vec<usize>,
+    pub unpaid_output_indexes: Vec<usize>,
     pub tag_secondary: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcceptedShare {
-    pub work: RebuiltShare,
+    pub rebuilt: RebuiltShare,
     pub is_block: bool,
 }
 
@@ -117,7 +118,7 @@ pub struct AbwKeys {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DictatedSplit {
-    pub outputs: Vec<CoinbaseOutput>,
+    pub outputs: Vec<TxOut>,
     pub identities: Vec<String>,
     pub sent_at: u64,
 }
@@ -144,30 +145,30 @@ fn coinbase_bytes(cb: &CoinbaseSection) -> usize {
 
 #[derive(Debug)]
 pub struct Verifier {
-    policy: PoolPolicy,
+    policy: SharePolicy,
     jobs: Vec<Option<JobState>>,
     splits: Splits,
-    replay: Arc<Mutex<ReplayGuard>>,
+    accepted_hashes: Arc<Mutex<AcceptedShareHashes>>,
     tip: Option<[u8; 32]>,
     tip_next_target: Option<target::Target>,
     recent_tips: VecDeque<([u8; 32], u64)>,
     installed_coinbase_bytes: usize,
-    cap: usize,
+    installed_coinbase_bytes_cap: usize,
     abw_keys: Option<AbwKeys>,
 }
 
 impl Verifier {
-    pub fn new(policy: PoolPolicy, replay: Arc<Mutex<ReplayGuard>>) -> Self {
+    pub fn new(policy: SharePolicy, accepted_hashes: Arc<Mutex<AcceptedShareHashes>>) -> Self {
         Self {
             policy,
             jobs: vec![None; MAX_JOBS],
             splits: HashMap::new(),
-            replay,
+            accepted_hashes,
             tip: None,
             tip_next_target: None,
             recent_tips: VecDeque::new(),
             installed_coinbase_bytes: 0,
-            cap: MAX_INSTALLED_COINBASE_BYTES,
+            installed_coinbase_bytes_cap: MAX_INSTALLED_COINBASE_BYTES,
             abw_keys: None,
         }
     }
@@ -200,11 +201,12 @@ impl Verifier {
         self.splits = splits;
     }
 
-    pub fn unpaid_outputs(&self, work: &RebuiltShare) -> Vec<(String, u64)> {
-        let Some(split) = self.splits.get(&work.coinbaser_id) else {
+    pub fn unpaid_outputs(&self, rebuilt: &RebuiltShare) -> Vec<(String, u64)> {
+        let Some(split) = self.splits.get(&rebuilt.coinbaser_id) else {
             return Vec::new();
         };
-        work.unpaid
+        rebuilt
+            .unpaid_output_indexes
             .iter()
             .filter_map(|&i| {
                 let d = split.outputs.get(i)?;
@@ -213,7 +215,7 @@ impl Verifier {
                     .get(i)
                     .filter(|id| !id.is_empty())
                     .cloned()
-                    .unwrap_or_else(|| format!("script {}", hex::encode(&d.script)));
+                    .unwrap_or_else(|| format!("script {}", hex::encode(&d.script_pubkey)));
                 Some((identity, d.value))
             })
             .collect()
@@ -259,10 +261,10 @@ impl Verifier {
         }
     }
 
-    fn meets_network_target(&self, work: &RebuiltShare) -> bool {
+    fn meets_network_target(&self, rebuilt: &RebuiltShare) -> bool {
         self.tip_next_target
             .as_ref()
-            .is_some_and(|target| target::meets_target(&work.block_hash, target))
+            .is_some_and(|target| target::meets_target(&rebuilt.block_hash, target))
     }
 
     fn within_tip_grace(&self, prev_hash: [u8; 32], now: u64) -> bool {
@@ -284,96 +286,96 @@ impl Verifier {
     }
 
     pub fn verify(&mut self, s: &PowSubmit, now: u64) -> Result<AcceptedShare, RejectReason> {
-        let work = self.rebuild(s, now)?;
-        let is_block = self.meets_network_target(&work);
+        let rebuilt = self.rebuild(s, now)?;
+        let is_block = self.meets_network_target(&rebuilt);
 
-        if !ratum::lock(&self.replay).accept(work.block_hash) {
+        if !ratum::lock(&self.accepted_hashes).accept(rebuilt.block_hash) {
             return Err(RejectReason::DuplicateWork);
         }
-        Ok(AcceptedShare { work, is_block })
+        Ok(AcceptedShare { rebuilt, is_block })
     }
 
     pub fn rebuild_refused(&self, s: &PowSubmit) -> Option<RebuiltShare> {
-        self.build_unchecked(s, true).ok().map(|(work, _)| work)
+        self.build_unchecked(s, true).ok().map(|(rebuilt, _)| rebuilt)
     }
 
-    pub fn block_candidate(&self, work: &RebuiltShare) -> bool {
-        self.meets_network_target(work) || meets_own_bits(work)
+    pub fn block_candidate(&self, rebuilt: &RebuiltShare) -> bool {
+        self.meets_network_target(rebuilt) || meets_own_bits(rebuilt)
     }
 
     fn build(&self, s: &PowSubmit) -> Result<RebuiltShare, RejectReason> {
-        let (work, key) = self.build_unchecked(s, false)?;
-        if key == SlotKey::Revealed {
+        let (rebuilt, key) = self.build_unchecked(s, false)?;
+        if key == SlotKeyStatus::Revealed {
             return Err(RejectReason::BadAbwSlot);
         }
 
-        if self.tip == Some(work.prev_hash)
+        if self.tip == Some(rebuilt.prev_hash)
             && let Some(node_target) = self.tip_next_target
         {
             let job_target =
-                target::bits_to_target(work.job_bits).ok_or(RejectReason::BadTarget)?;
+                target::bits_to_target(rebuilt.job_bits).ok_or(RejectReason::BadTarget)?;
             if job_target > node_target {
                 return Err(RejectReason::BadTarget);
             }
         }
-        Ok(work)
+        Ok(rebuilt)
     }
 
     fn build_unchecked(
         &self,
         s: &PowSubmit,
         allow_evicted: bool,
-    ) -> Result<(RebuiltShare, SlotKey), RejectReason> {
+    ) -> Result<(RebuiltShare, SlotKeyStatus), RejectReason> {
         let (job, cb) = self.resolve(s, allow_evicted)?;
         let (abw_key, key) = match &self.abw_keys {
-            None => (None, SlotKey::Secret),
+            None => (None, SlotKeyStatus::Secret),
             Some(keys) => {
                 let slot = usize::from(s.abw_slot.ok_or(RejectReason::BadAbwSlot)?);
                 let seeded = keys.seeded.get(slot).copied().flatten();
                 let revealed = keys.revealed.get(slot).copied().flatten();
                 match (seeded, revealed) {
-                    (Some(key), _) => (Some(key), SlotKey::Secret),
-                    (None, Some(key)) => (Some(key), SlotKey::Revealed),
+                    (Some(key), _) => (Some(key), SlotKeyStatus::Secret),
+                    (None, Some(key)) => (Some(key), SlotKeyStatus::Revealed),
                     (None, None) => return Err(RejectReason::BadAbwSlot),
                 }
             }
         };
-        let work = rebuild::build_work(&self.policy, &self.splits, job, cb, s, abw_key)?;
-        Ok((work, key))
+        let rebuilt = rebuild::rebuild_share(&self.policy, &self.splits, job, cb, s, abw_key)?;
+        Ok((rebuilt, key))
     }
 
     fn check_share(
         &self,
         s: &PowSubmit,
-        work: &RebuiltShare,
+        rebuilt: &RebuiltShare,
         now: u64,
     ) -> Result<(), RejectReason> {
-        if !self.meets_network_target(work)
+        if !self.meets_network_target(rebuilt)
             && let Some(tip) = self.tip
-            && work.prev_hash != tip
-            && !self.within_tip_grace(work.prev_hash, now)
+            && rebuilt.prev_hash != tip
+            && !self.within_tip_grace(rebuilt.prev_hash, now)
         {
             return Err(RejectReason::StaleBlock);
         }
-        self.check_split(s, work, now)?;
+        self.check_split(s, rebuilt, now)?;
         check_username_and_time(&self.policy, s, now)
     }
 
     fn check_split(
         &self,
         s: &PowSubmit,
-        work: &RebuiltShare,
+        rebuilt: &RebuiltShare,
         now: u64,
     ) -> Result<(), RejectReason> {
         if !self.policy.require_split
             || s.subsidy_only
-            || work.paid_to_split != 0
-            || work.coinbaser_id == 0
-            || self.meets_network_target(work)
+            || rebuilt.paid_to_split != 0
+            || rebuilt.coinbaser_id == 0
+            || self.meets_network_target(rebuilt)
         {
             return Ok(());
         }
-        match self.splits.get(&work.coinbaser_id) {
+        match self.splits.get(&rebuilt.coinbaser_id) {
             Some(split)
                 if !split.outputs.is_empty()
                     && now.saturating_sub(split.sent_at) > SPLIT_GRACE_SECS =>
@@ -386,22 +388,25 @@ impl Verifier {
 
     #[cfg(test)]
     fn reconstruct(&self, s: &PowSubmit, now: u64) -> Result<RebuiltShare, RejectReason> {
-        let work = self.build(s)?;
-        self.check_share(s, &work, now)?;
-        Ok(work)
+        let rebuilt = self.build(s)?;
+        self.check_share(s, &rebuilt, now)?;
+        Ok(rebuilt)
     }
 
     fn rebuild(&mut self, s: &PowSubmit, now: u64) -> Result<RebuiltShare, RejectReason> {
-        let work = self.build(s)?;
-        let meets = target::meets_target(&work.raw_hash, &target::target_for_pot(s.target_byte));
-        if meets || self.meets_network_target(&work) {
+        let rebuilt = self.build(s)?;
+        let meets = target::meets_target(
+            &rebuilt.raw_pow_hash,
+            &target::target_for_exponent(s.target_byte),
+        );
+        if meets || self.meets_network_target(&rebuilt) {
             self.install_sections(s)?;
         }
-        self.check_share(s, &work, now)?;
+        self.check_share(s, &rebuilt, now)?;
         if !meets {
             return Err(RejectReason::HighHash);
         }
-        Ok(work)
+        Ok(rebuilt)
     }
 
     fn brings_new_job(&self, s: &PowSubmit) -> bool {
@@ -470,7 +475,7 @@ impl Verifier {
             };
             let projected = self.installed_coinbase_bytes.saturating_sub(released + replaced)
                 + coinbase_bytes(cb);
-            if projected > self.cap {
+            if projected > self.installed_coinbase_bytes_cap {
                 return Err(RejectReason::CoinbaseTooLarge);
             }
         }
@@ -506,12 +511,12 @@ fn parent_is_kept(
 const PRINTABLE_ASCII: std::ops::RangeInclusive<u8> = 0x21..=0x7e;
 
 fn check_username_and_time(
-    policy: &PoolPolicy,
+    policy: &SharePolicy,
     s: &PowSubmit,
     now: u64,
 ) -> Result<(), RejectReason> {
     if s.username.is_empty()
-        || s.username.len() > MAX_USERNAME
+        || s.username.len() > MAX_USERNAME_LEN
         || !s.username.bytes().all(|b| PRINTABLE_ASCII.contains(&b))
         || s.username.starts_with('.')
     {
@@ -530,28 +535,29 @@ fn check_username_and_time(
     Ok(())
 }
 
-fn meets_own_bits(work: &RebuiltShare) -> bool {
-    target::bits_to_target(work.job_bits)
-        .is_some_and(|t| target::meets_target(&work.block_hash, &t))
+fn meets_own_bits(rebuilt: &RebuiltShare) -> bool {
+    target::bits_to_target(rebuilt.job_bits)
+        .is_some_and(|t| target::meets_target(&rebuilt.block_hash, &t))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::rebuild::{Payments, build_header_v2, check_outputs, decode_tag, locate_pot_byte};
+    use super::rebuild::{
+        Payments, build_header_v2, check_outputs, decode_tag, locate_target_byte,
+    };
     use super::*;
     use ratum::bitcoin::{self, CoinbaseTx};
-    use ratum::header::HeaderV2;
+    use ratum::header::BlockHeaderV2;
 
     fn verifier() -> Verifier {
-        Verifier::new(policy(), Arc::new(Mutex::new(ReplayGuard::default())))
+        Verifier::new(policy(), Arc::new(Mutex::new(AcceptedShareHashes::default())))
     }
-    use ratum::bitcoin::TxOut;
 
     #[test]
     fn build_header_v2_inverts_from_header_and_share_extranonce() {
         let mut extranonce = [0u8; 16];
         extranonce[4..].copy_from_slice(&[7u8; 12]);
-        let h = HeaderV2 {
+        let h = BlockHeaderV2 {
             version: 0x2000_0000,
             prev_block: [0xaa; 32],
             merkle_root: [0xbb; 32],
@@ -613,8 +619,8 @@ mod tests {
     const DIFF1_NONCE_HARD: u32 = 0x5823_2ac6;
     const DIFF1_NTIME_OFFSET_HARD: u32 = 0;
 
-    fn policy() -> PoolPolicy {
-        PoolPolicy {
+    fn policy() -> SharePolicy {
+        SharePolicy {
             payout_script: p2wpkh(0xee),
             prime_id: 0x0000_0001,
             coinbase_tag: "RATUM".to_string(),
@@ -624,18 +630,21 @@ mod tests {
         }
     }
 
-    use ratum::fixtures::{self, Tagging, p2wpkh};
+    use ratum::fixtures::{self, ScriptSigTags, p2wpkh};
 
-    fn coinbase_sections(p: &PoolPolicy, outputs: &[CoinbaseOutput]) -> (CoinbaseSection, usize) {
-        let tagging =
-            Tagging { tag: &p.coinbase_tag, tag_secondary: "", prime_id: p.prime_id as u32 };
+    fn coinbase_sections(p: &SharePolicy, outputs: &[TxOut]) -> (CoinbaseSection, usize) {
+        let tagging = ScriptSigTags {
+            tag_primary: &p.coinbase_tag,
+            tag_secondary: "",
+            prime_id: p.prime_id as u32,
+        };
         fixtures::coinbase(&tagging, &p.payout_script, outputs, COINBASE_VALUE)
     }
 
-    fn job_section(pot_index: usize) -> JobSection {
+    fn job_section(target_byte_index: usize) -> JobSection {
         JobSection {
             prev_hash: [0x5a; 32],
-            target_byte_index: pot_index as u16,
+            target_byte_index: target_byte_index as u16,
             nbits: NBITS,
             coinbaser_id: 1,
             height: 840_000,
@@ -653,8 +662,8 @@ mod tests {
             value: COINBASE_VALUE,
             coinbaser_id: 1,
             outputs: vec![
-                CoinbaseOutput { value: 100_000_000, script: p2wpkh(0x01) },
-                CoinbaseOutput { value: 50_000_000, script: p2wpkh(0x02) },
+                TxOut { value: 100_000_000, script_pubkey: p2wpkh(0x01) },
+                TxOut { value: 50_000_000, script_pubkey: p2wpkh(0x02) },
             ],
         }
     }
@@ -696,11 +705,11 @@ mod tests {
         let build = |coinbaser_id: u8, require_split: bool| {
             let mut p = policy();
             p.require_split = require_split;
-            let (cb, pot_index) = coinbase_sections(&p, &[]);
-            let mut v = Verifier::new(p, Arc::new(Mutex::new(ReplayGuard::default())));
+            let (cb, target_byte_index) = coinbase_sections(&p, &[]);
+            let mut v = Verifier::new(p, Arc::new(Mutex::new(AcceptedShareHashes::default())));
             v.record_dictated(&split(), Vec::new(), NOW);
             v.set_next_target(Some(u32::from_le_bytes(HARD_NBITS)));
-            let mut job = job_section(pot_index);
+            let mut job = job_section(target_byte_index);
             job.coinbaser_id = coinbaser_id;
             (v, share_on(job, cb))
         };
@@ -728,55 +737,61 @@ mod tests {
 
         let (mut v, s) = setup();
         v.record_dictated(&split(), names(), NOW);
-        let w = v.reconstruct(&s, NOW).unwrap();
-        assert!(w.unpaid.is_empty());
-        assert_eq!((w.paid_to_split, w.paid_to_pool), (150_000_000, COINBASE_VALUE - 150_000_000));
+        let rebuilt = v.reconstruct(&s, NOW).unwrap();
+        assert!(rebuilt.unpaid_output_indexes.is_empty());
+        assert_eq!(
+            (rebuilt.paid_to_split, rebuilt.paid_to_pool),
+            (150_000_000, COINBASE_VALUE - 150_000_000)
+        );
 
         let (mut v, s) = with_outputs(&split().outputs[..1]);
         v.record_dictated(&split(), names(), NOW);
-        let w = v.reconstruct(&s, NOW).unwrap();
-        assert_eq!(w.unpaid, vec![1]);
-        assert_eq!(v.unpaid_outputs(&w), vec![("bob".to_string(), 50_000_000)]);
-        assert_eq!((w.paid_to_split, w.paid_to_pool), (100_000_000, COINBASE_VALUE - 100_000_000));
+        let rebuilt = v.reconstruct(&s, NOW).unwrap();
+        assert_eq!(rebuilt.unpaid_output_indexes, vec![1]);
+        assert_eq!(v.unpaid_outputs(&rebuilt), vec![("bob".to_string(), 50_000_000)]);
+        assert_eq!(
+            (rebuilt.paid_to_split, rebuilt.paid_to_pool),
+            (100_000_000, COINBASE_VALUE - 100_000_000)
+        );
 
         let (mut v, s) = with_outputs(&[]);
         v.record_dictated(&split(), names(), NOW);
-        let w = v.reconstruct(&s, NOW).unwrap();
-        assert_eq!(w.unpaid, vec![0, 1]);
+        let rebuilt = v.reconstruct(&s, NOW).unwrap();
+        assert_eq!(rebuilt.unpaid_output_indexes, vec![0, 1]);
         assert_eq!(
-            v.unpaid_outputs(&w),
+            v.unpaid_outputs(&rebuilt),
             vec![("alice".to_string(), 100_000_000), ("bob".to_string(), 50_000_000)]
         );
-        assert_eq!(w.paid_to_pool, COINBASE_VALUE);
+        assert_eq!(rebuilt.paid_to_pool, COINBASE_VALUE);
 
         v.record_dictated(&CoinbaserResponse { coinbaser_id: 3, ..split() }, names(), NOW);
-        assert_eq!(v.unpaid_outputs(&w).len(), 2, "recorded under another id still");
+        assert_eq!(v.unpaid_outputs(&rebuilt).len(), 2, "recorded under another id still");
         v.restore_splits(Splits::new());
-        assert!(v.unpaid_outputs(&w).is_empty());
+        assert!(v.unpaid_outputs(&rebuilt).is_empty());
 
         let (mut v, s) = with_outputs(&split().outputs[..1]);
         v.record_dictated(&split(), Vec::new(), NOW);
-        let w = v.reconstruct(&s, NOW).unwrap();
+        let rebuilt = v.reconstruct(&s, NOW).unwrap();
         assert_eq!(
-            v.unpaid_outputs(&w),
+            v.unpaid_outputs(&rebuilt),
             vec![(format!("script {}", hex::encode(p2wpkh(0x02))), 50_000_000)]
         );
 
         let (mut v, mut s) = with_outputs(&[]);
         v.record_dictated(&split(), names(), NOW);
         s.job.as_mut().unwrap().coinbaser_id = 0;
-        assert!(v.reconstruct(&s, NOW).unwrap().unpaid.is_empty());
+        assert!(v.reconstruct(&s, NOW).unwrap().unpaid_output_indexes.is_empty());
 
         let (mut v, s) = with_outputs(&[]);
         let fallback = CoinbaserResponse {
             value: COINBASE_VALUE - 1,
             coinbaser_id: 1,
-            outputs: vec![CoinbaseOutput { value: COINBASE_VALUE - 1, script: p2wpkh(0xee) }],
+            outputs: vec![TxOut { value: COINBASE_VALUE - 1, script_pubkey: p2wpkh(0xee) }],
         };
         v.record_dictated(&fallback, vec![String::new()], NOW);
-        let w = v.reconstruct(&s, NOW).unwrap();
-        assert!(w.unpaid.is_empty(), "{:?}", w.unpaid);
-        assert_eq!((w.paid_to_split, w.paid_to_pool), (0, COINBASE_VALUE));
+        let rebuilt = v.reconstruct(&s, NOW).unwrap();
+        assert!(rebuilt.unpaid_output_indexes.is_empty(), "{:?}", rebuilt.unpaid_output_indexes);
+        assert_eq!((rebuilt.paid_to_split, rebuilt.paid_to_pool), (0, COINBASE_VALUE));
     }
 
     #[test]
@@ -787,36 +802,36 @@ mod tests {
             Vec::new(),
             NOW,
         );
-        let mut w = v.reconstruct(&s, NOW).unwrap();
-        assert!(!v.meets_network_target(&w));
-        w.paid_to_split = 0;
+        let mut rebuilt = v.reconstruct(&s, NOW).unwrap();
+        assert!(!v.meets_network_target(&rebuilt));
+        rebuilt.paid_to_split = 0;
         let late = NOW + SPLIT_GRACE_SECS + 1;
         let no_split = Err(RejectReason::NoSplit);
 
-        assert_eq!(v.check_split(&s, &w, late), no_split, "past the grace");
-        assert_eq!(v.check_split(&s, &w, NOW + SPLIT_GRACE_SECS), Ok(()), "at the grace");
-        assert_eq!(v.check_split(&s, &w, NOW), Ok(()), "inside the grace");
+        assert_eq!(v.check_split(&s, &rebuilt, late), no_split, "past the grace");
+        assert_eq!(v.check_split(&s, &rebuilt, NOW + SPLIT_GRACE_SECS), Ok(()), "at the grace");
+        assert_eq!(v.check_split(&s, &rebuilt, NOW), Ok(()), "inside the grace");
 
         let mut off = Verifier::new(
-            PoolPolicy { require_split: false, ..policy() },
-            Arc::new(Mutex::new(ReplayGuard::default())),
+            SharePolicy { require_split: false, ..policy() },
+            Arc::new(Mutex::new(AcceptedShareHashes::default())),
         );
         off.record_dictated(&split(), Vec::new(), NOW);
-        assert_eq!(off.check_split(&s, &w, late), Ok(()), "require_split off");
+        assert_eq!(off.check_split(&s, &rebuilt, late), Ok(()), "require_split off");
 
         let subsidy_only = PowSubmit { subsidy_only: true, ..s.clone() };
-        assert_eq!(v.check_split(&subsidy_only, &w, late), Ok(()), "subsidy-only work");
+        assert_eq!(v.check_split(&subsidy_only, &rebuilt, late), Ok(()), "subsidy-only work");
 
-        let paid = RebuiltShare { paid_to_split: 1, ..w.clone() };
+        let paid = RebuiltShare { paid_to_split: 1, ..rebuilt.clone() };
         assert_eq!(v.check_split(&s, &paid, late), Ok(()), "a dictated output paid");
 
-        let id0 = RebuiltShare { coinbaser_id: 0, ..w.clone() };
+        let id0 = RebuiltShare { coinbaser_id: 0, ..rebuilt.clone() };
         assert_eq!(v.check_split(&s, &id0, late), Ok(()), "id 0 names no coinbaser");
 
-        let id5 = RebuiltShare { coinbaser_id: 5, ..w.clone() };
+        let id5 = RebuiltShare { coinbaser_id: 5, ..rebuilt.clone() };
         assert_eq!(v.check_split(&s, &id5, late), Ok(()), "id 5 was never recorded");
 
-        let id2 = RebuiltShare { coinbaser_id: 2, ..w.clone() };
+        let id2 = RebuiltShare { coinbaser_id: 2, ..rebuilt.clone() };
         assert_eq!(v.check_split(&s, &id2, late), Ok(()), "id 2 dictated nothing");
 
         let (v, s) = setup();
@@ -838,55 +853,59 @@ mod tests {
         (v, s)
     }
 
-    fn with_outputs(outputs: &[CoinbaseOutput]) -> (Verifier, PowSubmit) {
+    fn with_outputs(outputs: &[TxOut]) -> (Verifier, PowSubmit) {
         let p = policy();
-        let (cb, pot_index) = coinbase_sections(&p, outputs);
-        let mut v = Verifier::new(p, Arc::new(Mutex::new(ReplayGuard::default())));
+        let (cb, target_byte_index) = coinbase_sections(&p, outputs);
+        let mut v = Verifier::new(p, Arc::new(Mutex::new(AcceptedShareHashes::default())));
         v.record_dictated(&split(), Vec::new(), NOW);
         v.set_next_target(Some(u32::from_le_bytes(NBITS)));
-        (v, share_on(job_section(pot_index), cb))
+        (v, share_on(job_section(target_byte_index), cb))
     }
 
-    fn built_header(w: &RebuiltShare) -> HeaderV2 {
-        HeaderV2::deserialize(&w.header).expect("a version 2 header")
+    fn built_header(rebuilt: &RebuiltShare) -> BlockHeaderV2 {
+        BlockHeaderV2::deserialize(&rebuilt.header).expect("a version 2 header")
     }
 
     #[test]
     fn rebuilds_a_correct_share() {
         let (mut v, s) = setup();
-        let w = v.rebuild(&s, NOW).unwrap();
-        assert_eq!(w.difficulty, 1);
-        assert_eq!(w.height, 840_000);
-        assert_eq!(w.paid_to_split, 150_000_000);
-        assert_eq!(w.paid_to_pool, COINBASE_VALUE - 150_000_000);
-        assert_eq!(w.header.len(), ratum::header::HEADER_V2_SIZE);
-        let h = built_header(&w);
-        assert_eq!(h.merkle_root, bitcoin::sha256d(&w.coinbase_tx), "no branches in this job");
+        let rebuilt = v.rebuild(&s, NOW).unwrap();
+        assert_eq!(rebuilt.difficulty, 1);
+        assert_eq!(rebuilt.height, 840_000);
+        assert_eq!(rebuilt.paid_to_split, 150_000_000);
+        assert_eq!(rebuilt.paid_to_pool, COINBASE_VALUE - 150_000_000);
+        assert_eq!(rebuilt.header.len(), ratum::header::HEADER_V2_SIZE);
+        let h = built_header(&rebuilt);
+        assert_eq!(
+            h.merkle_root,
+            bitcoin::sha256d(&rebuilt.coinbase_tx),
+            "no branches in this job"
+        );
         assert_eq!(h.version, 0x2000_0000);
         assert_eq!(h.prev_block, [0x5a; 32]);
         assert_eq!(h.time, s.blake2b.time_on_wire);
         assert_eq!(h.bits, u32::from_le_bytes(NBITS));
         assert_eq!(h.nonce, s.nonce);
-        assert_eq!(w.block_hash, h.pow_and_block_hash().1);
+        assert_eq!(rebuilt.block_hash, h.raw_pow_and_block_hash().1);
         assert_eq!(
-            w.coinbase_tx[s.job.as_ref().unwrap().target_byte_index as usize],
+            rebuilt.coinbase_tx[s.job.as_ref().unwrap().target_byte_index as usize],
             s.target_byte
         );
         let n = s.coinbase.as_ref().unwrap().coinb1.len();
-        assert_eq!(&w.coinbase_tx[n..n + share::EXTRANONCE_SIZE], &[0u8; 12]);
+        assert_eq!(&rebuilt.coinbase_tx[n..n + share::EXTRANONCE_SIZE], &[0u8; 12]);
         assert_eq!(h.extranonce, share::header_extranonce(&EXTRANONCE).unwrap());
         let mut leaf = vec![0u8, 0, 0, 0];
-        leaf.extend_from_slice(&h.precompute().h2);
+        leaf.extend_from_slice(&h.hash_stages().h2);
         leaf.extend_from_slice(&h.extranonce);
-        assert_eq!(ratum::header::blake2b_256(&leaf), h.precompute().hash1);
+        assert_eq!(ratum::header::blake2b_256(&leaf), h.hash_stages().work_root);
     }
 
     #[test]
     fn accepts_a_share_that_meets_the_share_target() {
         let (mut v, s) = setup();
         let a = v.verify(&s, NOW).unwrap();
-        assert_eq!(a.work.difficulty, 1);
-        assert!(target::meets_target(&a.work.block_hash, &target::DIFF1_TARGET));
+        assert_eq!(a.rebuilt.difficulty, 1);
+        assert!(target::meets_target(&a.rebuilt.block_hash, &target::DIFF1_TARGET));
         assert!(a.is_block);
         let mut again = s.clone();
         again.job = None;
@@ -901,7 +920,7 @@ mod tests {
     fn a_share_that_misses_the_network_target_is_not_a_block() {
         let (mut v, s) = setup_hard();
         let a = v.verify(&s, NOW).unwrap();
-        assert!(target::meets_target(&a.work.block_hash, &target::DIFF1_TARGET));
+        assert!(target::meets_target(&a.rebuilt.block_hash, &target::DIFF1_TARGET));
         assert!(!a.is_block);
     }
 
@@ -913,12 +932,12 @@ mod tests {
         assert!(
             !a.is_block,
             "hash {} is above the 1a008d4f target",
-            hex::encode(a.work.block_hash)
+            hex::encode(a.rebuilt.block_hash)
         );
         let mut v2 = setup_hard().0;
         v2.set_next_target(Some(0x2100ffff));
         let b = v2.verify(&s, NOW).unwrap();
-        assert!(b.is_block, "hash {} meets the easy target", hex::encode(b.work.block_hash));
+        assert!(b.is_block, "hash {} meets the easy target", hex::encode(b.rebuilt.block_hash));
     }
 
     #[test]
@@ -928,7 +947,7 @@ mod tests {
         v.set_tip(Some([0x5a; 32]), NOW);
         v.set_tip(Some([0x11; 32]), NOW);
         let a = v.verify(&s, NOW).unwrap();
-        assert!(target::meets_target(&a.work.block_hash, &target::DIFF1_TARGET));
+        assert!(target::meets_target(&a.rebuilt.block_hash, &target::DIFF1_TARGET));
         assert!(!a.is_block, "the job's easy bits must not make an ordinary share a block");
     }
 
@@ -936,13 +955,17 @@ mod tests {
     fn the_header_is_the_gateways_job_plus_the_miners_nonces() {
         let (mut v, s) = setup();
         let job = s.job.clone().unwrap();
-        let w = v.rebuild(&s, NOW).unwrap();
-        let h = built_header(&w);
+        let rebuilt = v.rebuild(&s, NOW).unwrap();
+        let h = built_header(&rebuilt);
 
         assert_eq!(h.prev_block, job.prev_hash);
         assert_eq!(h.height, job.height as i32);
         assert_eq!(h.bits, u32::from_le_bytes(job.nbits));
-        assert_eq!(h.merkle_root, bitcoin::sha256d(&w.coinbase_tx), "no branches in this job");
+        assert_eq!(
+            h.merkle_root,
+            bitcoin::sha256d(&rebuilt.coinbase_tx),
+            "no branches in this job"
+        );
         assert_eq!(h.version, 0x2000_0000);
         assert_eq!(h.xor_key, [0u8; 16]);
         assert_eq!(h.mm_rhs, [0u8; 32]);
@@ -965,7 +988,7 @@ mod tests {
         let h = built_header(&v.rebuild(&s, NOW).unwrap());
         assert_eq!(h.asic_profile(), 0);
         assert_eq!(h.flags, 0);
-        assert_eq!(h.asic_input_with(&h.precompute().hash1, &h.precompute().h2).len(), 80);
+        assert_eq!(h.asic_input_with(&h.hash_stages().work_root, &h.hash_stages().h2).len(), 80);
     }
 
     #[test]
@@ -1004,11 +1027,11 @@ mod tests {
     #[test]
     fn a_subsidy_only_header_counts_only_the_coinbase() {
         let p = policy();
-        let (mut cb, pot_index) = coinbase_sections(&p, &[]);
+        let (mut cb, target_byte_index) = coinbase_sections(&p, &[]);
         cb.coinbase_id = COINBASE_ID_SUBSIDY_ONLY;
-        let v = Verifier::new(p, Arc::new(Mutex::new(ReplayGuard::default())));
+        let v = Verifier::new(p, Arc::new(Mutex::new(AcceptedShareHashes::default())));
 
-        let mut job = job_section(pot_index);
+        let mut job = job_section(target_byte_index);
         job.txn_count = 7;
         job.merkle_branches = vec![[0x42; 32]];
 
@@ -1030,10 +1053,10 @@ mod tests {
             blake2b: section(NOW as u32, 0),
             abw_slot: None,
         };
-        let w = v.reconstruct(&s, NOW).expect("the job's seven transactions are not carried");
-        let h = built_header(&w);
+        let rebuilt = v.reconstruct(&s, NOW).expect("the job's seven transactions are not carried");
+        let h = built_header(&rebuilt);
         assert_eq!(h.txcount, 1, "the coinbase alone, not the job's seven plus one");
-        assert_eq!(h.merkle_root, bitcoin::sha256d(&w.coinbase_tx));
+        assert_eq!(h.merkle_root, bitcoin::sha256d(&rebuilt.coinbase_tx));
     }
 
     #[test]
@@ -1061,12 +1084,12 @@ mod tests {
         let mut job = s.job.clone().unwrap();
         job.merkle_branches = vec![[0x11; 32], [0x22; 32]];
         s.job = Some(job.clone());
-        let w = v.reconstruct(&s, NOW).unwrap();
+        let rebuilt = v.reconstruct(&s, NOW).unwrap();
         let expected =
-            bitcoin::merkle_root(&bitcoin::sha256d(&w.coinbase_tx), &job.merkle_branches);
-        let root = built_header(&w).merkle_root;
+            bitcoin::merkle_root(&bitcoin::sha256d(&rebuilt.coinbase_tx), &job.merkle_branches);
+        let root = built_header(&rebuilt).merkle_root;
         assert_eq!(root, expected);
-        assert_ne!(root, bitcoin::sha256d(&w.coinbase_tx));
+        assert_ne!(root, bitcoin::sha256d(&rebuilt.coinbase_tx));
     }
 
     #[test]
@@ -1116,13 +1139,13 @@ mod tests {
         let mut block = s.clone();
         block.target_byte = 20;
         block.is_block = true;
-        let pot = target::target_for_pot(block.target_byte);
+        let share_target = target::target_for_exponent(block.target_byte);
         let found = (0u32..10_000).any(|nonce| {
             block.nonce = nonce;
             block.blake2b = section(block.ntime, nonce);
-            let w = v.reconstruct(&block, NOW).unwrap();
-            target::meets_target(&w.block_hash, &network)
-                && !target::meets_target(&w.block_hash, &pot)
+            let rebuilt = v.reconstruct(&block, NOW).unwrap();
+            target::meets_target(&rebuilt.block_hash, &network)
+                && !target::meets_target(&rebuilt.block_hash, &share_target)
         });
         assert!(found);
         assert_eq!(v.rebuild(&block, NOW), Err(RejectReason::HighHash));
@@ -1171,12 +1194,12 @@ mod tests {
         let (mut v, s) = setup();
         v.set_next_target(Some(0x1b00_ffff));
         let per_share = coinbase_bytes(s.coinbase.as_ref().unwrap());
-        v.cap = 3 * per_share;
+        v.installed_coinbase_bytes_cap = 3 * per_share;
         let on_slot = |job_id: u8| PowSubmit { job_id, ..s.clone() };
         for job_id in 0..3 {
             assert!(v.rebuild(&on_slot(job_id), NOW).is_ok());
         }
-        assert_eq!(v.installed_coinbase_bytes, v.cap);
+        assert_eq!(v.installed_coinbase_bytes, v.installed_coinbase_bytes_cap);
         assert_eq!(v.rebuild(&on_slot(3), NOW), Err(RejectReason::CoinbaseTooLarge));
         assert!(v.jobs[3].is_none(), "a refused share installs neither section");
 
@@ -1211,7 +1234,7 @@ mod tests {
     fn a_share_cannot_claim_more_difficulty_than_it_was_mined_at() {
         let (mut v, as_mined) = setup();
         let accepted = v.verify(&as_mined, NOW).expect("solved at difficulty 1");
-        assert_eq!(accepted.work.difficulty, 1);
+        assert_eq!(accepted.rebuilt.difficulty, 1);
 
         let mut inflated = as_mined.clone();
         inflated.target_byte = 20;
@@ -1221,7 +1244,7 @@ mod tests {
         let as_mined_cb = v.reconstruct(&as_mined, NOW).unwrap().coinbase_tx;
         let inflated_cb = v.reconstruct(&inflated, NOW).unwrap().coinbase_tx;
         let differing = as_mined_cb.iter().zip(&inflated_cb).filter(|(a, b)| a != b).count();
-        assert_eq!(differing, 1, "exactly the PoT byte");
+        assert_eq!(differing, 1, "exactly the target byte");
     }
 
     #[test]
@@ -1239,7 +1262,7 @@ mod tests {
         let mut p = policy();
         p.min_difficulty = 16384;
         let (_, s) = setup();
-        let mut v = Verifier::new(p, Arc::new(Mutex::new(ReplayGuard::default())));
+        let mut v = Verifier::new(p, Arc::new(Mutex::new(AcceptedShareHashes::default())));
         v.record_dictated(&split(), Vec::new(), NOW);
         assert_eq!(v.reconstruct(&s, NOW), Err(RejectReason::BadTarget));
         let mut ok = s.clone();
@@ -1251,14 +1274,14 @@ mod tests {
     fn rejects_a_coinbase_paying_someone_else() {
         let p = policy();
         let mut redirected = split();
-        redirected.outputs[1].script = p2wpkh(0x99);
-        let (cb, pot_index) = coinbase_sections(&p, &redirected.outputs);
-        let mut v = Verifier::new(p, Arc::new(Mutex::new(ReplayGuard::default())));
+        redirected.outputs[1].script_pubkey = p2wpkh(0x99);
+        let (cb, target_byte_index) = coinbase_sections(&p, &redirected.outputs);
+        let mut v = Verifier::new(p, Arc::new(Mutex::new(AcceptedShareHashes::default())));
         v.record_dictated(&split(), Vec::new(), NOW);
         let (_, base) = setup();
         let mut share = base.clone();
         share.coinbase = Some(cb);
-        share.job = Some(job_section(pot_index));
+        share.job = Some(job_section(target_byte_index));
         assert_eq!(v.rebuild(&share, NOW), Err(RejectReason::BadCoinbaseOutputs));
     }
 
@@ -1266,7 +1289,7 @@ mod tests {
     fn rejects_a_coinbase_whose_outputs_total_less_than_the_job_value() {
         let p = policy();
         let sp = split();
-        let (mut cb, pot_index) = coinbase_sections(&p, &sp.outputs);
+        let (mut cb, target_byte_index) = coinbase_sections(&p, &sp.outputs);
         let full = cb.assemble(&[0u8; share::EXTRANONCE_SIZE]);
         let remainder = bitcoin::parse_coinbase(&full).unwrap().outputs[2].value;
         let pos = cb
@@ -1276,25 +1299,25 @@ mod tests {
             .expect("remainder output value");
         cb.coinb2[pos..pos + 8].copy_from_slice(&(remainder - 1).to_le_bytes());
 
-        let mut v = Verifier::new(p, Arc::new(Mutex::new(ReplayGuard::default())));
+        let mut v = Verifier::new(p, Arc::new(Mutex::new(AcceptedShareHashes::default())));
         v.record_dictated(&sp, Vec::new(), NOW);
         let (_, base) = setup();
         let mut share = base.clone();
         share.coinbase = Some(cb);
-        share.job = Some(job_section(pot_index));
+        share.job = Some(job_section(target_byte_index));
         assert_eq!(v.rebuild(&share, NOW), Err(RejectReason::BadCoinbase));
     }
 
     #[test]
     fn accepts_a_split_the_gateway_could_not_fit_entirely() {
         let (v, s) = with_outputs(&split().outputs[..1]);
-        let w = v.reconstruct(&s, NOW).unwrap();
-        assert_eq!(w.paid_to_split, 100_000_000);
-        assert_eq!(w.paid_to_pool, COINBASE_VALUE - 100_000_000);
+        let rebuilt = v.reconstruct(&s, NOW).unwrap();
+        assert_eq!(rebuilt.paid_to_split, 100_000_000);
+        assert_eq!(rebuilt.paid_to_pool, COINBASE_VALUE - 100_000_000);
 
         let (v, s) = with_outputs(&split().outputs[1..]);
-        let w = v.reconstruct(&s, NOW).unwrap();
-        assert_eq!(w.paid_to_split, 50_000_000);
+        let rebuilt = v.reconstruct(&s, NOW).unwrap();
+        assert_eq!(rebuilt.paid_to_split, 50_000_000);
     }
 
     #[test]
@@ -1306,14 +1329,14 @@ mod tests {
     fn a_share_is_checked_against_the_split_its_job_used() {
         let p = policy();
         let old_split = split();
-        let (cb, pot_index) = coinbase_sections(&p, &old_split.outputs);
-        let mut v = Verifier::new(p.clone(), Arc::new(Mutex::new(ReplayGuard::default())));
+        let (cb, target_byte_index) = coinbase_sections(&p, &old_split.outputs);
+        let mut v = Verifier::new(p.clone(), Arc::new(Mutex::new(AcceptedShareHashes::default())));
         v.record_dictated(&old_split, Vec::new(), NOW);
         v.record_dictated(
             &CoinbaserResponse {
                 value: COINBASE_VALUE,
                 coinbaser_id: old_split.coinbaser_id + 1,
-                outputs: vec![CoinbaseOutput { value: COINBASE_VALUE, script: p2wpkh(0x77) }],
+                outputs: vec![TxOut { value: COINBASE_VALUE, script_pubkey: p2wpkh(0x77) }],
             },
             Vec::new(),
             NOW,
@@ -1322,11 +1345,11 @@ mod tests {
         let (_, base) = setup();
         let mut share = base.clone();
         share.coinbase = Some(cb);
-        let mut job = job_section(pot_index);
+        let mut job = job_section(target_byte_index);
         job.coinbaser_id = old_split.coinbaser_id;
         share.job = Some(job);
-        let w = v.rebuild(&share, NOW).unwrap();
-        assert_eq!(w.paid_to_split, 150_000_000);
+        let rebuilt = v.rebuild(&share, NOW).unwrap();
+        assert_eq!(rebuilt.paid_to_split, 150_000_000);
 
         let mut wrong = share.clone();
         let mut job = wrong.job.clone().unwrap();
@@ -1347,30 +1370,34 @@ mod tests {
     fn rejects_a_coinbase_without_the_pool_tag() {
         let mut other = policy();
         other.coinbase_tag = "SOMEONEELSE".to_string();
-        let (cb, pot_index) = coinbase_sections(&other, &split().outputs);
+        let (cb, target_byte_index) = coinbase_sections(&other, &split().outputs);
         let mut v = verifier();
         v.record_dictated(&split(), Vec::new(), NOW);
         let (_, base) = setup();
         let mut share = base.clone();
         share.coinbase = Some(cb);
-        share.job = Some(job_section(pot_index));
+        share.job = Some(job_section(target_byte_index));
         assert_eq!(v.rebuild(&share, NOW), Err(RejectReason::MissingPoolTag));
     }
 
-    fn located(p: &PoolPolicy, tagging: &Tagging) -> (usize, String) {
-        let (cb, pot_index) = fixtures::coinbase(tagging, &p.payout_script, &[], COINBASE_VALUE);
+    fn located(p: &SharePolicy, tagging: &ScriptSigTags) -> (usize, String) {
+        let (cb, target_byte_index) =
+            fixtures::coinbase(tagging, &p.payout_script, &[], COINBASE_VALUE);
         let coinbase_tx = cb.assemble(&[0u8; share::EXTRANONCE_SIZE]);
         let parsed = bitcoin::parse_coinbase(&coinbase_tx).expect("a parseable coinbase");
-        let (index, tag) = locate_pot_byte(&parsed, p).expect("the pool tag is present");
-        assert_eq!(index, pot_index, "the PoT byte is where the fixture placed it");
+        let (index, tag) = locate_target_byte(&parsed, p).expect("the pool tag is present");
+        assert_eq!(index, target_byte_index, "the target byte is where the fixture placed it");
         (index, tag)
     }
 
     #[test]
     fn reads_the_secondary_coinbase_tag_out_of_the_tag_push() {
         let p = policy();
-        let tagging =
-            Tagging { tag: &p.coinbase_tag, tag_secondary: "bob", prime_id: p.prime_id as u32 };
+        let tagging = ScriptSigTags {
+            tag_primary: &p.coinbase_tag,
+            tag_secondary: "bob",
+            prime_id: p.prime_id as u32,
+        };
         assert_eq!(located(&p, &tagging).1, "bob");
     }
 
@@ -1378,9 +1405,11 @@ mod tests {
     fn reads_the_secondary_tag_when_the_pool_declares_no_tag() {
         let mut p = policy();
         p.coinbase_tag = String::new();
-        let tagging = Tagging { tag: "", tag_secondary: "bob", prime_id: p.prime_id as u32 };
+        let tagging =
+            ScriptSigTags { tag_primary: "", tag_secondary: "bob", prime_id: p.prime_id as u32 };
         assert_eq!(located(&p, &tagging).1, "bob");
-        let untagged = Tagging { tag: "", tag_secondary: "", prime_id: p.prime_id as u32 };
+        let untagged =
+            ScriptSigTags { tag_primary: "", tag_secondary: "", prime_id: p.prime_id as u32 };
         assert_eq!(located(&p, &untagged).1, "");
     }
 
@@ -1398,12 +1427,26 @@ mod tests {
         assert_eq!(decode_tag(&[0xff, 0x41]), "\u{fffd}A", "invalid UTF-8 is replaced");
     }
 
-    fn widen_prime_push(cb: &CoinbaseSection, pot_index: usize, prime_id: u64) -> CoinbaseSection {
+    fn widen_prime_push(
+        cb: &CoinbaseSection,
+        target_byte_index: usize,
+        prime_id: u64,
+    ) -> CoinbaseSection {
         let mut coinb1 = cb.coinb1.clone();
-        assert_eq!(coinb1[pot_index - 1], 0x07, "the 7-byte push opcode precedes the PoT byte");
-        coinb1[pot_index - 1] = 0x0b;
-        assert_eq!(&coinb1[pot_index + 3..pot_index + 7], &prime_id.to_le_bytes()[..4]);
-        coinb1.splice(pot_index + 7..pot_index + 7, prime_id.to_le_bytes()[4..].iter().copied());
+        assert_eq!(
+            coinb1[target_byte_index - 1],
+            0x07,
+            "the 7-byte push opcode precedes the target byte"
+        );
+        coinb1[target_byte_index - 1] = 0x0b;
+        assert_eq!(
+            &coinb1[target_byte_index + 3..target_byte_index + 7],
+            &prime_id.to_le_bytes()[..4]
+        );
+        coinb1.splice(
+            target_byte_index + 7..target_byte_index + 7,
+            prime_id.to_le_bytes()[4..].iter().copied(),
+        );
         coinb1[41] += 4;
         CoinbaseSection { coinbase_id: cb.coinbase_id, coinb1, coinb2: cb.coinb2.clone() }
     }
@@ -1412,14 +1455,18 @@ mod tests {
     fn accepts_the_version_3_eleven_byte_prime_push() {
         let mut wide = policy();
         wide.prime_id = 0x1122_3344_5566_7788;
-        let (cb, pot_index) = coinbase_sections(&wide, &split().outputs);
-        let cb = widen_prime_push(&cb, pot_index, wide.prime_id);
-        let mut v = Verifier::new(wide.clone(), Arc::new(Mutex::new(ReplayGuard::default())));
+        let (cb, target_byte_index) = coinbase_sections(&wide, &split().outputs);
+        let cb = widen_prime_push(&cb, target_byte_index, wide.prime_id);
+        let mut v =
+            Verifier::new(wide.clone(), Arc::new(Mutex::new(AcceptedShareHashes::default())));
         v.record_dictated(&split(), Vec::new(), NOW);
-        let mut share = share_on(job_section(pot_index), cb.clone());
+        let mut share = share_on(job_section(target_byte_index), cb.clone());
         share.target_byte = 5;
-        let w = v.reconstruct(&share, NOW).expect("the 64-bit prime id is found in the push");
-        assert_eq!(w.coinbase_tx[pot_index], 5, "the PoT byte is at the claimed index");
+        let rebuilt = v.reconstruct(&share, NOW).expect("the 64-bit prime id is found in the push");
+        assert_eq!(
+            rebuilt.coinbase_tx[target_byte_index], 5,
+            "the target byte is at the claimed index"
+        );
 
         let (narrow, _) = coinbase_sections(&wide, &split().outputs);
         share.coinbase = Some(narrow);
@@ -1436,18 +1483,18 @@ mod tests {
         let mut refused = share.clone();
         refused.username = String::new();
         assert_eq!(v.verify(&refused, NOW), Err(RejectReason::BadUsername));
-        let work = v.rebuild_refused(&refused).expect("the job section resolves");
-        assert_eq!(work.raw_hash, v.reconstruct(&share, NOW).unwrap().raw_hash);
+        let rebuilt = v.rebuild_refused(&refused).expect("the job section resolves");
+        assert_eq!(rebuilt.raw_pow_hash, v.reconstruct(&share, NOW).unwrap().raw_pow_hash);
         assert!(
-            v.block_candidate(&work),
+            v.block_candidate(&rebuilt),
             "under the node's regtest target the refused share is a block"
         );
 
         let (v, share) = setup_hard();
         let mut refused = share.clone();
         refused.username = String::new();
-        let work = v.rebuild_refused(&refused).expect("the job section resolves");
-        assert!(!v.block_candidate(&work), "under a hard network target it is a share only");
+        let rebuilt = v.rebuild_refused(&refused).expect("the job section resolves");
+        assert!(!v.block_candidate(&rebuilt), "under a hard network target it is a share only");
 
         let mut unknown = share.clone();
         unknown.job = None;
@@ -1472,8 +1519,8 @@ mod tests {
         let mut on_revealed = share.clone();
         on_revealed.abw_slot = Some(1);
         assert_eq!(v.verify(&on_revealed, NOW), Err(RejectReason::BadAbwSlot));
-        let work = v.rebuild_refused(&on_revealed).expect("rebuilt with the revealed key");
-        assert_eq!(&work.header[112..128], &revealed, "the header carries the revealed key");
+        let rebuilt = v.rebuild_refused(&on_revealed).expect("rebuilt with the revealed key");
+        assert_eq!(&rebuilt.header[112..128], &revealed, "the header carries the revealed key");
 
         let mut never_seeded = share.clone();
         never_seeded.abw_slot = Some(2);
@@ -1493,10 +1540,10 @@ mod tests {
         v.set_next_target(Some(0x1b00_ffff));
         v.set_tip(Some(job.prev_hash), NOW);
         assert_eq!(v.verify(&s, NOW), Err(RejectReason::BadTarget));
-        let work = v.rebuild_refused(&s).expect("rebuilt without the on-tip bits check");
-        assert_eq!(work.job_bits, u32::from_le_bytes(NBITS));
-        assert!(meets_own_bits(&work));
-        assert!(v.block_candidate(&work), "a block by the job's own bits gets the receipt");
+        let rebuilt = v.rebuild_refused(&s).expect("rebuilt without the on-tip bits check");
+        assert_eq!(rebuilt.job_bits, u32::from_le_bytes(NBITS));
+        assert!(meets_own_bits(&rebuilt));
+        assert!(v.block_candidate(&rebuilt), "a block by the job's own bits gets the receipt");
 
         let (mut v, s) = setup();
         v.set_next_target(Some(0x1b00_ffff));
@@ -1504,25 +1551,25 @@ mod tests {
         v.set_tip(Some([0x11; 32]), NOW);
         let a = v.verify(&s, NOW).unwrap();
         assert!(!a.is_block, "the node's target is not met, so it is not relayed");
-        assert!(v.block_candidate(&a.work), "the gateway's audit counts it as a block");
+        assert!(v.block_candidate(&a.rebuilt), "the gateway's audit counts it as a block");
 
         let (mut v, s) = setup_hard();
         let a = v.verify(&s, NOW).unwrap();
-        assert!(!meets_own_bits(&a.work));
-        assert!(!v.block_candidate(&a.work));
+        assert!(!meets_own_bits(&a.rebuilt));
+        assert!(!v.block_candidate(&a.rebuilt));
     }
 
     #[test]
     fn rejects_a_coinbase_without_the_prime_id() {
         let mut other = policy();
         other.prime_id = 0x1234_5678;
-        let (cb, pot_index) = coinbase_sections(&other, &split().outputs);
+        let (cb, target_byte_index) = coinbase_sections(&other, &split().outputs);
         let mut v = verifier();
         v.record_dictated(&split(), Vec::new(), NOW);
         let (_, base) = setup();
         let mut share = base.clone();
         share.coinbase = Some(cb);
-        share.job = Some(job_section(pot_index));
+        share.job = Some(job_section(target_byte_index));
         assert_eq!(v.rebuild(&share, NOW), Err(RejectReason::MissingPoolTag));
     }
 
@@ -1549,7 +1596,7 @@ mod tests {
         assert!(v.reconstruct(&stale_field, NOW).is_ok(), "the fixed field is not the block time");
         let mut p = policy();
         p.ntime_window_secs = 0;
-        let mut v = Verifier::new(p, Arc::new(Mutex::new(ReplayGuard::default())));
+        let mut v = Verifier::new(p, Arc::new(Mutex::new(AcceptedShareHashes::default())));
         v.record_dictated(&split(), Vec::new(), NOW);
         assert!(v.reconstruct(&old, NOW).is_ok());
     }
@@ -1673,9 +1720,9 @@ mod tests {
         bare.job = None;
         bare.coinbase = None;
         assert_eq!(v.rebuild(&bare, NOW), Err(RejectReason::StaleBlock));
-        let work = v.rebuild_refused(&bare).expect("rebuilt from the evicted job's sections");
-        assert_eq!(work.raw_hash, v.rebuild_refused(&s).unwrap().raw_hash);
-        assert!(v.block_candidate(&work));
+        let rebuilt = v.rebuild_refused(&bare).expect("rebuilt from the evicted job's sections");
+        assert_eq!(rebuilt.raw_pow_hash, v.rebuild_refused(&s).unwrap().raw_pow_hash);
+        assert!(v.block_candidate(&rebuilt));
     }
 
     #[test]
@@ -1780,7 +1827,7 @@ mod tests {
     #[test]
     fn a_share_is_credited_once_across_connections() {
         let (mut first, s) = setup();
-        let mut second = Verifier::new(policy(), Arc::clone(&first.replay));
+        let mut second = Verifier::new(policy(), Arc::clone(&first.accepted_hashes));
         second.record_dictated(&split(), Vec::new(), NOW);
 
         assert!(first.verify(&s, NOW).is_ok());
@@ -1792,32 +1839,32 @@ mod tests {
     }
 
     #[test]
-    fn replay_guard_removes_the_oldest_hash_first() {
-        let mut g = ReplayGuard::new(2);
-        assert!(g.accept([1; 32]));
-        assert!(g.accept([2; 32]));
-        assert!(!g.accept([1; 32]));
-        assert_eq!(g.len(), 2);
-        assert!(g.accept([3; 32]));
-        assert_eq!(g.len(), 2);
-        assert!(g.accept([1; 32]));
-        assert!(!g.accept([3; 32]));
-        let mut g = ReplayGuard::new(0);
-        assert!(g.accept([9; 32]));
-        assert!(!g.accept([9; 32]));
+    fn accepted_share_hashes_remove_the_oldest_first() {
+        let mut hashes = AcceptedShareHashes::new(2);
+        assert!(hashes.accept([1; 32]));
+        assert!(hashes.accept([2; 32]));
+        assert!(!hashes.accept([1; 32]));
+        assert_eq!(hashes.len(), 2);
+        assert!(hashes.accept([3; 32]));
+        assert_eq!(hashes.len(), 2);
+        assert!(hashes.accept([1; 32]));
+        assert!(!hashes.accept([3; 32]));
+        let mut hashes = AcceptedShareHashes::new(0);
+        assert!(hashes.accept([9; 32]));
+        assert!(!hashes.accept([9; 32]));
     }
 
     #[test]
     fn a_removed_hash_can_be_accepted_again() {
-        let mut g = ReplayGuard::new(4);
-        assert!(g.accept([1; 32]));
-        assert!(g.accept([2; 32]));
-        assert!(!g.accept([1; 32]));
-        assert!(g.remove(&[1; 32]), "the hash was present");
-        assert!(!g.remove(&[1; 32]), "and is gone now");
-        assert_eq!(g.len(), 1);
-        assert!(g.accept([1; 32]), "a removed hash is accepted again when it is resent");
-        assert!(!g.accept([2; 32]), "the one that stayed is still a duplicate");
+        let mut hashes = AcceptedShareHashes::new(4);
+        assert!(hashes.accept([1; 32]));
+        assert!(hashes.accept([2; 32]));
+        assert!(!hashes.accept([1; 32]));
+        assert!(hashes.remove(&[1; 32]), "the hash was present");
+        assert!(!hashes.remove(&[1; 32]), "and is gone now");
+        assert_eq!(hashes.len(), 1);
+        assert!(hashes.accept([1; 32]), "a removed hash is accepted again when it is resent");
+        assert!(!hashes.accept([2; 32]), "the one that stayed is still a duplicate");
     }
 
     #[test]
@@ -1842,22 +1889,22 @@ mod tests {
     #[test]
     fn rebuilds_a_subsidy_only_share() {
         let p = policy();
-        let (mut cb, pot_index) = coinbase_sections(&p, &[]);
+        let (mut cb, target_byte_index) = coinbase_sections(&p, &[]);
         cb.coinbase_id = COINBASE_ID_SUBSIDY_ONLY;
-        let v = Verifier::new(p, Arc::new(Mutex::new(ReplayGuard::default())));
+        let v = Verifier::new(p, Arc::new(Mutex::new(AcceptedShareHashes::default())));
         let (_, base) = setup();
         let mut share = base.clone();
         share.subsidy_only = true;
         share.coinbase_id = COINBASE_ID_SUBSIDY_ONLY;
         share.coinbase = Some(cb);
-        let mut job = job_section(pot_index);
+        let mut job = job_section(target_byte_index);
         job.merkle_branches = vec![[0x42; 32]];
         share.job = Some(job);
 
-        let w = v.reconstruct(&share, NOW).unwrap();
-        assert_eq!(w.paid_to_split, 0);
-        assert_eq!(w.paid_to_pool, COINBASE_VALUE);
-        assert_eq!(built_header(&w).merkle_root, bitcoin::sha256d(&w.coinbase_tx));
+        let rebuilt = v.reconstruct(&share, NOW).unwrap();
+        assert_eq!(rebuilt.paid_to_split, 0);
+        assert_eq!(rebuilt.paid_to_pool, COINBASE_VALUE);
+        assert_eq!(built_header(&rebuilt).merkle_root, bitcoin::sha256d(&rebuilt.coinbase_tx));
     }
 
     #[test]
@@ -1889,17 +1936,17 @@ mod tests {
             script_sig: vec![],
             sequence: 0xffff_ffff,
             outputs: vec![
-                TxOut { value: 0, script: vec![0x6a, 0x0e] },
-                TxOut { value: COINBASE_VALUE, script: p.payout_script.clone() },
+                TxOut { value: 0, script_pubkey: vec![0x6a, 0x0e] },
+                TxOut { value: COINBASE_VALUE, script_pubkey: p.payout_script.clone() },
             ],
             lock_time: 0,
             has_witness: false,
         };
         let (_, s) = setup();
-        let Payments { to_split, to_pool, unpaid } =
+        let Payments { to_split, to_pool, unpaid_output_indexes } =
             check_outputs(&p, &HashMap::new(), &job_section(0), &tx, &s).unwrap();
         assert_eq!((to_split, to_pool), (0, COINBASE_VALUE));
-        assert!(unpaid.is_empty(), "nothing was dictated, so nothing was left out");
+        assert!(unpaid_output_indexes.is_empty(), "nothing was dictated, so nothing was left out");
     }
 
     #[test]
@@ -1911,10 +1958,10 @@ mod tests {
             for offset in 0..16u32 {
                 s.blake2b.time_on_wire = NOW as u32 + offset;
                 s.ntime = s.blake2b.time_on_wire;
-                let w = v.rebuild(&s, NOW + u64::from(offset)).expect("rebuild");
-                let h = built_header(&w);
-                let pre = h.precompute();
-                let input = h.asic_input_with(&pre.hash1, &pre.h2);
+                let rebuilt = v.rebuild(&s, NOW + u64::from(offset)).expect("rebuild");
+                let h = built_header(&rebuilt);
+                let stages = h.hash_stages();
+                let input = h.asic_input_with(&stages.work_root, &stages.h2);
                 match ratum::nonce::search(
                     &input,
                     32,

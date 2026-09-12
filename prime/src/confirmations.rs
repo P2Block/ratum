@@ -1,7 +1,7 @@
 use crate::server::Server;
 use log::{error, info, warn};
 use ratum::lock;
-use ratum_prime::ledger::{ChainState, Ledger};
+use ratum_prime::ledger::{ConfirmationReading, Ledger};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +12,7 @@ const CONFIRMED_DEPTH: i64 = 100;
 const MAX_PER_PASS: usize = 32;
 
 pub(crate) fn watch(server: Arc<Server>) {
-    ratum::thread::spawn("chain-state", move || {
+    ratum::thread::spawn("confirmations", move || {
         loop {
             std::thread::sleep(INTERVAL);
             check_once(&server);
@@ -25,7 +25,7 @@ fn due(ledger: &Ledger) -> Vec<[u8; 32]> {
         .blocks()
         .iter()
         .filter(|b| {
-            ledger.chain_state(&b.block_hash).is_none_or(|s| s.confirmations < CONFIRMED_DEPTH)
+            ledger.confirmations(&b.block_hash).is_none_or(|s| s.confirmations < CONFIRMED_DEPTH)
         })
         .map(|b| b.block_hash)
         .take(MAX_PER_PASS)
@@ -49,9 +49,9 @@ fn check_once(server: &Server) {
                 continue;
             }
         };
-        let state = ChainState { checked_at: ratum::unix_now(), confirmations };
+        let state = ConfirmationReading { checked_at: ratum::unix_now(), confirmations };
         let mut l = lock(&server.ledger);
-        let previous = match l.record_chain_state(hash, state) {
+        let previous = match l.record_confirmations(hash, state) {
             Ok(previous) => previous,
             Err(e) => {
                 warn!("could not record the chain state of block {display} ({e})");
@@ -66,8 +66,8 @@ fn check_once(server: &Server) {
 
 fn report(
     display: &str,
-    state: ChainState,
-    previous: Option<ChainState>,
+    state: ConfirmationReading,
+    previous: Option<ConfirmationReading>,
     owed: Option<ratum_prime::ledger::OwedBlock>,
 ) {
     let was_on_chain = previous.is_none_or(|p| p.on_best_chain());
@@ -122,14 +122,14 @@ mod tests {
                 paid_to_pool: 1,
                 finder: "alice".into(),
                 tag: String::new(),
-                difficulty: 1.0,
+                network_difficulty: 1.0,
                 cumulative_work: 1,
             })
             .unwrap();
             if let Some(confirmations) = confirmations {
-                l.record_chain_state(
+                l.record_confirmations(
                     hash(*n),
-                    ChainState { checked_at: 1, confirmations: *confirmations },
+                    ConfirmationReading { checked_at: 1, confirmations: *confirmations },
                 )
                 .unwrap();
             }
@@ -165,8 +165,11 @@ mod tests {
 
     #[test]
     fn a_negative_confirmation_count_is_off_the_best_chain() {
-        assert!(ChainState { checked_at: 1, confirmations: 0 }.on_best_chain(), "the tip itself");
-        assert!(ChainState { checked_at: 1, confirmations: 6 }.on_best_chain());
-        assert!(!ChainState { checked_at: 1, confirmations: -1 }.on_best_chain());
+        assert!(
+            ConfirmationReading { checked_at: 1, confirmations: 0 }.on_best_chain(),
+            "the tip itself"
+        );
+        assert!(ConfirmationReading { checked_at: 1, confirmations: 6 }.on_best_chain());
+        assert!(!ConfirmationReading { checked_at: 1, confirmations: -1 }.on_best_chain());
     }
 }

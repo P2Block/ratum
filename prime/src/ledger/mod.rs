@@ -9,14 +9,14 @@ pub(crate) const MAX_SHARES: usize = 1 << 20;
 
 pub const SHARES_PER_KEEP_UNIT: u64 = MAX_SHARES as u64;
 
-pub(crate) const HASH_SIZE: usize = ratum::bitcoin::HASH_SIZE;
+use ratum::bitcoin::HASH_SIZE;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Share {
     pub at: u64,
     pub identity: String,
     pub difficulty: u64,
-    pub hash: Option<[u8; 32]>,
+    pub block_hash: [u8; 32],
     pub tag: String,
 }
 
@@ -38,12 +38,12 @@ pub struct OwedBlock {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChainState {
+pub struct ConfirmationReading {
     pub checked_at: u64,
     pub confirmations: i64,
 }
 
-impl ChainState {
+impl ConfirmationReading {
     pub fn on_best_chain(&self) -> bool {
         self.confirmations >= 0
     }
@@ -58,7 +58,7 @@ pub struct FoundBlock {
     pub paid_to_pool: u64,
     pub finder: String,
     pub tag: String,
-    pub difficulty: f64,
+    pub network_difficulty: f64,
     pub cumulative_work: u128,
 }
 
@@ -72,7 +72,7 @@ pub struct Ledger {
     store: Option<Store>,
     owed: Vec<OwedBlock>,
     blocks: Vec<FoundBlock>,
-    chain_state: HashMap<[u8; HASH_SIZE], ChainState>,
+    confirmations: HashMap<[u8; HASH_SIZE], ConfirmationReading>,
     cumulative_work: u128,
     count_capped: bool,
 }
@@ -89,7 +89,7 @@ impl Ledger {
             store: None,
             owed: Vec::new(),
             blocks: Vec::new(),
-            chain_state: HashMap::new(),
+            confirmations: HashMap::new(),
             cumulative_work: 0,
             count_capped: false,
         }
@@ -108,7 +108,7 @@ impl Ledger {
         ledger.fill(shares);
         ledger.owed = store.read_owed()?;
         ledger.blocks = store.read_blocks()?;
-        ledger.chain_state = store.read_chain_states()?.into_iter().collect();
+        ledger.confirmations = store.read_confirmations()?.into_iter().collect();
         ledger.cumulative_work = store.cumulative_work;
         ledger.store = Some(store);
         Ok((ledger, read_back))
@@ -183,8 +183,8 @@ impl Ledger {
         std::mem::replace(&mut self.removed, 0)
     }
 
-    pub fn hashes(&self) -> impl Iterator<Item = &[u8; 32]> {
-        self.shares.iter().filter_map(|s| s.hash.as_ref())
+    pub fn block_hashes(&self) -> impl Iterator<Item = &[u8; 32]> {
+        self.shares.iter().map(|s| &s.block_hash)
     }
 
     pub fn record(
@@ -192,14 +192,14 @@ impl Ledger {
         at: u64,
         identity: &str,
         difficulty: u64,
-        hash: &[u8; 32],
+        block_hash: &[u8; 32],
         tag: &str,
     ) -> io::Result<()> {
         let share = Share {
             at,
             identity: identity.to_string(),
             difficulty,
-            hash: Some(*hash),
+            block_hash: *block_hash,
             tag: tag.to_string(),
         };
         if let Some(store) = &mut self.store
@@ -240,19 +240,19 @@ impl Ledger {
         &self.blocks
     }
 
-    pub fn chain_state(&self, hash: &[u8; HASH_SIZE]) -> Option<ChainState> {
-        self.chain_state.get(hash).copied()
+    pub fn confirmations(&self, hash: &[u8; HASH_SIZE]) -> Option<ConfirmationReading> {
+        self.confirmations.get(hash).copied()
     }
 
-    pub fn record_chain_state(
+    pub fn record_confirmations(
         &mut self,
         hash: [u8; HASH_SIZE],
-        state: ChainState,
-    ) -> io::Result<Option<ChainState>> {
+        reading: ConfirmationReading,
+    ) -> io::Result<Option<ConfirmationReading>> {
         if let Some(store) = &self.store {
-            store.write_chain_state(&hash, &state)?;
+            store.write_confirmations(&hash, &reading)?;
         }
-        Ok(self.chain_state.insert(hash, state))
+        Ok(self.confirmations.insert(hash, reading))
     }
 
     pub fn record_owed(&mut self, owed: OwedBlock) -> io::Result<()> {
@@ -732,19 +732,23 @@ mod tests {
             l.record(2, "bob", 32, &hash(2), "").unwrap();
         }
         let (l, _) = open(&scratch, 1_000_000, None);
-        assert_eq!(l.hashes().copied().collect::<Vec<_>>(), vec![hash(1), hash(2)], "oldest first");
+        assert_eq!(
+            l.block_hashes().copied().collect::<Vec<_>>(),
+            vec![hash(1), hash(2)],
+            "oldest first"
+        );
     }
 
     #[test]
     fn hashes_returns_the_hashes_the_window_holds() {
         let mut l = ledger_with(1_000_000, &[("alice", 16), ("bob", 32)]);
         l.record(1_100, "carol", 8, &hash(99), "").unwrap();
-        assert_eq!(l.hashes().copied().collect::<Vec<_>>(), vec![hash(0), hash(1), hash(99)]);
+        assert_eq!(l.block_hashes().copied().collect::<Vec<_>>(), vec![hash(0), hash(1), hash(99)]);
 
         let mut narrow = Ledger::new(8);
         narrow.record(1, "alice", 8, &hash(1), "").unwrap();
         narrow.record(2, "bob", 8, &hash(2), "").unwrap();
-        assert_eq!(narrow.hashes().copied().collect::<Vec<_>>(), vec![hash(2)]);
+        assert_eq!(narrow.block_hashes().copied().collect::<Vec<_>>(), vec![hash(2)]);
     }
 
     #[test]
@@ -798,7 +802,7 @@ mod tests {
 
         assert_eq!(l.set_window(8), 0);
         assert_eq!(l.work_by_identity(), vec![("carol".into(), 8)]);
-        assert_eq!(l.hashes().copied().collect::<Vec<_>>(), vec![hash(3)]);
+        assert_eq!(l.block_hashes().copied().collect::<Vec<_>>(), vec![hash(3)]);
 
         assert_eq!(l.set_window(56), 2, "alice and bob are re-read");
         assert_eq!(l.total_work(), 56);
@@ -806,7 +810,7 @@ mod tests {
             l.work_by_identity(),
             vec![("bob".into(), 32), ("alice".into(), 16), ("carol".into(), 8)]
         );
-        assert_eq!(l.hashes().copied().collect::<Vec<_>>(), vec![hash(1), hash(2), hash(3)]);
+        assert_eq!(l.block_hashes().copied().collect::<Vec<_>>(), vec![hash(1), hash(2), hash(3)]);
     }
 
     #[test]
@@ -862,34 +866,41 @@ mod tests {
     }
 
     #[test]
-    fn the_chain_state_of_a_block_is_durable_and_reports_what_it_replaced() {
+    fn the_confirmations_of_a_block_is_durable_and_reports_what_it_replaced() {
         let scratch = Scratch::new("chain-state");
-        let on_chain = ChainState { checked_at: 1_000, confirmations: 3 };
-        let orphaned = ChainState { checked_at: 2_000, confirmations: -1 };
+        let on_chain = ConfirmationReading { checked_at: 1_000, confirmations: 3 };
+        let orphaned = ConfirmationReading { checked_at: 2_000, confirmations: -1 };
         {
             let (mut l, _) = open(&scratch, u128::MAX, None);
-            assert_eq!(l.chain_state(&hash(1)), None, "nothing has been read yet");
-
-            assert_eq!(l.record_chain_state(hash(1), on_chain).unwrap(), None, "the first reading");
-            assert_eq!(l.chain_state(&hash(1)), Some(on_chain));
+            assert_eq!(l.confirmations(&hash(1)), None, "nothing has been read yet");
 
             assert_eq!(
-                l.record_chain_state(hash(1), orphaned).unwrap(),
+                l.record_confirmations(hash(1), on_chain).unwrap(),
+                None,
+                "the first reading"
+            );
+            assert_eq!(l.confirmations(&hash(1)), Some(on_chain));
+
+            assert_eq!(
+                l.record_confirmations(hash(1), orphaned).unwrap(),
                 Some(on_chain),
                 "the reading it replaced, which is how a block leaving the chain is reported"
             );
-            assert_eq!(l.chain_state(&hash(1)), Some(orphaned));
+            assert_eq!(l.confirmations(&hash(1)), Some(orphaned));
         }
         let (l, _) = open(&scratch, u128::MAX, None);
-        assert_eq!(l.chain_state(&hash(1)), Some(orphaned), "the reading survives a reopen");
-        assert_eq!(l.chain_state(&hash(2)), None, "and no other block gained one");
+        assert_eq!(l.confirmations(&hash(1)), Some(orphaned), "the reading survives a reopen");
+        assert_eq!(l.confirmations(&hash(2)), None, "and no other block gained one");
     }
 
     #[test]
     fn a_block_is_on_the_best_chain_at_zero_confirmations_and_not_below() {
-        assert!(ChainState { checked_at: 1, confirmations: 0 }.on_best_chain(), "the tip itself");
-        assert!(ChainState { checked_at: 1, confirmations: 100 }.on_best_chain());
-        assert!(!ChainState { checked_at: 1, confirmations: -1 }.on_best_chain());
+        assert!(
+            ConfirmationReading { checked_at: 1, confirmations: 0 }.on_best_chain(),
+            "the tip itself"
+        );
+        assert!(ConfirmationReading { checked_at: 1, confirmations: 100 }.on_best_chain());
+        assert!(!ConfirmationReading { checked_at: 1, confirmations: -1 }.on_best_chain());
     }
 
     #[test]
@@ -934,7 +945,7 @@ mod tests {
             paid_to_pool: 5,
             finder: "alice".into(),
             tag: "bob".into(),
-            difficulty: 100.5,
+            network_difficulty: 100.5,
             cumulative_work,
         }
     }

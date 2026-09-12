@@ -1,4 +1,4 @@
-use crate::cursor::Cursor;
+use crate::reader::ByteReader;
 use blake2::Blake2b;
 use blake2::digest::Digest as _;
 use blake2::digest::consts::U32;
@@ -24,27 +24,24 @@ const WORK_ROOT_EXTRANONCE_OFFSET: usize = 36;
 
 const PREVBLOCK_HIDDEN_CLEARED_BYTES: usize = 6;
 
-pub type U256 = [u8; 32];
-pub type U128 = [u8; 16];
-
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub struct HeaderV2 {
+pub struct BlockHeaderV2 {
     pub version: i32,
-    pub prev_block: U256,
-    pub merkle_root: U256,
+    pub prev_block: [u8; 32],
+    pub merkle_root: [u8; 32],
     pub time: u32,
     pub bits: u32,
     pub nonce: u32,
     pub nonce2: u32,
     pub nonce3: u32,
-    pub extranonce: U128,
+    pub extranonce: [u8; 16],
     pub time_offset: u32,
     pub txcount: u16,
     pub flags: u8,
     pub xor_key_mask_clear_bits: u8,
-    pub xor_key: U128,
+    pub xor_key: [u8; 16],
     pub height: i32,
-    pub mm_rhs: U256,
+    pub mm_rhs: [u8; 32],
 }
 
 fn sha256(data: &[u8]) -> [u8; 32] {
@@ -66,7 +63,7 @@ pub fn blake2b_256(data: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-impl HeaderV2 {
+impl BlockHeaderV2 {
     pub fn time_on_wire(&self) -> u32 {
         if self.flags & FLAG_USE_TIME_OFFSET == 0 {
             self.time
@@ -106,7 +103,7 @@ impl HeaderV2 {
         if b.len() != HEADER_V2_SIZE {
             return None;
         }
-        let mut r = Cursor::new(b);
+        let mut r = ByteReader::new(b);
         let v = r.u32("version").ok()?;
         if v & V2_FLAG == 0 {
             return None;
@@ -135,7 +132,7 @@ impl HeaderV2 {
         Some(h)
     }
 
-    pub fn asic_input_with(&self, hash1: &[u8; 32], h2: &[u8; 32]) -> Vec<u8> {
+    pub fn asic_input_with(&self, work_root: &[u8; 32], h2: &[u8; 32]) -> Vec<u8> {
         let profile = self.asic_profile();
         let mut ss = Vec::with_capacity(ASIC_INPUT_LEN[profile as usize]);
         match profile {
@@ -144,7 +141,7 @@ impl HeaderV2 {
                 ss.put_u32_le(self.nonce2);
                 ss.put_u32_le(self.nonce3);
                 ss.put_u32_le(self.time_offset);
-                ss.put_slice(hash1);
+                ss.put_slice(work_root);
                 ss.put_slice(h2);
             }
             p => {
@@ -158,18 +155,18 @@ impl HeaderV2 {
                 ss.put_u32_le(self.nonce2);
                 ss.put_u32_le(self.time_offset);
                 ss.put_u32_le(self.nonce3);
-                ss.put_slice(hash1);
+                ss.put_slice(work_root);
             }
         }
         debug_assert_eq!(ss.len(), ASIC_INPUT_LEN[profile as usize]);
         ss
     }
 
-    pub fn precompute(&self) -> Precomputed {
-        self.precompute_with_key_hash(xor_key_hash(&self.xor_key))
+    pub fn hash_stages(&self) -> HashStages {
+        self.hash_stages_with_key_hash(xor_key_hash(&self.xor_key))
     }
 
-    pub fn precompute_with_key_hash(&self, xor_key_hash: [u8; 32]) -> Precomputed {
+    pub fn hash_stages_with_key_hash(&self, xor_key_hash: [u8; 32]) -> HashStages {
         let prev_display = crate::bitcoin::reversed(&self.prev_block);
 
         let mut h1d = [0u8; H1_PREIMAGE_SIZE];
@@ -196,18 +193,21 @@ impl HeaderV2 {
         let mut leaf = [0u8; WORK_ROOT_LEAF_SIZE];
         leaf[WORK_ROOT_H2_OFFSET..WORK_ROOT_EXTRANONCE_OFFSET].copy_from_slice(&h2);
         leaf[WORK_ROOT_EXTRANONCE_OFFSET..].copy_from_slice(&self.extranonce);
-        let hash1 = blake2b_256(&leaf);
+        let work_root = blake2b_256(&leaf);
 
-        let mask = xor_mask(&self.xor_key, self.xor_key_mask_clear_bits);
-
-        Precomputed { h2, hash1, mask }
+        HashStages {
+            h1,
+            h2,
+            work_root,
+            xor_key_mask: xor_key_mask(&self.xor_key, self.xor_key_mask_clear_bits),
+        }
     }
 
-    pub fn pow_and_block_hash(&self) -> ([u8; 32], [u8; 32]) {
-        let pre = self.precompute();
-        let pow = blake2b_256(&self.asic_input_with(&pre.hash1, &pre.h2));
+    pub fn raw_pow_and_block_hash(&self) -> ([u8; 32], [u8; 32]) {
+        let stages = self.hash_stages();
+        let pow = blake2b_256(&self.asic_input_with(&stages.work_root, &stages.h2));
         let mut block = pow;
-        for (b, m) in block.iter_mut().zip(pre.mask) {
+        for (b, m) in block.iter_mut().zip(stages.xor_key_mask) {
             *b ^= m;
         }
         (pow, block)
@@ -215,24 +215,25 @@ impl HeaderV2 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Precomputed {
+pub struct HashStages {
+    pub h1: [u8; 32],
     pub h2: [u8; 32],
-    pub hash1: [u8; 32],
-    pub mask: [u8; 32],
+    pub work_root: [u8; 32],
+    pub xor_key_mask: [u8; 32],
 }
 
-pub fn xor_key_hash(xor_key: &U128) -> [u8; 32] {
+pub fn xor_key_hash(xor_key: &[u8; 16]) -> [u8; 32] {
     tagged_sha256("Bitcoin block hash PoW XOR key", xor_key)
 }
 
-pub fn prevblock_hidden(prev_block: &U256) -> [u8; 32] {
+pub fn prevblock_hidden(prev_block: &[u8; 32]) -> [u8; 32] {
     let display = crate::bitcoin::reversed(prev_block);
     let mut out = tagged_sha256("Bitcoin prevblock header, hashed", &display);
     out[..PREVBLOCK_HIDDEN_CLEARED_BYTES].fill(0);
     out
 }
 
-pub fn xor_mask(xor_key: &U128, clear_bits: u8) -> [u8; 32] {
+pub fn xor_key_mask(xor_key: &[u8; 16], clear_bits: u8) -> [u8; 32] {
     if xor_key.iter().all(|&b| b == 0) {
         return [0u8; 32];
     }
@@ -248,11 +249,11 @@ pub fn xor_mask(xor_key: &U128, clear_bits: u8) -> [u8; 32] {
     m
 }
 
-pub fn u256_from_display_hex(s: &str) -> Option<U256> {
-    let v: U256 = hex::decode(s).ok()?.try_into().ok()?;
+pub fn hash_from_display_hex(s: &str) -> Option<[u8; 32]> {
+    let v: [u8; 32] = hex::decode(s).ok()?.try_into().ok()?;
     Some(crate::bitcoin::reversed(&v))
 }
 
-pub fn u256_to_display_hex(v: &U256) -> String {
+pub fn hash_to_display_hex(v: &[u8; 32]) -> String {
     hex::encode(crate::bitcoin::reversed(v))
 }

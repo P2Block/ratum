@@ -3,7 +3,7 @@ use serde::Deserialize;
 const EXTRA_JOBS_PER_TIP: u64 = 2;
 
 const MAX_THREADS: usize = 64;
-const MAX_CLIENTS_THREAD: usize = 4096;
+const MAX_CLIENTS_PER_THREAD: usize = 4096;
 pub const WORK_UPDATE_SECONDS_RANGE: std::ops::RangeInclusive<u64> = 5..=120;
 const MIN_VARDIFF_TARGET_SHARES_MIN: u64 = 1;
 const MIN_VARDIFF_QUICKDIFF_COUNT: u64 = 4;
@@ -16,7 +16,7 @@ pub const GLOBAL_TIMEOUT_MARGIN_SECS: u64 = 5;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub struct Bitcoind {
+pub struct BitcoindConfig {
     pub rpccookiefile: String,
     pub rpcuser: String,
     pub rpcpassword: String,
@@ -25,7 +25,7 @@ pub struct Bitcoind {
     pub notify_fallback: bool,
 }
 
-impl Default for Bitcoind {
+impl Default for BitcoindConfig {
     fn default() -> Self {
         Self {
             rpccookiefile: String::new(),
@@ -40,7 +40,7 @@ impl Default for Bitcoind {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub struct Stratum {
+pub struct StratumConfig {
     pub listen_addr: String,
     pub listen_port: u16,
     pub max_clients_per_thread: usize,
@@ -62,16 +62,16 @@ pub struct Stratum {
     pub username_modifiers: crate::username::Modifiers,
 }
 
-struct Ordered<V>(Vec<(String, V)>);
+struct OrderedPairs<V>(Vec<(String, V)>);
 
-impl<'de, V: Deserialize<'de>> Deserialize<'de> for Ordered<V> {
+impl<'de, V: Deserialize<'de>> Deserialize<'de> for OrderedPairs<V> {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         use serde::de::{MapAccess, Visitor};
         use std::marker::PhantomData;
 
         struct Pairs<V>(PhantomData<V>);
         impl<'de, V: Deserialize<'de>> Visitor<'de> for Pairs<V> {
-            type Value = Ordered<V>;
+            type Value = OrderedPairs<V>;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                 f.write_str("an object")
             }
@@ -80,7 +80,7 @@ impl<'de, V: Deserialize<'de>> Deserialize<'de> for Ordered<V> {
                 while let Some(pair) = m.next_entry::<String, V>()? {
                     v.push(pair);
                 }
-                Ok(Ordered(v))
+                Ok(OrderedPairs(v))
             }
         }
         d.deserialize_map(Pairs(PhantomData))
@@ -90,11 +90,11 @@ impl<'de, V: Deserialize<'de>> Deserialize<'de> for Ordered<V> {
 fn deserialize_modifiers<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<crate::username::Modifiers, D::Error> {
-    let mods = Ordered::<Ordered<f64>>::deserialize(d)?;
+    let mods = OrderedPairs::<OrderedPairs<f64>>::deserialize(d)?;
     Ok(mods.0.into_iter().map(|(name, ranges)| (name, ranges.0)).collect())
 }
 
-impl Default for Stratum {
+impl Default for StratumConfig {
     fn default() -> Self {
         Self {
             listen_addr: String::new(),
@@ -121,7 +121,7 @@ impl Default for Stratum {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub struct Mining {
+pub struct MiningConfig {
     pub pool_address: String,
     pub coinbase_tag_primary: String,
     pub coinbase_tag_secondary: String,
@@ -129,7 +129,7 @@ pub struct Mining {
     pub save_submitblocks_dir: String,
 }
 
-impl Default for Mining {
+impl Default for MiningConfig {
     fn default() -> Self {
         Self {
             pool_address: String::new(),
@@ -143,7 +143,7 @@ impl Default for Mining {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub struct Api {
+pub struct ApiConfig {
     pub admin_password: String,
     pub allow_insecure_auth: bool,
     pub listen_addr: String,
@@ -153,7 +153,7 @@ pub struct Api {
     pub modify_conf: bool,
 }
 
-impl Default for Api {
+impl Default for ApiConfig {
     fn default() -> Self {
         Self {
             admin_password: String::new(),
@@ -169,13 +169,13 @@ impl Default for Api {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
-pub struct ExtraBlockSubmissions {
+pub struct ExtraBlockSubmissionsConfig {
     pub urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub struct Logging {
+pub struct LoggerConfig {
     pub log_to_console: bool,
     pub log_to_stderr: bool,
     pub log_to_file: bool,
@@ -186,7 +186,7 @@ pub struct Logging {
     pub log_level_file: u8,
 }
 
-impl Default for Logging {
+impl Default for LoggerConfig {
     fn default() -> Self {
         Self {
             log_to_console: true,
@@ -203,7 +203,7 @@ impl Default for Logging {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub struct Datum {
+pub struct DatumConfig {
     pub pool_host: String,
     pub pool_port: u16,
     pub pool_url: String,
@@ -221,7 +221,7 @@ pub struct Datum {
     pub protocol_v3: bool,
 }
 
-impl Default for Datum {
+impl Default for DatumConfig {
     fn default() -> Self {
         Self {
             pool_host: "datum-beta1.mine.ocean.xyz".into(),
@@ -246,15 +246,15 @@ impl Default for Datum {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    pub bitcoind: Bitcoind,
-    pub stratum: Stratum,
-    pub mining: Mining,
-    pub api: Api,
-    pub extra_block_submissions: ExtraBlockSubmissions,
-    pub logger: Logging,
-    pub datum: Datum,
+    pub bitcoind: BitcoindConfig,
+    pub stratum: StratumConfig,
+    pub mining: MiningConfig,
+    pub api: ApiConfig,
+    pub extra_block_submissions: ExtraBlockSubmissionsConfig,
+    pub logger: LoggerConfig,
+    pub datum: DatumConfig,
     #[serde(skip)]
-    pub warnings: Vec<(log::Level, String)>,
+    pub startup_notes: Vec<(log::Level, String)>,
     #[serde(skip)]
     pub pool_output_script: Vec<u8>,
 }
@@ -262,8 +262,8 @@ pub struct Config {
 pub const MAX_COINBASE_TAG_SPACE: usize = 86;
 pub const WIDE_PRIME_PUSH_EXTRA_BYTES: usize = 4;
 
-pub const MAX_CONFIGURED_TAG: usize = 60;
-pub const MAX_CONFIGURED_TAGS_TOTAL: usize = 88;
+pub const MAX_CONFIGURED_TAG_LEN: usize = 60;
+pub const MAX_CONFIGURED_TAGS_TOTAL_LEN: usize = 88;
 
 fn at_least(name: &str, value: u64, min: u64) -> Result<(), String> {
     if value < min { Err(format!("{name} must be at least {min}")) } else { Ok(()) }
@@ -291,7 +291,7 @@ impl Config {
     }
 
     fn warn(&mut self, message: impl Into<String>) {
-        self.warnings.push((log::Level::Warn, message.into()));
+        self.startup_notes.push((log::Level::Warn, message.into()));
     }
 
     fn validate_bitcoind(&mut self) -> Result<(), String> {
@@ -318,7 +318,7 @@ impl Config {
         at_most(
             "stratum.max_clients_per_thread",
             s.max_clients_per_thread as u64,
-            MAX_CLIENTS_THREAD as u64,
+            MAX_CLIENTS_PER_THREAD as u64,
         )?;
         if s.max_clients > s.max_clients_per_thread * s.max_threads {
             return Err("stratum.max_clients exceeds max_clients_per_thread * max_threads".into());
@@ -376,13 +376,13 @@ impl Config {
             return Err("Required configuration option (mining.pool_address) not found".into());
         }
         let tags = m.coinbase_tag_primary.len() + m.coinbase_tag_secondary.len();
-        if tags > MAX_CONFIGURED_TAGS_TOTAL
-            || m.coinbase_tag_primary.len() > MAX_CONFIGURED_TAG
-            || m.coinbase_tag_secondary.len() > MAX_CONFIGURED_TAG
+        if tags > MAX_CONFIGURED_TAGS_TOTAL_LEN
+            || m.coinbase_tag_primary.len() > MAX_CONFIGURED_TAG_LEN
+            || m.coinbase_tag_secondary.len() > MAX_CONFIGURED_TAG_LEN
         {
             return Err(format!(
                 "mining.coinbase_tag_primary and mining.coinbase_tag_secondary must be at most \
-                 {MAX_CONFIGURED_TAG} bytes each and {MAX_CONFIGURED_TAGS_TOTAL} bytes together"
+                 {MAX_CONFIGURED_TAG_LEN} bytes each and {MAX_CONFIGURED_TAGS_TOTAL_LEN} bytes together"
             ));
         }
         self.pool_output_script = crate::address::to_output_script(&m.pool_address)
@@ -520,7 +520,7 @@ impl Config {
                 ));
             }
         }
-        self.warnings.extend(notes);
+        self.startup_notes.extend(notes);
         Ok(())
     }
 
@@ -538,7 +538,7 @@ impl Config {
             * 16
     }
 
-    pub fn dupe_table_capacity(&self) -> usize {
+    pub fn seen_share_hashes_capacity(&self) -> usize {
         self.share_queue_capacity() * self.stratum.max_threads
     }
 
@@ -591,7 +591,7 @@ mod tests {
         let c = Config::parse(&minimal()).unwrap();
         assert_eq!(c.stratum.max_network_share_bps, DEFAULT_MAX_NETWORK_SHARE_BPS);
         assert_eq!(c.max_network_share(), Some(0.05));
-        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+        assert!(c.startup_notes.is_empty(), "{:?}", c.startup_notes);
 
         let with_bps = |bps: &str| {
             minimal().replace(
@@ -608,9 +608,9 @@ mod tests {
         let c = Config::parse(&with_bps("0")).unwrap();
         assert_eq!(c.max_network_share(), None, "0 refuses no connection");
         assert!(
-            c.warnings.iter().any(|(_, m)| m.contains("max_network_share_bps is 0")),
+            c.startup_notes.iter().any(|(_, m)| m.contains("max_network_share_bps is 0")),
             "a limit of 0 is reported at startup: {:?}",
-            c.warnings
+            c.startup_notes
         );
 
         let e = Config::parse(&with_bps("10001")).unwrap_err();
@@ -688,8 +688,12 @@ mod tests {
             "\"stratum\": {\"username_modifiers\": {\"half\": {\"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080\": 0.5}}}, \"datum\":",
         );
         let c = Config::parse(&text).unwrap();
-        assert_eq!(c.warnings.len(), 1);
-        assert!(c.warnings[0].1.contains("not distribute 50% of shares"), "{}", c.warnings[0].1);
+        assert_eq!(c.startup_notes.len(), 1);
+        assert!(
+            c.startup_notes[0].1.contains("not distribute 50% of shares"),
+            "{}",
+            c.startup_notes[0].1
+        );
         let text = minimal().replace(
             "\"datum\":",
             "\"stratum\": {\"username_modifiers\": {\"bad\": {\"\": -1}}}, \"datum\":",

@@ -13,12 +13,16 @@ pub(crate) fn submit_or_request_txns(
     a: &AcceptedShare,
     subsidy_only: bool,
 ) -> bool {
-    let template_txns = a.work.txn_count;
+    let template_txns = a.rebuilt.txn_count;
     if !subsidy_only && template_txns != 0 {
         info!("[{peer}]      block has {template_txns} more transactions; requesting them");
         return true;
     }
-    send(peer, node, &ratum::bitcoin::serialize_block(&a.work.header, &a.work.coinbase_tx, &[]));
+    send(
+        peer,
+        node,
+        &ratum::bitcoin::serialize_block(&a.rebuilt.header, &a.rebuilt.coinbase_tx, &[]),
+    );
     false
 }
 
@@ -33,16 +37,20 @@ pub(crate) fn submit_with_txns(
         error!("[{peer}]      not relaying job {job_index}: {why}");
         return;
     }
-    send(peer, node, &ratum::bitcoin::serialize_block(&a.work.header, &a.work.coinbase_tx, txns));
+    send(
+        peer,
+        node,
+        &ratum::bitcoin::serialize_block(&a.rebuilt.header, &a.rebuilt.coinbase_tx, txns),
+    );
 }
 
 fn block_matches_header(a: &AcceptedShare, txns: &[Vec<u8>]) -> Result<(), String> {
-    let committed = ratum::header::HeaderV2::deserialize(&a.work.header)
+    let committed = ratum::header::BlockHeaderV2::deserialize(&a.rebuilt.header)
         .ok_or_else(|| "the header does not deserialize".to_string())?
         .merkle_root;
 
     let mut ids = Vec::with_capacity(txns.len() + 1);
-    ids.push(ratum::bitcoin::sha256d(&a.work.coinbase_tx));
+    ids.push(ratum::bitcoin::sha256d(&a.rebuilt.coinbase_tx));
     for (i, raw) in txns.iter().enumerate() {
         match ratum::bitcoin::txid(raw) {
             Ok(id) => ids.push(id),
@@ -60,8 +68,8 @@ fn block_matches_header(a: &AcceptedShare, txns: &[Vec<u8>]) -> Result<(), Strin
     if built != committed {
         return Err(format!(
             "{count} transactions have merkle root {}, but the header commits to {}",
-            ratum::header::u256_to_display_hex(&built),
-            ratum::header::u256_to_display_hex(&committed)
+            ratum::header::hash_to_display_hex(&built),
+            ratum::header::hash_to_display_hex(&committed)
         ));
     }
     Ok(())

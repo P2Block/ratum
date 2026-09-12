@@ -3,14 +3,14 @@ use bytes::Buf as _;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Truncated(pub &'static str);
 
-pub struct Cursor<'a> {
+pub struct ByteReader<'a> {
     full: &'a [u8],
     rest: &'a [u8],
 }
 
-impl<'a> Cursor<'a> {
+impl<'a> ByteReader<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        Cursor { full: data, rest: data }
+        ByteReader { full: data, rest: data }
     }
 
     pub fn pos(&self) -> usize {
@@ -83,7 +83,7 @@ mod tests {
     #[test]
     fn reads_fields_in_order() {
         let data = [0x27, 0x01, 0x02, 0x03, 0x04, 0x05, 0xaa, 0xbb];
-        let mut c = Cursor::new(&data);
+        let mut c = ByteReader::new(&data);
         assert!(c.skip_if(0x27));
         assert!(!c.skip_if(0x27));
         assert_eq!(c.u8("a").unwrap(), 0x01);
@@ -96,14 +96,14 @@ mod tests {
 
     #[test]
     fn a_short_read_names_the_field() {
-        let mut c = Cursor::new(&[0x01, 0x02]);
+        let mut c = ByteReader::new(&[0x01, 0x02]);
         assert_eq!(c.u32("nonce"), Err(Truncated("nonce")));
         assert_eq!(c.u16("half").unwrap(), 0x0201);
     }
 
     #[test]
     fn an_overflowing_length_is_truncation_not_a_panic() {
-        let mut c = Cursor::new(&[0u8; 4]);
+        let mut c = ByteReader::new(&[0u8; 4]);
         c.advance(2, "start").unwrap();
         assert_eq!(c.take(usize::MAX, "huge"), Err(Truncated("huge")));
         assert_eq!(c.pos(), 2);
@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn peeking_does_not_advance() {
-        let mut c = Cursor::new(&[0x00, 0x01]);
+        let mut c = ByteReader::new(&[0x00, 0x01]);
         assert_eq!(c.peek(), Some(0x00));
         assert_eq!(c.peek2(), Some((0x00, 0x01)));
         assert_eq!(c.pos(), 0);

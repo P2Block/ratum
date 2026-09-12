@@ -1,4 +1,4 @@
-use crate::cursor::{Cursor, Truncated};
+use crate::reader::{ByteReader, Truncated};
 use bytes::BufMut as _;
 use sha2::{Digest, Sha256};
 
@@ -66,7 +66,7 @@ pub fn merkle_root(coinbase_txid: &[u8; 32], branches: &[[u8; 32]]) -> [u8; 32] 
 }
 
 pub fn txid(tx: &[u8]) -> Result<[u8; 32], TxError> {
-    let mut c = Cursor::new(tx);
+    let mut c = ByteReader::new(tx);
     let (version, has_witness) = read_version_and_marker(&mut c)?;
 
     let body_start = c.pos();
@@ -101,7 +101,7 @@ pub fn txid(tx: &[u8]) -> Result<[u8; 32], TxError> {
     Ok(sha256d(&stripped))
 }
 
-fn read_version_and_marker(c: &mut Cursor<'_>) -> Result<(u32, bool), TxError> {
+fn read_version_and_marker(c: &mut ByteReader<'_>) -> Result<(u32, bool), TxError> {
     let version = c.u32("version")?;
     let has_witness = c.peek2() == Some(SEGWIT_MARKER_AND_FLAG);
     if has_witness {
@@ -110,7 +110,7 @@ fn read_version_and_marker(c: &mut Cursor<'_>) -> Result<(u32, bool), TxError> {
     Ok((version, has_witness))
 }
 
-fn skip_witnesses(c: &mut Cursor<'_>, inputs: u64) -> Result<(), TxError> {
+fn skip_witnesses(c: &mut ByteReader<'_>, inputs: u64) -> Result<(), TxError> {
     for _ in 0..inputs {
         let items = decode_compact_size(c)?;
         for _ in 0..items {
@@ -121,7 +121,7 @@ fn skip_witnesses(c: &mut Cursor<'_>, inputs: u64) -> Result<(), TxError> {
     Ok(())
 }
 
-fn read_lock_time(c: &mut Cursor<'_>, tx_len: usize) -> Result<u32, TxError> {
+fn read_lock_time(c: &mut ByteReader<'_>, tx_len: usize) -> Result<u32, TxError> {
     let lock_time = c.u32("lock time")?;
     if !c.at_end() {
         return Err(TxError::TrailingBytes(tx_len - c.pos()));
@@ -156,7 +156,7 @@ pub fn merkle_root_of(txids: &[[u8; 32]]) -> Option<([u8; 32], bool)> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TxOut {
     pub value: u64,
-    pub script: Vec<u8>,
+    pub script_pubkey: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -195,7 +195,7 @@ impl From<Truncated> for TxError {
 }
 
 pub fn parse_coinbase(tx: &[u8]) -> Result<CoinbaseTx, TxError> {
-    let mut c = Cursor::new(tx);
+    let mut c = ByteReader::new(tx);
     let (version, has_witness) = read_version_and_marker(&mut c)?;
 
     if decode_compact_size(&mut c)? != 1 {
@@ -219,7 +219,7 @@ pub fn parse_coinbase(tx: &[u8]) -> Result<CoinbaseTx, TxError> {
         let value = c.u64("value")?;
         let len = decode_compact_size(&mut c)? as usize;
         let script = c.take(len, "scriptPubKey")?.to_vec();
-        outputs.push(TxOut { value, script });
+        outputs.push(TxOut { value, script_pubkey: script });
     }
 
     if has_witness {
@@ -303,7 +303,7 @@ const COMPACT_SIZE_MAX_1: u64 = COMPACT_SIZE_U16_TAG as u64 - 1;
 const COMPACT_SIZE_MAX_2: u64 = u16::MAX as u64;
 const COMPACT_SIZE_MAX_4: u64 = u32::MAX as u64;
 
-fn decode_compact_size(c: &mut Cursor<'_>) -> Result<u64, TxError> {
+fn decode_compact_size(c: &mut ByteReader<'_>) -> Result<u64, TxError> {
     let first = c.u8("compact size")?;
     let (v, minimum) = match first {
         COMPACT_SIZE_U16_TAG => (u64::from(c.u16("compact size")?), COMPACT_SIZE_MAX_1 + 1),
@@ -531,7 +531,7 @@ mod tests {
         assert_eq!(cb.sequence, 0xffff_ffff);
         assert_eq!(cb.outputs.len(), 1);
         assert_eq!(cb.outputs[0].value, 50_0000_0000);
-        assert_eq!(cb.outputs[0].script.len(), 67);
+        assert_eq!(cb.outputs[0].script_pubkey.len(), 67);
         assert_eq!(cb.lock_time, 0);
         assert_eq!(cb.outputs.iter().map(|o| o.value).sum::<u64>(), 50_0000_0000);
     }
@@ -549,7 +549,7 @@ mod tests {
         assert_eq!(cb.script_sig, vec![0x51]);
         assert_eq!(cb.outputs.len(), 2);
         assert_eq!(cb.outputs[1].value, 0);
-        assert_eq!(cb.outputs[1].script[0], 0x6a);
+        assert_eq!(cb.outputs[1].script_pubkey[0], 0x6a);
         assert_eq!(cb.lock_time, 0);
     }
 
@@ -601,7 +601,7 @@ mod tests {
         let mut witness_unknown = vec![0x52, 40];
         witness_unknown.extend_from_slice(&[0xef; 40]);
         assert_eq!(witness_unknown.len(), 42);
-        assert!(witness_unknown.len() <= crate::datum::messages::MAX_OUTPUT_SCRIPT);
+        assert!(witness_unknown.len() <= crate::datum::messages::MAX_COINBASER_OUTPUT_SCRIPT_LEN);
         assert!(!output_script_size_is_valid(&witness_unknown));
     }
 

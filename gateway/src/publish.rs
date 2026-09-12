@@ -1,5 +1,5 @@
-use crate::datum::Pool;
-use crate::job::{BuildError, Builder, PoolConfig};
+use crate::datum::PoolConnectionState;
+use crate::job::{BuildError, JobBuilder, PoolConfig};
 use crate::stratum::Server;
 use crate::template::Template;
 use log::{debug, error, info};
@@ -11,21 +11,25 @@ use std::time::Duration;
 const EMPTY_JOB_HOLD: Duration = Duration::from_millis(50);
 
 pub struct Publisher {
-    builder: Mutex<Builder>,
+    builder: Mutex<JobBuilder>,
     server: Arc<Server>,
-    pool: Arc<Pool>,
+    pool: Arc<PoolConnectionState>,
     template_serial: AtomicU64,
-    last_error: Mutex<Option<BuildError>>,
+    last_build_error: Mutex<Option<BuildError>>,
 }
 
 impl Publisher {
-    pub fn new(builder: Builder, server: Arc<Server>, pool: Arc<Pool>) -> Arc<Self> {
+    pub fn new(
+        builder: JobBuilder,
+        server: Arc<Server>,
+        pool: Arc<PoolConnectionState>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             builder: Mutex::new(builder),
             server,
             pool,
             template_serial: AtomicU64::new(0),
-            last_error: Mutex::new(None),
+            last_build_error: Mutex::new(None),
         })
     }
 
@@ -47,7 +51,7 @@ impl Publisher {
         }
         let built =
             ratum::lock(&self.builder).build(Arc::clone(t), new_block, pool_config, coinbaser, abw);
-        let mut last = ratum::lock(&self.last_error);
+        let mut last = ratum::lock(&self.last_build_error);
         match built {
             Ok(job) => {
                 *last = None;

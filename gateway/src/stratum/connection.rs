@@ -1,18 +1,16 @@
 use super::{ClientEntry, ClientStats, Server};
-use crate::coinbase::COINBASE_POOLED;
+use crate::coinbase::COINBASE_ID_POOLED;
 use crate::datum::QueuedShare;
-use crate::job::{
-    COINBASE_SUBSIDY_ONLY, JOB_ID_TIME_CHARS, Job, JobRef, MAX_JOBS, SIA_FIELD_SIZE,
-    parse_sia_field,
-};
+use crate::job::{JOB_ID_TIME_CHARS, Job, NotifyId, parse_sia_field};
 use crate::tally::FeeMeter;
 use crate::username;
 use crate::vardiff::{self, Vardiff};
 use log::{debug, info, warn};
 use ratum::datum::share::{
-    EXTRANONCE_SIZE_V2, EXTRANONCE_V2_PAD, EXTRANONCE1_SIZE, EXTRANONCE2_SIZE,
+    COINBASE_ID_SUBSIDY_ONLY, EXTRANONCE1_SIZE, EXTRANONCE2_SIZE, HEADER_EXTRANONCE_PAD,
+    HEADER_EXTRANONCE_SIZE, MAX_JOBS, SIA_FIELD_SIZE,
 };
-use ratum::poll::PolledSocket;
+use ratum::poll::{PolledSocket, WRITE_TIMEOUT};
 use ratum::target;
 use serde_json::{Value, json};
 use std::io;
@@ -27,23 +25,22 @@ const MAX_USER_AGENT_CHARS: usize = 127;
 const MAX_USERNAME_CHARS: usize = 191;
 const NICEHASH_MIN_DIFFICULTY: u64 = 524_288;
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_millis(11150);
-const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const FIRST_IDLE_CHECK_DELAY: Duration = Duration::from_secs(10);
 const READ_CHUNK: usize = 4096;
 const SESSION_ID_XOR: u32 = 0xB10C_F00D;
 const BLOCK_FOUND_LOG_LINES: usize = 3;
-const STAT_CYCLE: Duration = Duration::from_secs(60);
+const HASHRATE_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy)]
-struct Reject(i64, &'static str);
+struct StratumError(i64, &'static str);
 
-const UNKNOWN_WORK: Reject = Reject(20, "unknown-work");
-const STALE_WORK: Reject = Reject(21, "stale-work");
-const STALE_PREVBLK: Reject = Reject(21, "stale-prevblk");
-const DUPLICATE: Reject = Reject(22, "duplicate");
-const HIGH_HASH: Reject = Reject(23, "high-hash");
-const UNAUTHORIZED_WORKER: Reject = Reject(24, "unauthorized-worker");
-const METHOD_NOT_FOUND: Reject = Reject(-3, "Method not found");
+const UNKNOWN_WORK: StratumError = StratumError(20, "unknown-work");
+const STALE_WORK: StratumError = StratumError(21, "stale-work");
+const STALE_PREVBLK: StratumError = StratumError(21, "stale-prevblk");
+const DUPLICATE: StratumError = StratumError(22, "duplicate");
+const HIGH_HASH: StratumError = StratumError(23, "high-hash");
+const UNAUTHORIZED_WORKER: StratumError = StratumError(24, "unauthorized-worker");
+const METHOD_NOT_FOUND: StratumError = StratumError(-3, "Method not found");
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum Disconnect {
@@ -60,8 +57,8 @@ pub(super) enum Disconnect {
 struct SubmitRequest {
     job: Arc<Job>,
     job_diff: u64,
-    job_ref: JobRef,
-    extranonce: [u8; EXTRANONCE_SIZE_V2],
+    notify_id: NotifyId,
+    extranonce: [u8; HEADER_EXTRANONCE_SIZE],
     ntime: [u8; SIA_FIELD_SIZE],
     nonce: [u8; SIA_FIELD_SIZE],
     miner_username: String,
@@ -80,9 +77,9 @@ pub(super) struct Connection {
     sent_generation: u64,
     connected: Instant,
     last_accepted: Option<Instant>,
-    window_active: u64,
+    diff_since_window_start: u64,
     window_started: Instant,
-    fee: FeeMeter,
+    fee_meter: FeeMeter,
     next_idle_check: Instant,
 }
 
@@ -95,7 +92,7 @@ impl Connection {
         let unique_id = server.next_unique_id.fetch_add(1, Ordering::Relaxed);
         let sid = (unique_id as u32) ^ SESSION_ID_XOR;
         let entry = Arc::new(ClientEntry {
-            kill: AtomicBool::new(false),
+            kill_requested: AtomicBool::new(false),
             waker,
             stats: Mutex::new(ClientStats {
                 remote: remote.clone(),
@@ -116,7 +113,7 @@ impl Connection {
             subscribed: false,
             username: String::new(),
             vardiff: Vardiff::new(
-                vardiff::Thresholds {
+                vardiff::VardiffParams {
                     min: s.vardiff_min,
                     target_shares_min: s.vardiff_target_shares_min,
                     quickdiff_count: s.vardiff_quickdiff_count,
@@ -128,9 +125,9 @@ impl Connection {
             sent_generation: 0,
             connected: now,
             last_accepted: None,
-            window_active: 0,
+            diff_since_window_start: 0,
             window_started: now,
-            fee: FeeMeter::default(),
+            fee_meter: FeeMeter::default(),
             next_idle_check: now + FIRST_IDLE_CHECK_DELAY,
             server: Arc::clone(&server),
         };
@@ -144,7 +141,7 @@ impl Connection {
         let mut buf = Vec::with_capacity(READ_CHUNK);
         let mut chunk = [0u8; READ_CHUNK];
         loop {
-            if self.entry.kill.load(Ordering::Relaxed) {
+            if self.entry.kill_requested.load(Ordering::Relaxed) {
                 return Err(Disconnect::Killed);
             }
             if self.subscribed
@@ -181,7 +178,7 @@ impl Connection {
     }
 
     fn until_next_check(&self) -> Duration {
-        let due = self.next_idle_check.min(self.window_started + STAT_CYCLE);
+        let due = self.next_idle_check.min(self.window_started + HASHRATE_WINDOW);
         due.saturating_duration_since(Instant::now())
     }
 
@@ -190,16 +187,16 @@ impl Connection {
     }
 
     fn roll_window(&mut self) {
-        if self.window_started.elapsed() < STAT_CYCLE {
+        if self.window_started.elapsed() < HASHRATE_WINDOW {
             return;
         }
-        let (diff, window) = (self.window_active, self.window_started.elapsed());
+        let (diff, window) = (self.diff_since_window_start, self.window_started.elapsed());
         self.with_stats(|s| {
             s.window_diff = diff;
             s.window = window;
             s.window_ended = Some(Instant::now());
         });
-        self.window_active = 0;
+        self.diff_since_window_start = 0;
         self.window_started = Instant::now();
     }
 
@@ -240,9 +237,9 @@ impl Connection {
         self.socket.write_all(b"\n", WRITE_TIMEOUT)
     }
 
-    fn reply(&mut self, id: &str, error: Option<Reject>, result: Value) -> io::Result<()> {
+    fn reply(&mut self, id: &str, error: Option<StratumError>, result: Value) -> io::Result<()> {
         let error = match error {
-            Some(Reject(code, text)) => format!("[{code},\"{text}\",null]"),
+            Some(StratumError(code, text)) => format!("[{code},\"{text}\",null]"),
             None => "null".to_string(),
         };
         self.send_line(&format!("{{\"error\":{error},\"id\":{id},\"result\":{result}}}"))
@@ -252,7 +249,7 @@ impl Connection {
         self.reply(id, None, result)
     }
 
-    fn reply_error(&mut self, id: &str, r: Reject) -> io::Result<()> {
+    fn reply_error(&mut self, id: &str, r: StratumError) -> io::Result<()> {
         self.reply(id, Some(r), Value::Null)
     }
 
@@ -294,18 +291,18 @@ impl Connection {
             return Ok(());
         }
         let s = &self.server.config.stratum;
-        let useragent: String =
+        let user_agent: String =
             params.get(0).and_then(Value::as_str).map_or_else(String::new, |ua| {
                 ua.chars()
                     .filter(|c| c.is_ascii_alphanumeric() || ". -_=@,|/:<>';".contains(*c))
                     .take(MAX_USER_AGENT_CHARS)
                     .collect()
             });
-        if s.fingerprint_miners && useragent.starts_with("NiceHash/") {
+        if s.fingerprint_miners && user_agent.starts_with("NiceHash/") {
             self.vardiff.raise_floor(NICEHASH_MIN_DIFFICULTY);
         }
         let sid = format!("{:08x}", self.sid);
-        let pad = "0".repeat(2 * EXTRANONCE_V2_PAD);
+        let pad = "0".repeat(2 * HEADER_EXTRANONCE_PAD);
         self.reply_result(
             id,
             json!([
@@ -320,7 +317,7 @@ impl Connection {
         self.send_difficulty()?;
         self.subscribed = true;
         self.with_stats(|st| {
-            st.useragent = useragent;
+            st.user_agent = user_agent;
             st.subscribed = true;
             st.subscribed_at = Some(Instant::now());
         });
@@ -376,7 +373,7 @@ impl Connection {
         ))
     }
 
-    fn served_diff(&self, r: JobRef) -> Option<u64> {
+    fn served_diff(&self, r: NotifyId) -> Option<u64> {
         if r.quickdiff {
             Some(self.vardiff.quickdiff_value())
         } else {
@@ -385,10 +382,10 @@ impl Connection {
     }
 
     fn send_current_job(&mut self) -> io::Result<()> {
-        let (job, empty, generation) = self.server.current_for_send();
+        let (job, empty_work, generation) = self.server.current_for_send();
         self.sent_generation = generation;
         match job {
-            Some(job) => self.notify(&job, empty, false, empty),
+            Some(job) => self.notify(&job, empty_work, false, empty_work),
             None => Ok(()),
         }
     }
@@ -405,7 +402,7 @@ impl Connection {
             self.vardiff.update(true, Instant::now());
         }
         if job.is_datum_job {
-            self.vardiff.hold_at_least(self.server.datum.min_difficulty());
+            self.vardiff.hold_at_least(self.server.pool.min_difficulty());
         }
         if self.vardiff.change_pending() {
             self.send_difficulty()?;
@@ -414,14 +411,14 @@ impl Connection {
         if !quickdiff {
             self.job_diffs[job.global_index as usize] = Some(diff);
         }
-        let r = JobRef {
+        let r = NotifyId {
             global_index: job.global_index,
             quickdiff,
-            empty: new_block,
-            coinbase: if new_block { COINBASE_SUBSIDY_ONLY } else { COINBASE_POOLED },
+            empty_work: new_block,
+            coinbase_id: if new_block { COINBASE_ID_SUBSIDY_ONLY } else { COINBASE_ID_POOLED },
         };
-        let pot = target::floor_pot(diff.max(1));
-        let Some(commitment) = job.commitment(r.coinbase, pot) else {
+        let target_byte = target::floor_log2(diff.max(1));
+        let Some(commitment) = job.commitment(r.coinbase_id, target_byte) else {
             return Err(io::Error::other("job has no coinbase for the selection"));
         };
         let clean_flag = clean || quickdiff || new_block;
@@ -432,9 +429,9 @@ impl Connection {
         );
         let line = format!(
             "{{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"{}\",\"{}\",\"{coinb1}\",\"\",[],\"\",\"{:08x}\",\"{}\",{clean_flag}]}}",
-            r.notify_id(job),
+            r.encode(job),
             hex::encode(job.prevblock_hidden),
-            target::share_nbits(pot),
+            target::share_nbits(target_byte),
             job.ntime_hex,
         );
         self.send_line(&line)
@@ -469,7 +466,7 @@ impl Connection {
             st.last_accepted = Some(now);
         });
         self.vardiff.count_share();
-        self.window_active = self.window_active.saturating_add(diff);
+        self.diff_since_window_start = self.diff_since_window_start.saturating_add(diff);
         self.last_accepted = Some(now);
         if self.vardiff.update(false, now)
             && let Some(job) = self.server.current_job()
@@ -479,17 +476,17 @@ impl Connection {
         Ok(())
     }
 
-    fn parse_submit(&self, params: &Value) -> Result<SubmitRequest, (Reject, Option<u64>)> {
+    fn parse_submit(&self, params: &Value) -> Result<SubmitRequest, (StratumError, Option<u64>)> {
         let unknown = (UNKNOWN_WORK, None);
         let id_param = params.get(1).and_then(Value::as_str).ok_or(unknown)?;
-        let (job_ref, job_id) = JobRef::parse(id_param).ok_or(unknown)?;
-        let job = ratum::lock(&self.server.jobs).ring[job_ref.global_index as usize]
+        let (notify_id, job_id) = NotifyId::parse(id_param).ok_or(unknown)?;
+        let job = ratum::lock(&self.server.jobs).ring[notify_id.global_index as usize]
             .clone()
             .ok_or(unknown)?;
         if job.job_id.get(..JOB_ID_TIME_CHARS) != job_id.get(..JOB_ID_TIME_CHARS) {
             return Err(unknown);
         }
-        let job_diff = self.served_diff(job_ref).ok_or(unknown)?;
+        let job_diff = self.served_diff(notify_id).ok_or(unknown)?;
         let rejected = (UNKNOWN_WORK, Some(job_diff));
 
         let en2 = params.get(2).and_then(Value::as_str).ok_or(rejected)?;
@@ -497,12 +494,12 @@ impl Connection {
             return Err(rejected);
         }
         let en2 = hex::decode(en2).map_err(|_| rejected)?;
-        let mut extranonce = [0u8; EXTRANONCE_SIZE_V2];
-        let sid_at = EXTRANONCE_V2_PAD;
+        let mut extranonce = [0u8; HEADER_EXTRANONCE_SIZE];
+        let sid_at = HEADER_EXTRANONCE_PAD;
         let en2_at = EXTRANONCE1_SIZE;
         extranonce[sid_at..en2_at].copy_from_slice(&self.sid.to_be_bytes());
         extranonce[en2_at..].copy_from_slice(&en2);
-        if !job_ref.empty && job_ref.coinbase != COINBASE_POOLED {
+        if !notify_id.empty_work && notify_id.coinbase_id != COINBASE_ID_POOLED {
             return Err(rejected);
         }
         let ntime =
@@ -510,17 +507,17 @@ impl Connection {
         let nonce =
             params.get(4).and_then(Value::as_str).and_then(parse_sia_field).ok_or(rejected)?;
         let miner_username = params.get(0).and_then(Value::as_str).unwrap_or("NULL").to_string();
-        Ok(SubmitRequest { job, job_diff, job_ref, extranonce, ntime, nonce, miner_username })
+        Ok(SubmitRequest { job, job_diff, notify_id, extranonce, ntime, nonce, miner_username })
     }
 
-    fn evaluate(&mut self, req: &SubmitRequest) -> Result<(), Reject> {
+    fn evaluate(&mut self, req: &SubmitRequest) -> Result<(), StratumError> {
         let job = &req.job;
-        let r = req.job_ref;
-        let pot = target::floor_pot(req.job_diff);
+        let r = req.notify_id;
+        let target_byte = target::floor_log2(req.job_diff);
         let header = job
-            .header(r.coinbase, pot, req.extranonce, req.nonce, req.ntime)
+            .header(r.coinbase_id, target_byte, req.extranonce, req.nonce, req.ntime)
             .ok_or(UNKNOWN_WORK)?;
-        let hash = job.share_pow_hash(&header);
+        let hash = job.raw_pow_hash(&header);
         let is_block = job.abw.is_none() && target::meets_target(&hash, &job.block_target);
         if is_block {
             let display = hex::encode(hash);
@@ -530,23 +527,23 @@ impl Connection {
             crate::submit::found_block(
                 &self.server,
                 job,
-                r.coinbase,
-                pot,
+                r.coinbase_id,
+                target_byte,
                 &header.serialize(),
                 &display,
             );
         }
 
-        let checked = self.check_share(job, &hash, pot, &req.miner_username);
+        let checked = self.check_share(job, &hash, target_byte, &req.miner_username);
         if job.is_datum_job && (is_block || checked.is_ok()) {
             let wire_username = self.credited_username(req, &hash, checked.is_ok());
-            self.server.datum.submit(QueuedShare {
+            self.server.pool.submit(QueuedShare {
                 job: Arc::clone(job),
-                coinbase_id: r.coinbase,
+                coinbase_id: r.coinbase_id,
                 is_block,
-                subsidy_only: r.empty,
+                subsidy_only: r.empty_work,
                 quickdiff: r.quickdiff,
-                target_byte: pot,
+                target_byte,
                 header,
                 username: wire_username,
             });
@@ -577,20 +574,20 @@ impl Connection {
         &self,
         job: &Arc<Job>,
         hash: &[u8; 32],
-        pot: u8,
+        target_byte: u8,
         username: &str,
-    ) -> Result<(), Reject> {
+    ) -> Result<(), StratumError> {
         let cfg = &self.server.config;
         if job.is_stale_prevblock() {
             return Err(STALE_PREVBLK);
         }
-        if !target::meets_target(hash, &target::target_for_pot(pot)) {
+        if !target::meets_target(hash, &target::target_for_exponent(target_byte)) {
             return Err(HIGH_HASH);
         }
         if job.created.elapsed() > cfg.stale_window() {
             return Err(STALE_WORK);
         }
-        if !ratum::lock(&self.server.dupes).insert(*hash, job.created) {
+        if !ratum::lock(&self.server.seen_share_hashes).insert(*hash, job.created) {
             return Err(DUPLICATE);
         }
         if cfg.stratum.require_address_username && !username::is_payable(username) {
@@ -602,10 +599,10 @@ impl Connection {
     fn fee_charged(&mut self, diff: u64, username: &str) -> bool {
         let address = crate::username::address_of(username);
         let bps = u64::from(self.server.record_and_fee_bps(address));
-        let charged = self.fee.charge(diff, bps);
+        let charged = self.fee_meter.charge(diff, bps);
         if charged {
-            self.with_stats(|st| st.fee.add(diff));
-            ratum::lock(&self.server.fee).add(diff);
+            self.with_stats(|st| st.fee_shares.add(diff));
+            ratum::lock(&self.server.fee_tally).add(diff);
         }
         charged
     }
@@ -614,7 +611,7 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::Builder;
+    use crate::job::JobBuilder;
     use crate::stratum::tests::test_server;
     use crate::template::tests::template;
     use std::io::{BufRead, BufReader, Write};
@@ -624,7 +621,7 @@ mod tests {
     const DEADLINE: Duration = Duration::from_millis(250);
 
     fn a_job(server: &Server) -> Arc<Job> {
-        let mut builder = Builder::new(Arc::clone(&server.config));
+        let mut builder = JobBuilder::new(Arc::clone(&server.config));
         Arc::new(builder.build(Arc::new(template()), false, None, None, None).unwrap())
     }
 
@@ -703,7 +700,7 @@ mod tests {
         let params = notify["params"].as_array().unwrap();
         assert_eq!(
             params[0].as_str().unwrap(),
-            format!("{}{COINBASE_POOLED:02x}", job.job_id),
+            format!("{}{COINBASE_ID_POOLED:02x}", job.job_id),
             "the notify names the published job and its pooled coinbase"
         );
     }

@@ -1,11 +1,10 @@
 use ratum::bitcoin;
 use ratum::datum::messages::{
-    ClientConfig, CoinbaseOutput, CoinbaserRequest, CoinbaserResponse, RejectReason, ShareResponse,
-    ShareVerdict,
+    ClientConfig, CoinbaserRequest, CoinbaserResponse, RejectReason, ShareResponse, ShareVerdict,
 };
 use ratum::datum::share::{Blake2bSection, CoinbaseSection, JobSection, PowSubmit};
-use ratum::datum::validation::{self, Status, TxnBundle};
-use ratum::header::{self, HeaderV2};
+use ratum::datum::validation::{self, TxnList, TxnListStatus};
+use ratum::header::{self, BlockHeaderV2};
 use ratum::target;
 
 struct Rng(u64);
@@ -42,9 +41,9 @@ fn feed_everything(blob: &[u8]) {
     let _ = CoinbaserRequest::decode(blob);
     let _ = CoinbaserResponse::decode(blob);
     let _ = ShareResponse::decode(blob);
-    let _ = TxnBundle::decode(blob, validation::response::TXNS);
-    let _ = TxnBundle::decode(blob, validation::response::BLOCK_TXNS);
-    let _ = HeaderV2::deserialize(blob);
+    let _ = TxnList::decode(blob, validation::response::TXNS);
+    let _ = TxnList::decode(blob, validation::response::BLOCK_TXNS);
+    let _ = BlockHeaderV2::deserialize(blob);
     let _ = bitcoin::parse_coinbase(blob);
     let _ = bitcoin::txid(blob);
     let _ = bitcoin::script_pushes(blob);
@@ -222,7 +221,10 @@ fn a_damaged_coinbaser_response_is_refused_or_reproduces_itself() {
         value: 312_500_000,
         coinbaser_id: 9,
         outputs: (0..6)
-            .map(|i| CoinbaseOutput { value: 1_000_000 + i, script: vec![0x00, 0x14, i as u8] })
+            .map(|i| bitcoin::TxOut {
+                value: 1_000_000 + i,
+                script_pubkey: vec![0x00, 0x14, i as u8],
+            })
             .collect(),
     };
     let valid = response.encode().unwrap();
@@ -233,14 +235,14 @@ fn a_damaged_coinbaser_response_is_refused_or_reproduces_itself() {
 
 #[test]
 fn a_damaged_validation_message_is_refused_or_reproduces_itself() {
-    let bundle = TxnBundle {
+    let list = TxnList {
         selector: validation::response::BLOCK_TXNS,
         job_index: 6,
-        status: Status::Ok,
+        status: TxnListStatus::Ok,
         txns: vec![vec![0xab; 10], vec![0xcd; 300], vec![]],
     };
-    truncations_and_flips(&bundle.encode(), |bytes| {
-        TxnBundle::decode(bytes, validation::response::BLOCK_TXNS).ok().map(|b| b.encode())
+    truncations_and_flips(&list.encode(), |bytes| {
+        TxnList::decode(bytes, validation::response::BLOCK_TXNS).ok().map(|b| b.encode())
     });
 }
 
@@ -261,7 +263,7 @@ fn a_damaged_share_response_is_refused_or_reproduces_itself() {
 #[test]
 fn a_damaged_header_is_refused_or_reproduces_itself() {
     let mut rng = Rng::new(0xFEED_FACE_1234_5678);
-    let header = HeaderV2 {
+    let header = BlockHeaderV2 {
         version: 0x2000_0004,
         prev_block: rng.bytes(32).try_into().unwrap(),
         merkle_root: rng.bytes(32).try_into().unwrap(),
@@ -280,23 +282,23 @@ fn a_damaged_header_is_refused_or_reproduces_itself() {
         mm_rhs: rng.bytes(32).try_into().unwrap(),
     };
     truncations_and_flips(&header.serialize(), |bytes| {
-        HeaderV2::deserialize(bytes).map(|h| h.serialize().to_vec())
+        BlockHeaderV2::deserialize(bytes).map(|h| h.serialize().to_vec())
     });
 }
 
 #[test]
 fn the_version_2_flag_is_not_part_of_the_version() {
-    let mut header = HeaderV2 { version: 0x2000_0000, ..Default::default() };
+    let mut header = BlockHeaderV2 { version: 0x2000_0000, ..Default::default() };
     let serialized = header.serialize();
     assert_eq!(&serialized[..4], &(header::V2_FLAG | 0x2000_0000).to_le_bytes());
 
     header.version = i32::MIN;
-    let round_tripped = HeaderV2::deserialize(&header.serialize()).expect("still a v2 header");
+    let round_tripped = BlockHeaderV2::deserialize(&header.serialize()).expect("still a v2 header");
     assert_eq!(round_tripped.version, 0, "the flag bit is stripped, not carried");
 
-    let mut without_flag = HeaderV2::default().serialize();
+    let mut without_flag = BlockHeaderV2::default().serialize();
     without_flag[3] &= 0x7f;
-    assert_eq!(HeaderV2::deserialize(&without_flag), None, "the flag bit clear is refused");
+    assert_eq!(BlockHeaderV2::deserialize(&without_flag), None, "the flag bit clear is refused");
 }
 
 #[test]
@@ -305,14 +307,14 @@ fn hashing_never_panics_on_a_header_that_deserialized() {
     for _ in 0..300 {
         let mut raw = rng.bytes(header::HEADER_V2_SIZE);
         raw[3] |= 0x80;
-        let header = HeaderV2::deserialize(&raw).expect("deserializes");
-        let pre = header.precompute();
-        let asic_input = header.asic_input_with(&pre.hash1, &pre.h2);
+        let header = BlockHeaderV2::deserialize(&raw).expect("deserializes");
+        let stages = header.hash_stages();
+        let asic_input = header.asic_input_with(&stages.work_root, &stages.h2);
         assert_eq!(asic_input.len(), header::ASIC_INPUT_LEN[header.asic_profile() as usize]);
-        let (pow, block) = header.pow_and_block_hash();
-        assert_eq!((pow, block), header.pow_and_block_hash(), "hashing is deterministic");
+        let (pow, block) = header.raw_pow_and_block_hash();
+        assert_eq!((pow, block), header.raw_pow_and_block_hash(), "hashing is deterministic");
         assert_eq!(header::blake2b_256(&asic_input), pow);
-        let masked: Vec<u8> = pow.iter().zip(pre.mask).map(|(b, m)| b ^ m).collect();
+        let masked: Vec<u8> = pow.iter().zip(stages.xor_key_mask).map(|(b, m)| b ^ m).collect();
         assert_eq!(masked, block);
     }
 }

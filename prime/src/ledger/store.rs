@@ -1,8 +1,9 @@
 use super::{
-    ChainState, FoundBlock, HASH_SIZE, MAX_SHARES, OwedBlock, ReadBack, SHARES_PER_KEEP_UNIT, Share,
+    ConfirmationReading, FoundBlock, MAX_SHARES, OwedBlock, ReadBack, SHARES_PER_KEEP_UNIT, Share,
 };
 use bytes::BufMut as _;
-use ratum::cursor::Cursor;
+use ratum::bitcoin::HASH_SIZE;
+use ratum::reader::ByteReader;
 use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
 };
@@ -22,11 +23,10 @@ const META_CUMULATIVE_WORK: &str = "cumulative_work";
 const NAME_SEPARATOR: u8 = 0x00;
 
 fn pack(share: &Share) -> Vec<u8> {
-    let hash = share.hash.unwrap_or([0u8; HASH_SIZE]);
     let mut v = Vec::with_capacity(SHARE_PREFIX_LEN + 1 + share.identity.len() + share.tag.len());
     v.put_u64_le(share.at);
     v.put_u64_le(share.difficulty);
-    v.put_slice(&hash);
+    v.put_slice(&share.block_hash);
     v.put_slice(share.identity.as_bytes());
     v.put_u8(NAME_SEPARATOR);
     v.put_slice(share.tag.as_bytes());
@@ -37,7 +37,7 @@ const SHARE_PREFIX_LEN: usize = 2 * size_of::<u64>() + HASH_SIZE;
 const SHARE_HASH_AT: std::ops::Range<usize> = SHARE_PREFIX_LEN - HASH_SIZE..SHARE_PREFIX_LEN;
 
 fn unpack(bytes: &[u8]) -> Option<Share> {
-    let mut c = Cursor::new(bytes);
+    let mut c = ByteReader::new(bytes);
     let at = c.u64("at").ok()?;
     let difficulty = c.u64("difficulty").ok()?;
     let hash: [u8; HASH_SIZE] = c.arr("hash").ok()?;
@@ -46,7 +46,7 @@ fn unpack(bytes: &[u8]) -> Option<Share> {
         at,
         identity: String::from_utf8_lossy(identity).into_owned(),
         difficulty,
-        hash: Some(hash),
+        block_hash: hash,
         tag: String::from_utf8_lossy(tag).into_owned(),
     })
 }
@@ -80,7 +80,7 @@ const OWED_ENTRY_PREFIX_LEN: usize = size_of::<u16>() + size_of::<u64>();
 
 fn unpack_owed(hash: &[u8], bytes: &[u8]) -> Option<OwedBlock> {
     let block_hash: [u8; HASH_SIZE] = hash.try_into().ok()?;
-    let mut c = Cursor::new(bytes);
+    let mut c = ByteReader::new(bytes);
     let at = c.u64("at").ok()?;
     let height = c.u32("height").ok()?;
     let total = c.u64("total").ok()?;
@@ -108,7 +108,7 @@ fn pack_block(b: &FoundBlock) -> Vec<u8> {
     v.put_u32_le(b.height);
     v.put_u64_le(b.paid_to_split);
     v.put_u64_le(b.paid_to_pool);
-    v.put_f64_le(b.difficulty);
+    v.put_f64_le(b.network_difficulty);
     v.put_u128_le(b.cumulative_work);
     v.put_slice(b.finder.as_bytes());
     v.put_u8(NAME_SEPARATOR);
@@ -121,12 +121,12 @@ const BLOCK_PREFIX_LEN: usize =
 
 fn unpack_block(hash: &[u8], bytes: &[u8]) -> Option<FoundBlock> {
     let block_hash: [u8; HASH_SIZE] = hash.try_into().ok()?;
-    let mut c = Cursor::new(bytes);
+    let mut c = ByteReader::new(bytes);
     let at = c.u64("at").ok()?;
     let height = c.u32("height").ok()?;
     let paid_to_split = c.u64("paid_to_split").ok()?;
     let paid_to_pool = c.u64("paid_to_pool").ok()?;
-    let difficulty = f64::from_le_bytes(c.arr("difficulty").ok()?);
+    let network_difficulty = f64::from_le_bytes(c.arr("network difficulty").ok()?);
     let cumulative_work = u128::from_le_bytes(c.arr("cumulative work").ok()?);
     let (finder, tag) = split_at_separator(c.rest());
     Some(FoundBlock {
@@ -135,28 +135,31 @@ fn unpack_block(hash: &[u8], bytes: &[u8]) -> Option<FoundBlock> {
         block_hash,
         paid_to_split,
         paid_to_pool,
-        difficulty,
+        network_difficulty,
         cumulative_work,
         finder: String::from_utf8_lossy(finder).into_owned(),
         tag: String::from_utf8_lossy(tag).into_owned(),
     })
 }
 
-fn pack_chain_state(c: &ChainState) -> Vec<u8> {
-    let mut v = Vec::with_capacity(CHAIN_STATE_LEN);
+fn pack_confirmations(c: &ConfirmationReading) -> Vec<u8> {
+    let mut v = Vec::with_capacity(CONFIRMATION_READING_LEN);
     v.put_u64_le(c.checked_at);
     v.put_i64_le(c.confirmations);
     v
 }
 
-const CHAIN_STATE_LEN: usize = size_of::<u64>() + size_of::<i64>();
+const CONFIRMATION_READING_LEN: usize = size_of::<u64>() + size_of::<i64>();
 
-fn unpack_chain_state(hash: &[u8], bytes: &[u8]) -> Option<([u8; HASH_SIZE], ChainState)> {
+fn unpack_confirmations(
+    hash: &[u8],
+    bytes: &[u8],
+) -> Option<([u8; HASH_SIZE], ConfirmationReading)> {
     let block_hash: [u8; HASH_SIZE] = hash.try_into().ok()?;
-    let mut c = Cursor::new(bytes);
+    let mut c = ByteReader::new(bytes);
     let checked_at = c.u64("checked_at").ok()?;
     let confirmations = i64::from_le_bytes(c.arr("confirmations").ok()?);
-    Some((block_hash, ChainState { checked_at, confirmations }))
+    Some((block_hash, ConfirmationReading { checked_at, confirmations }))
 }
 
 trait DbResult<T> {
@@ -262,7 +265,7 @@ impl Store {
     }
 
     pub(super) fn insert(&mut self, share: &Share) -> io::Result<bool> {
-        let hash = share.hash.expect("a recorded share has a hash");
+        let hash = share.block_hash;
         let cumulative = self.cumulative_work + u128::from(share.difficulty);
         let inserted = self.write(|w| {
             let mut by_hash = w.open_table(BY_HASH).db()?;
@@ -386,22 +389,24 @@ impl Store {
         Ok(out)
     }
 
-    pub(super) fn write_chain_state(
+    pub(super) fn write_confirmations(
         &self,
         hash: &[u8; HASH_SIZE],
-        state: &ChainState,
+        state: &ConfirmationReading,
     ) -> io::Result<()> {
         self.write(|w| {
             w.open_table(CHAIN_STATE)
                 .db()?
-                .insert(hash.as_slice(), pack_chain_state(state).as_slice())
+                .insert(hash.as_slice(), pack_confirmations(state).as_slice())
                 .db()?;
             Ok(())
         })
     }
 
-    pub(super) fn read_chain_states(&self) -> io::Result<Vec<([u8; HASH_SIZE], ChainState)>> {
-        self.read_packed(CHAIN_STATE, "a chain state", unpack_chain_state)
+    pub(super) fn read_confirmations(
+        &self,
+    ) -> io::Result<Vec<([u8; HASH_SIZE], ConfirmationReading)>> {
+        self.read_packed(CHAIN_STATE, "a confirmation reading", unpack_confirmations)
     }
 
     pub(super) fn dump(&self) -> io::Result<Vec<Share>> {
@@ -424,18 +429,18 @@ mod tests {
     use crate::ledger::tests::{Scratch, found, hash, owed};
 
     #[test]
-    fn packs_and_unpacks_a_chain_state() {
+    fn packs_and_unpacks_a_confirmation_reading() {
         for confirmations in [-1i64, 0, 1, 100, i64::MAX, i64::MIN] {
-            let state = ChainState { checked_at: 1_750_000_000, confirmations };
-            let packed = pack_chain_state(&state);
-            assert_eq!(packed.len(), CHAIN_STATE_LEN);
-            assert_eq!(unpack_chain_state(&hash(3), &packed), Some((hash(3), state)));
+            let state = ConfirmationReading { checked_at: 1_750_000_000, confirmations };
+            let packed = pack_confirmations(&state);
+            assert_eq!(packed.len(), CONFIRMATION_READING_LEN);
+            assert_eq!(unpack_confirmations(&hash(3), &packed), Some((hash(3), state)));
         }
-        assert_eq!(unpack_chain_state(&hash(3), &[]), None, "a truncated row does not unpack");
+        assert_eq!(unpack_confirmations(&hash(3), &[]), None, "a truncated row does not unpack");
         assert_eq!(
-            unpack_chain_state(
+            unpack_confirmations(
                 &[0u8; 4],
-                &pack_chain_state(&ChainState { checked_at: 1, confirmations: 1 })
+                &pack_confirmations(&ConfirmationReading { checked_at: 1, confirmations: 1 })
             ),
             None,
             "a key that is not a block hash does not unpack"
@@ -448,7 +453,7 @@ mod tests {
             at: 1_750_000_000,
             identity: "bc1qexample".into(),
             difficulty: 16384,
-            hash: Some(hash(7)),
+            block_hash: hash(7),
             tag: "garage".into(),
         };
         assert_eq!(unpack(&pack(&share)), Some(share.clone()));
@@ -495,7 +500,7 @@ mod tests {
                 at: i,
                 identity: "m".into(),
                 difficulty: 16,
-                hash: Some(hash(i)),
+                block_hash: hash(i),
                 tag: String::new(),
             };
             store.insert(&share).unwrap();
@@ -511,7 +516,7 @@ mod tests {
                     at: 0,
                     identity: "m".into(),
                     difficulty: 16,
-                    hash: Some(hash(0)),
+                    block_hash: hash(0),
                     tag: String::new(),
                 })
                 .unwrap()

@@ -8,7 +8,7 @@ const MIN_QUICKDIFF_SHIFT: u32 = 2;
 const MIN_SHARES_TO_DOUBLE: u64 = 16;
 
 #[derive(Clone, Copy, Debug)]
-pub struct Thresholds {
+pub struct VardiffParams {
     pub min: u64,
     pub target_shares_min: u64,
     pub quickdiff_count: u64,
@@ -16,18 +16,18 @@ pub struct Thresholds {
 }
 
 pub struct Vardiff {
-    params: Thresholds,
+    params: VardiffParams,
     current: u64,
     last_sent: u64,
     forced_floor: u64,
     quickdiff_active: bool,
     quickdiff_value: u64,
-    snap_count: u64,
-    snap_at: Instant,
+    shares_since_snapshot: u64,
+    snapshot_at: Instant,
 }
 
 impl Vardiff {
-    pub fn new(params: Thresholds, now: Instant) -> Self {
+    pub fn new(params: VardiffParams, now: Instant) -> Self {
         Self {
             params,
             current: params.min,
@@ -35,14 +35,14 @@ impl Vardiff {
             forced_floor: 0,
             quickdiff_active: false,
             quickdiff_value: 0,
-            snap_count: 0,
-            snap_at: now,
+            shares_since_snapshot: 0,
+            snapshot_at: now,
         }
     }
 
     pub fn reset_snapshot(&mut self, now: Instant) {
-        self.snap_count = 0;
-        self.snap_at = now;
+        self.shares_since_snapshot = 0;
+        self.snapshot_at = now;
     }
 
     pub fn last_sent(&self) -> u64 {
@@ -75,7 +75,7 @@ impl Vardiff {
     }
 
     pub fn count_share(&mut self) {
-        self.snap_count += 1;
+        self.shares_since_snapshot += 1;
     }
 
     pub fn mark_sent(&mut self) -> u64 {
@@ -95,11 +95,11 @@ impl Vardiff {
         if self.current != self.last_sent {
             return false;
         }
-        if !no_quick && self.snap_count < p.quickdiff_count {
+        if !no_quick && self.shares_since_snapshot < p.quickdiff_count {
             return false;
         }
-        let delta = now.saturating_duration_since(self.snap_at).as_millis() as u64;
-        let n = self.snap_count;
+        let delta = now.saturating_duration_since(self.snapshot_at).as_millis() as u64;
+        let n = self.shares_since_snapshot;
         let target_ms = MS_PER_MINUTE / p.target_shares_min.max(1);
         if n == 0 {
             if delta > MS_PER_MINUTE {
@@ -144,8 +144,8 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    const PARAMS: Thresholds =
-        Thresholds { min: 16384, target_shares_min: 8, quickdiff_count: 8, quickdiff_delta: 8 };
+    const PARAMS: VardiffParams =
+        VardiffParams { min: 16384, target_shares_min: 8, quickdiff_count: 8, quickdiff_delta: 8 };
 
     fn started() -> (Vardiff, Instant) {
         let now = Instant::now();

@@ -1,10 +1,10 @@
 use crate::abw;
-use crate::cli::{self, Cli, fatal};
-use crate::server::{Resolved, resolve_address};
+use crate::cli::{self, fatal};
+use crate::server::{Payability, Unpayable, resolve_address};
 use log::warn;
 use ratum::bitcoin::opcode::OP_RETURN;
 use ratum::bitcoin::output_script_size_is_valid;
-use ratum::datum::messages::MAX_COINBASE_TAG;
+use ratum::datum::messages::MAX_COINBASE_TAG_LEN;
 use ratum::rpc;
 use ratum_prime::config::Config;
 use std::path::PathBuf;
@@ -32,7 +32,7 @@ pub(crate) struct Settings {
     pub(crate) abw_reveal_after: Duration,
     pub(crate) min_difficulty: u64,
     pub(crate) max_connections: usize,
-    pub(crate) payout: Option<(Payout, String)>,
+    pub(crate) payout: Option<(PayoutFlag, String)>,
     pub(crate) coinbase_tag: String,
     pub(crate) prime_id: u32,
     pub(crate) ledger_path: Option<String>,
@@ -55,7 +55,7 @@ struct NodeCredential {
 }
 
 impl Settings {
-    pub(crate) fn resolve(c: &Cli, f: Config) -> Self {
+    pub(crate) fn resolve(c: &Config, f: Config) -> Self {
         let payout = payout_choice(c, &f);
         let data_dir = c.data_dir.clone().or(f.data_dir).map(PathBuf::from);
         Self {
@@ -150,9 +150,9 @@ impl Settings {
 }
 
 fn coinbase_tag(tag: String) -> String {
-    if tag.len() > MAX_COINBASE_TAG {
+    if tag.len() > MAX_COINBASE_TAG_LEN {
         fatal!(
-            "--coinbase-tag must be at most {MAX_COINBASE_TAG} bytes, not {}; it is pushed into \
+            "--coinbase-tag must be at most {MAX_COINBASE_TAG_LEN} bytes, not {}; it is pushed into \
              every pooled coinbase's scriptSig ahead of the miner's secondary tag",
             tag.len()
         );
@@ -239,12 +239,12 @@ impl NodeCredential {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum Payout {
+pub(crate) enum PayoutFlag {
     Address,
     Script,
 }
 
-impl Payout {
+impl PayoutFlag {
     fn flag(self) -> &'static str {
         match self {
             Self::Address => "--payout-address",
@@ -253,15 +253,15 @@ impl Payout {
     }
 }
 
-fn payout_choice(c: &Cli, f: &Config) -> Option<(Payout, String)> {
+fn payout_choice(c: &Config, f: &Config) -> Option<(PayoutFlag, String)> {
     let sources = [
         (c.payout_address.as_ref(), c.payout_script.as_ref()),
         (f.payout_address.as_ref(), f.payout_script.as_ref()),
     ];
     for (address, script) in sources {
         match (address, script) {
-            (Some(a), None) => return Some((Payout::Address, a.clone())),
-            (None, Some(s)) => return Some((Payout::Script, s.clone())),
+            (Some(a), None) => return Some((PayoutFlag::Address, a.clone())),
+            (None, Some(s)) => return Some((PayoutFlag::Script, s.clone())),
             (Some(_), Some(_)) => fatal!("give --payout-address or --payout-script, not both"),
             (None, None) => {}
         }
@@ -269,7 +269,7 @@ fn payout_choice(c: &Cli, f: &Config) -> Option<(Payout, String)> {
     None
 }
 
-pub(crate) fn payout_script(node: &rpc::Client, payout: Option<(Payout, String)>) -> Vec<u8> {
+pub(crate) fn payout_script(node: &rpc::Client, payout: Option<(PayoutFlag, String)>) -> Vec<u8> {
     let Some((kind, value)) = payout else {
         fatal!(
             "--payout-address (or --payout-script) is required: the gateway reserves a \
@@ -279,7 +279,7 @@ pub(crate) fn payout_script(node: &rpc::Client, payout: Option<(Payout, String)>
         )
     };
     let script = match kind {
-        Payout::Script => match hex::decode(&value) {
+        PayoutFlag::Script => match hex::decode(&value) {
             Ok(b) if b.first() == Some(&OP_RETURN) => fatal!(
                 "--payout-script starts with OP_RETURN, which would burn every fallback \
                  payment rather than pay it"
@@ -287,23 +287,31 @@ pub(crate) fn payout_script(node: &rpc::Client, payout: Option<(Payout, String)>
             Ok(b) if !b.is_empty() => b,
             _ => fatal!("--payout-script must be a non-empty hex script, got {value:?}"),
         },
-        Payout::Address => match resolve_address(node, &value) {
-            Ok(Resolved::Script(b)) => b,
-            Ok(Resolved::NoScript) => fatal!("the node gave no scriptPubKey for {value:?}"),
-            Ok(Resolved::Invalid) => {
+        PayoutFlag::Address => match resolve_address(node, &value) {
+            Payability::Script(b) => b,
+            Payability::Unpayable(Unpayable::ScriptTooLong(len)) => script_too_long(kind, len),
+            Payability::Unpayable(Unpayable::NoScript) => {
+                fatal!("the node gave no scriptPubKey for {value:?}")
+            }
+            Payability::Unpayable(Unpayable::NotAnAddress) => {
                 fatal!("--payout-address {value:?} is not an address this node accepts")
             }
-            Err(e) => fatal!("could not resolve --payout-address {value:?}: {e}"),
+            Payability::Unknown(e) => {
+                fatal!("could not resolve --payout-address {value:?}: {e}")
+            }
         },
     };
     if !output_script_size_is_valid(&script) {
-        fatal!(
-            "{} gives a {}-byte script, which a block carrying it would be rejected for: \
-             a coinbase output script may be at most {} bytes",
-            kind.flag(),
-            script.len(),
-            ratum::bitcoin::MAX_OUTPUT_SCRIPT_SIZE
-        );
+        script_too_long(kind, script.len());
     }
     script
+}
+
+fn script_too_long(kind: PayoutFlag, len: usize) -> ! {
+    fatal!(
+        "{} gives a {len}-byte script, which a block carrying it would be rejected for: \
+         a coinbase output script may be at most {} bytes",
+        kind.flag(),
+        ratum::bitcoin::MAX_OUTPUT_SCRIPT_SIZE
+    )
 }

@@ -1,21 +1,19 @@
-use crate::coinbase::{self, Coinbase};
+use crate::coinbase::{self, StratumCoinbase};
 use crate::config::Config;
 use crate::template::Template;
-use ratum::bitcoin::HASH_SIZE;
-use ratum::datum::messages::{CoinbaseOutput, CoinbaserResponse};
+use ratum::bitcoin::{HASH_SIZE, TxOut};
+use ratum::datum::messages::CoinbaserResponse;
 use ratum::datum::share::{
-    self, EXTRANONCE_SIZE, EXTRANONCE_SIZE_V2, MAX_MERKLE_BRANCHES, SIA_FIELD_HALF,
+    self, COINBASE_ID_SUBSIDY_ONLY, EXTRANONCE_SIZE, HEADER_EXTRANONCE_SIZE, MAX_JOBS,
+    MAX_MERKLE_BRANCHES, SIA_FIELD_HALF, SIA_FIELD_SIZE,
 };
-use ratum::header::{self, HeaderV2};
+use ratum::header::{self, BlockHeaderV2};
 use ratum::target::{self, Target};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-pub use ratum::datum::share::{
-    COINBASE_ID_SUBSIDY_ONLY as COINBASE_SUBSIDY_ONLY, MAX_JOBS, SIA_FIELD_SIZE,
-};
 pub const JOB_INDEX_XOR: u16 = 0xC0DE;
 const ENPREFIX_XOR: u16 = 0xB10C;
 
@@ -30,7 +28,7 @@ pub struct PoolConfig {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Abw {
+pub struct AbwAssignment {
     pub slot: u8,
     pub key_hash: [u8; 32],
 }
@@ -45,21 +43,21 @@ pub struct Job {
     pub block_target: Target,
     pub prevblock_hidden: [u8; 32],
     pub merkle_branches: Vec<[u8; 32]>,
-    pub pooled: Coinbase,
-    pub subsidy_only: Coinbase,
+    pub pooled_coinbase: StratumCoinbase,
+    pub subsidy_only_coinbase: StratumCoinbase,
     pub coinbaser_id: u8,
-    pub coinbaser_outputs: Vec<CoinbaseOutput>,
-    pub pool_addr_script: Vec<u8>,
+    pub coinbaser_outputs: Vec<TxOut>,
+    pub pool_payout_script: Vec<u8>,
     pub is_datum_job: bool,
-    pub abw: Option<Abw>,
+    pub abw: Option<AbwAssignment>,
     pub is_new_block: bool,
     pub created: Instant,
     pub stale_prevblock: AtomicBool,
-    commitments: Mutex<HashMap<(u8, u8), Commitment>>,
+    commitments: Mutex<HashMap<(u8, u8), H2Commitment>>,
 }
 
 #[derive(Clone, Debug)]
-pub struct Commitment {
+pub struct H2Commitment {
     pub merkle_root: [u8; 32],
     pub h2: [u8; 32],
     pub txcount: u16,
@@ -67,28 +65,32 @@ pub struct Commitment {
 
 pub struct PayoutRow {
     pub value: u64,
-    pub script: Vec<u8>,
-    pub remainder: bool,
+    pub script_pubkey: Vec<u8>,
+    pub is_remainder: bool,
 }
 
 impl Job {
-    pub fn coinbase(&self, id: u8) -> &Coinbase {
-        if id == COINBASE_SUBSIDY_ONLY { &self.subsidy_only } else { &self.pooled }
+    pub fn coinbase(&self, id: u8) -> &StratumCoinbase {
+        if id == COINBASE_ID_SUBSIDY_ONLY {
+            &self.subsidy_only_coinbase
+        } else {
+            &self.pooled_coinbase
+        }
     }
 
     pub fn is_stale_prevblock(&self) -> bool {
         self.stale_prevblock.load(Ordering::Relaxed)
     }
 
-    pub fn full_coinbase(&self, id: u8, pot: u8) -> Option<Vec<u8>> {
+    pub fn full_coinbase(&self, id: u8, target_byte: u8) -> Option<Vec<u8>> {
         let coinbase = self.coinbase(id);
         let mut tx = coinbase.assemble(&[0u8; EXTRANONCE_SIZE]);
-        *tx.get_mut(coinbase.pot_index)? = pot;
+        *tx.get_mut(coinbase.target_byte_index)? = target_byte;
         Some(tx)
     }
 
-    fn header_base(&self, merkle_root: [u8; 32], txcount: u16, pot: u8) -> HeaderV2 {
-        HeaderV2 {
+    fn header_base(&self, merkle_root: [u8; 32], txcount: u16, target_byte: u8) -> BlockHeaderV2 {
+        BlockHeaderV2 {
             version: self.template.version as i32,
             prev_block: self.template.prev_hash,
             merkle_root,
@@ -96,49 +98,51 @@ impl Job {
             bits: self.template.nbits,
             txcount,
             height: self.template.height as i32,
-            xor_key_mask_clear_bits: self.abw.map_or(0, |_| ratum::datum::abw::clear_bits(pot)),
+            xor_key_mask_clear_bits: self
+                .abw
+                .map_or(0, |_| ratum::datum::abw::clear_bits(target_byte)),
             ..Default::default()
         }
     }
 
-    fn precompute(&self, h: &HeaderV2) -> header::Precomputed {
+    fn hash_stages(&self, h: &BlockHeaderV2) -> header::HashStages {
         match self.abw {
-            Some(a) => h.precompute_with_key_hash(a.key_hash),
-            None => h.precompute(),
+            Some(a) => h.hash_stages_with_key_hash(a.key_hash),
+            None => h.hash_stages(),
         }
     }
 
-    pub fn share_pow_hash(&self, h: &HeaderV2) -> [u8; 32] {
-        let pre = self.precompute(h);
-        header::blake2b_256(&h.asic_input_with(&pre.hash1, &pre.h2))
+    pub fn raw_pow_hash(&self, h: &BlockHeaderV2) -> [u8; 32] {
+        let stages = self.hash_stages(h);
+        header::blake2b_256(&h.asic_input_with(&stages.work_root, &stages.h2))
     }
 
-    pub fn commitment(&self, id: u8, pot: u8) -> Option<Commitment> {
-        if let Some(c) = ratum::lock(&self.commitments).get(&(id, pot)) {
+    pub fn commitment(&self, id: u8, target_byte: u8) -> Option<H2Commitment> {
+        if let Some(c) = ratum::lock(&self.commitments).get(&(id, target_byte)) {
             return Some(c.clone());
         }
-        let tx = self.full_coinbase(id, pot)?;
+        let tx = self.full_coinbase(id, target_byte)?;
         let cb_hash = ratum::bitcoin::sha256d(&tx);
-        let subsidy_only = id == COINBASE_SUBSIDY_ONLY;
+        let subsidy_only = id == COINBASE_ID_SUBSIDY_ONLY;
         let branches: &[[u8; 32]] = if subsidy_only { &[] } else { &self.merkle_branches };
         let merkle_root = ratum::bitcoin::merkle_root(&cb_hash, branches);
         let txcount = if subsidy_only { 1 } else { self.template.txns.len() as u16 + 1 };
-        let base = self.header_base(merkle_root, txcount, pot);
-        let c = Commitment { merkle_root, h2: self.precompute(&base).h2, txcount };
-        ratum::lock(&self.commitments).insert((id, pot), c.clone());
+        let base = self.header_base(merkle_root, txcount, target_byte);
+        let c = H2Commitment { merkle_root, h2: self.hash_stages(&base).h2, txcount };
+        ratum::lock(&self.commitments).insert((id, target_byte), c.clone());
         Some(c)
     }
 
     pub fn header(
         &self,
         id: u8,
-        pot: u8,
-        extranonce: [u8; EXTRANONCE_SIZE_V2],
+        target_byte: u8,
+        extranonce: [u8; HEADER_EXTRANONCE_SIZE],
         sia_nonce: [u8; SIA_FIELD_SIZE],
         sia_ntime: [u8; SIA_FIELD_SIZE],
-    ) -> Option<HeaderV2> {
-        let c = self.commitment(id, pot)?;
-        let mut h = self.header_base(c.merkle_root, c.txcount, pot);
+    ) -> Option<BlockHeaderV2> {
+        let c = self.commitment(id, target_byte)?;
+        let mut h = self.header_base(c.merkle_root, c.txcount, target_byte);
         h.extranonce = extranonce;
         (h.nonce, h.nonce2) = share::sia_halves(&sia_nonce);
         (h.time_offset, h.nonce3) = share::sia_halves(&sia_ntime);
@@ -149,14 +153,18 @@ impl Job {
         let mut rows: Vec<PayoutRow> = self
             .coinbaser_outputs
             .iter()
-            .map(|o| PayoutRow { value: o.value, script: o.script.clone(), remainder: false })
+            .map(|o| PayoutRow {
+                value: o.value,
+                script_pubkey: o.script_pubkey.clone(),
+                is_remainder: false,
+            })
             .collect();
         let paid: u64 = self.coinbaser_outputs.iter().map(|o| o.value).sum();
         if paid < self.template.coinbase_value {
             rows.push(PayoutRow {
                 value: self.template.coinbase_value - paid,
-                script: self.pool_addr_script.clone(),
-                remainder: true,
+                script_pubkey: self.pool_payout_script.clone(),
+                is_remainder: true,
             });
         }
         rows
@@ -199,7 +207,7 @@ pub enum BuildError {
     #[error("pool payout script of {0} bytes")]
     PayoutScriptSize(usize),
     #[error("{0}")]
-    Tagging(String),
+    ScriptSig(String),
     #[error("{0} merkle branches; the protocol carries at most {max}",
             max = MAX_MERKLE_BRANCHES)]
     TooManyBranches(usize),
@@ -207,20 +215,20 @@ pub enum BuildError {
     BadBits,
 }
 
-struct CoinbaseSet {
-    pooled: Coinbase,
-    subsidy_only: Coinbase,
-    included: Vec<CoinbaseOutput>,
+struct BuiltCoinbases {
+    pooled: StratumCoinbase,
+    subsidy_only: StratumCoinbase,
+    included_outputs: Vec<TxOut>,
 }
 
-pub struct Builder {
+pub struct JobBuilder {
     serial: u64,
     enprefix: u16,
     datum_slot: u8,
     config: Arc<Config>,
 }
 
-impl Builder {
+impl JobBuilder {
     pub fn new(config: Arc<Config>) -> Self {
         Self { serial: 0, enprefix: 0, datum_slot: 0, config }
     }
@@ -231,7 +239,7 @@ impl Builder {
         new_block: bool,
         pool: Option<&PoolConfig>,
         coinbaser: Option<CoinbaserResponse>,
-        abw: Option<Abw>,
+        abw: Option<AbwAssignment>,
     ) -> Result<Job, BuildError> {
         let c = &self.config;
         let serial = self.serial;
@@ -243,28 +251,35 @@ impl Builder {
         let datum_slot = self.datum_slot;
         self.datum_slot = ((u32::from(self.datum_slot) + 1) % slots) as u8;
 
-        let (pool_addr_script, prime_id, tag_primary) = match pool {
+        let (pool_payout_script, prime_id, tag_primary) = match pool {
             Some(p) => (p.payout_script.clone(), p.prime_id, p.coinbase_tag.as_str()),
             None => (c.pool_output_script.clone(), 0, c.mining.coinbase_tag_primary.as_str()),
         };
-        if pool_addr_script.is_empty()
-            || pool_addr_script.len() > ratum::datum::messages::MAX_OUTPUT_SCRIPT
+        if pool_payout_script.is_empty()
+            || pool_payout_script.len() > ratum::datum::messages::MAX_PAYOUT_SCRIPT_LEN
         {
-            return Err(BuildError::PayoutScriptSize(pool_addr_script.len()));
+            return Err(BuildError::PayoutScriptSize(pool_payout_script.len()));
         }
-        let (script, pot_in_script) = coinbase::script_sig(&coinbase::Tagging {
-            height: template.height,
-            tag_primary,
-            tag_secondary: &c.mining.coinbase_tag_secondary,
-            unique_id: (c.mining.coinbase_unique_id & u32::from(u16::MAX)) as u16,
-            prime_id,
-            wide_prime: pool.is_some_and(|p| p.protocol_v3),
-            datum_active: pool.is_some(),
-        })
-        .map_err(BuildError::Tagging)?;
+        let (script, target_byte_index_in_script) =
+            coinbase::script_sig(&coinbase::ScriptSigInputs {
+                height: template.height,
+                tag_primary,
+                tag_secondary: &c.mining.coinbase_tag_secondary,
+                unique_id: (c.mining.coinbase_unique_id & u32::from(u16::MAX)) as u16,
+                prime_id,
+                wide_prime: pool.is_some_and(|p| p.protocol_v3),
+                datum_active: pool.is_some(),
+            })
+            .map_err(BuildError::ScriptSig)?;
         let (coinbaser_id, outputs) = filter_coinbaser(&template, coinbaser);
-        let set =
-            coinbase_set(&template, &script, pot_in_script, enprefix, &pool_addr_script, &outputs);
+        let built = build_coinbases(
+            &template,
+            &script,
+            target_byte_index_in_script,
+            enprefix,
+            &pool_payout_script,
+            &outputs,
+        );
 
         let txids: Vec<[u8; 32]> = template.txns.iter().map(|t| t.txid).collect();
         let merkle_branches = merkle_branches(&txids);
@@ -283,11 +298,11 @@ impl Builder {
             block_target: target::bits_to_target(template.nbits).ok_or(BuildError::BadBits)?,
             prevblock_hidden: header::prevblock_hidden(&template.prev_hash),
             merkle_branches,
-            pooled: set.pooled,
-            subsidy_only: set.subsidy_only,
+            pooled_coinbase: built.pooled,
+            subsidy_only_coinbase: built.subsidy_only,
             coinbaser_id,
-            coinbaser_outputs: set.included,
-            pool_addr_script,
+            coinbaser_outputs: built.included_outputs,
+            pool_payout_script,
             is_datum_job: pool.is_some(),
             abw,
             is_new_block: new_block,
@@ -299,38 +314,35 @@ impl Builder {
     }
 }
 
-fn filter_coinbaser(
-    template: &Template,
-    coinbaser: Option<CoinbaserResponse>,
-) -> (u8, Vec<CoinbaseOutput>) {
+fn filter_coinbaser(template: &Template, coinbaser: Option<CoinbaserResponse>) -> (u8, Vec<TxOut>) {
     let Some(r) = coinbaser else { return (0, Vec::new()) };
     let (kept, dropped): (Vec<_>, Vec<_>) = r.outputs.into_iter().partition(|o| {
-        !template.reduced_data || ratum::bitcoin::output_script_size_is_valid(&o.script)
+        !template.reduced_data || ratum::bitcoin::output_script_size_is_valid(&o.script_pubkey)
     });
     for o in dropped {
         log::warn!(
             "Coinbaser sent a {} byte output script, over the reduced_data limit for block {}. Leaving that output out of the generation txn.",
-            o.script.len(),
+            o.script_pubkey.len(),
             template.height
         );
     }
     (r.coinbaser_id, kept)
 }
 
-fn coinbase_set(
+fn build_coinbases(
     template: &Template,
     script: &[u8],
-    pot_in_script: usize,
+    target_byte_index_in_script: usize,
     enprefix: u16,
-    pool_script: &[u8],
-    outputs: &[CoinbaseOutput],
-) -> CoinbaseSet {
-    let spec = |outs, budget, sigops, subsidy_only| coinbase::Spec {
+    pool_payout_script: &[u8],
+    outputs: &[TxOut],
+) -> BuiltCoinbases {
+    let spec = |outs, budget, sigops, subsidy_only| coinbase::CoinbaseSpec {
         script_sig: script,
-        pot_index_in_script: pot_in_script,
+        target_byte_index_in_script,
         enprefix,
         witness_commitment: if subsidy_only { None } else { Some(&template.witness_commitment) },
-        pool_script,
+        pool_payout_script,
         coinbase_value: if subsidy_only {
             template.coinbase_value - template.totals.fee
         } else {
@@ -341,16 +353,19 @@ fn coinbase_set(
         sigop_budget: sigops,
     };
     let (subsidy_only, _) = coinbase::build(&spec(&[], 0, 0, true));
-    let fixed =
-        coinbase::fixed_bytes(script.len(), pool_script.len(), template.witness_commitment.len());
+    let fixed = coinbase::fixed_bytes(
+        script.len(),
+        pool_payout_script.len(),
+        template.witness_commitment.len(),
+    );
     let budget = if outputs.is_empty() { 0 } else { coinbase::output_budget(fixed, template) };
     let sigops = template
         .sigoplimit
         .saturating_sub(u64::from(template.totals.sigops))
-        .saturating_sub(coinbase::output_sigop_cost(pool_script));
-    let (pooled, included) = coinbase::build(&spec(outputs, budget, sigops, false));
-    debug_assert_eq!(pooled.pot_index, subsidy_only.pot_index);
-    CoinbaseSet { pooled, subsidy_only, included }
+        .saturating_sub(coinbase::output_sigop_cost(pool_payout_script));
+    let (pooled, included_outputs) = coinbase::build(&spec(outputs, budget, sigops, false));
+    debug_assert_eq!(pooled.target_byte_index, subsidy_only.target_byte_index);
+    BuiltCoinbases { pooled, subsidy_only, included_outputs }
 }
 
 pub const JOB_ID_TIME_CHARS: usize = 8;
@@ -359,23 +374,23 @@ const JOB_ID_INDEX_AT: std::ops::Range<usize> = 10..JOB_ID_CHARS;
 const NOTIFY_ID_CHARS: usize = JOB_ID_CHARS + 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct JobRef {
+pub struct NotifyId {
     pub global_index: u8,
     pub quickdiff: bool,
-    pub empty: bool,
-    pub coinbase: u8,
+    pub empty_work: bool,
+    pub coinbase_id: u8,
 }
 
 const QUICKDIFF_PREFIX: char = 'Q';
-const EMPTY_PREFIX: char = 'N';
+const EMPTY_WORK_PREFIX: char = 'N';
 
-impl JobRef {
-    pub fn notify_id(self, job: &Job) -> String {
-        let cb = self.coinbase;
+impl NotifyId {
+    pub fn encode(self, job: &Job) -> String {
+        let cb = self.coinbase_id;
         if self.quickdiff {
             format!("{QUICKDIFF_PREFIX}{}{cb:02x}", job.job_id)
-        } else if self.empty {
-            format!("{EMPTY_PREFIX}{}{COINBASE_SUBSIDY_ONLY:02x}", job.job_id)
+        } else if self.empty_work {
+            format!("{EMPTY_WORK_PREFIX}{}{COINBASE_ID_SUBSIDY_ONLY:02x}", job.job_id)
         } else {
             format!("{}{cb:02x}", job.job_id)
         }
@@ -383,19 +398,19 @@ impl JobRef {
 
     pub fn parse(s: &str) -> Option<(Self, &str)> {
         const PREFIXED: usize = NOTIFY_ID_CHARS + 1;
-        let (quickdiff, empty, rest) = match s.len() {
+        let (quickdiff, empty_work, rest) = match s.len() {
             NOTIFY_ID_CHARS => (false, false, s),
             PREFIXED if s.starts_with(QUICKDIFF_PREFIX) => (true, false, &s[1..]),
-            PREFIXED if s.starts_with(EMPTY_PREFIX) => (false, true, &s[1..]),
+            PREFIXED if s.starts_with(EMPTY_WORK_PREFIX) => (false, true, &s[1..]),
             _ => return None,
         };
         let job_id = rest.get(..JOB_ID_CHARS)?;
         let global_index = global_index_of(job_id)?;
-        let coinbase = u8::from_str_radix(rest.get(JOB_ID_CHARS..NOTIFY_ID_CHARS)?, 16).ok()?;
-        if empty && coinbase != COINBASE_SUBSIDY_ONLY {
+        let coinbase_id = u8::from_str_radix(rest.get(JOB_ID_CHARS..NOTIFY_ID_CHARS)?, 16).ok()?;
+        if empty_work && coinbase_id != COINBASE_ID_SUBSIDY_ONLY {
             return None;
         }
-        Some((Self { global_index, quickdiff, empty, coinbase }, job_id))
+        Some((Self { global_index, quickdiff, empty_work, coinbase_id }, job_id))
     }
 }
 
@@ -446,18 +461,18 @@ mod tests {
         let job_id = format!("{:08x}{:02x}{:04x}", 0x6625a3d5u32, 0x3c, 0x3c ^ JOB_INDEX_XOR);
         let job = crate::template::tests::job_with_id(&job_id);
         for r in [
-            JobRef { global_index: 0x3c, quickdiff: false, empty: false, coinbase: 2 },
-            JobRef { global_index: 0x3c, quickdiff: true, empty: false, coinbase: 5 },
-            JobRef { global_index: 0x3c, quickdiff: false, empty: true, coinbase: 0xff },
+            NotifyId { global_index: 0x3c, quickdiff: false, empty_work: false, coinbase_id: 2 },
+            NotifyId { global_index: 0x3c, quickdiff: true, empty_work: false, coinbase_id: 5 },
+            NotifyId { global_index: 0x3c, quickdiff: false, empty_work: true, coinbase_id: 0xff },
         ] {
-            let id = r.notify_id(&job);
-            let (parsed, carried) = JobRef::parse(&id).unwrap();
+            let id = r.encode(&job);
+            let (parsed, carried) = NotifyId::parse(&id).unwrap();
             assert_eq!(parsed, r, "{id}");
             assert_eq!(carried, job_id);
         }
-        assert_eq!(JobRef::parse("N6625a3d53cc0e202"), None, "empty work is subsidy-only");
-        assert_eq!(JobRef::parse("X6625a3d53cc0e2ff"), None);
-        assert_eq!(JobRef::parse("6625a3d53cc0e2"), None);
+        assert_eq!(NotifyId::parse("N6625a3d53cc0e202"), None, "empty work is subsidy-only");
+        assert_eq!(NotifyId::parse("X6625a3d53cc0e2ff"), None);
+        assert_eq!(NotifyId::parse("6625a3d53cc0e2"), None);
     }
 
     #[test]
@@ -471,16 +486,16 @@ mod tests {
             protocol_v3: false,
             abw_disabled: false,
         };
-        let outputs: Vec<CoinbaseOutput> = (0..120u8)
-            .map(|i| CoinbaseOutput { value: 100_000, script: ratum::fixtures::p2wpkh(i) })
+        let outputs: Vec<TxOut> = (0..120u8)
+            .map(|i| TxOut { value: 100_000, script_pubkey: ratum::fixtures::p2wpkh(i) })
             .collect();
-        let build = |t: Template, outs: &[CoinbaseOutput]| {
+        let build = |t: Template, outs: &[TxOut]| {
             let split = CoinbaserResponse {
                 value: t.coinbase_value,
                 coinbaser_id: 1,
                 outputs: outs.to_vec(),
             };
-            Builder::new(Arc::new(config()))
+            JobBuilder::new(Arc::new(config()))
                 .build(Arc::new(t), false, Some(&pool), Some(split), None)
                 .unwrap()
         };
@@ -491,10 +506,10 @@ mod tests {
         roomy.sigoplimit = 80_000;
         let job = build(roomy.clone(), &outputs);
         assert_eq!(job.coinbaser_outputs.len(), 120);
-        let tx = job.pooled.assemble(&[0u8; EXTRANONCE_SIZE]);
+        let tx = job.pooled_coinbase.assemble(&[0u8; EXTRANONCE_SIZE]);
         let parsed = ratum::bitcoin::parse_coinbase(&tx).unwrap();
         assert_eq!(parsed.outputs.len(), 122);
-        assert_eq!(job.coinbase(coinbase::COINBASE_POOLED), &job.pooled);
+        assert_eq!(job.coinbase(coinbase::COINBASE_ID_POOLED), &job.pooled_coinbase);
 
         let mut tight = roomy.clone();
         let weight_used = u64::from(tight.totals.weight) + 340 + 336 + 36;
@@ -502,18 +517,13 @@ mod tests {
         let job = build(tight, &outputs);
         let included = job.coinbaser_outputs.len();
         assert!(included > 0 && included < 120, "{included} outputs");
-        let tx = job.pooled.assemble(&[0u8; EXTRANONCE_SIZE]);
+        let tx = job.pooled_coinbase.assemble(&[0u8; EXTRANONCE_SIZE]);
         assert!(tx.len() <= 700 + 15, "the coinbase fits the room: {} bytes", tx.len());
 
-        let mut legacy: Vec<CoinbaseOutput> = (0..30u8)
-            .map(|i| {
-                let mut s = vec![0x76, 0xa9, 0x14];
-                s.extend_from_slice(&[i; 20]);
-                s.extend_from_slice(&[0x88, 0xac]);
-                CoinbaseOutput { value: 100_000, script: s }
-            })
+        let mut legacy: Vec<TxOut> = (0..30u8)
+            .map(|i| TxOut { value: 100_000, script_pubkey: ratum::fixtures::p2pkh(i) })
             .collect();
-        legacy.push(CoinbaseOutput { value: 100_000, script: ratum::fixtures::p2wpkh(0xaa) });
+        legacy.push(TxOut { value: 100_000, script_pubkey: ratum::fixtures::p2wpkh(0xaa) });
         let mut scarce = roomy;
         scarce.sigoplimit = u64::from(scarce.totals.sigops) + 40;
         let job = build(scarce, &legacy);
@@ -536,21 +546,22 @@ mod tests {
         roomy.sizelimit = 4_000_000;
         roomy.weightlimit = 4_000_000;
         roomy.sigoplimit = 80_000;
-        let build = |outs: Vec<CoinbaseOutput>| {
+        let build = |outs: Vec<TxOut>| {
             let split =
                 CoinbaserResponse { value: roomy.coinbase_value, coinbaser_id: 1, outputs: outs };
-            Builder::new(Arc::new(config()))
+            JobBuilder::new(Arc::new(config()))
                 .build(Arc::new(roomy.clone()), false, Some(&pool), Some(split), None)
                 .unwrap()
         };
-        let section = |job: &Job| job.pooled.coinb1.len() + job.pooled.coinb2.len();
+        let section =
+            |job: &Job| job.pooled_coinbase.coinb1.len() + job.pooled_coinbase.coinb2.len();
 
-        let widest: Vec<CoinbaseOutput> = (0..512u16)
+        let widest: Vec<TxOut> = (0..512u16)
             .map(|i| {
                 let mut s = vec![0x6a, 0x3e];
                 s.extend_from_slice(&i.to_le_bytes());
                 s.resize(64, 0x33);
-                CoinbaseOutput { value: 1_000, script: s }
+                TxOut { value: 1_000, script_pubkey: s }
             })
             .collect();
         let job = build(widest);
@@ -559,12 +570,12 @@ mod tests {
         assert!(section(&job) <= MAX_COINBASE_SECTION_BYTES, "{} bytes", section(&job));
         assert!(section(&job) > MAX_COINBASE_SECTION_BYTES - 128, "{} bytes", section(&job));
 
-        let taproot: Vec<CoinbaseOutput> = (0..512u16)
+        let taproot: Vec<TxOut> = (0..512u16)
             .map(|i| {
                 let mut s = vec![0x51, 0x20];
                 s.extend_from_slice(&i.to_le_bytes());
                 s.resize(34, 0x44);
-                CoinbaseOutput { value: 1_000, script: s }
+                TxOut { value: 1_000, script_pubkey: s }
             })
             .collect();
         let job = build(taproot);
@@ -583,14 +594,14 @@ mod tests {
             protocol_v3: false,
             abw_disabled: false,
         };
-        let mut builder = Builder::new(Arc::new(config()));
+        let mut builder = JobBuilder::new(Arc::new(config()));
         for (script_len, op) in [(34usize, 0x51u8), (22, 0x00)] {
-            let outputs: Vec<CoinbaseOutput> = (0..512u16)
+            let outputs: Vec<TxOut> = (0..512u16)
                 .map(|i| {
                     let mut s = vec![op, (script_len - 2) as u8];
                     s.extend_from_slice(&i.to_le_bytes());
                     s.resize(script_len, 0x44);
-                    CoinbaseOutput { value: 1_000, script: s }
+                    TxOut { value: 1_000, script_pubkey: s }
                 })
                 .collect();
             let mut most = 0usize;
@@ -607,7 +618,7 @@ mod tests {
                 let job = builder
                     .build(Arc::new(t.clone()), false, Some(&pool), Some(split), None)
                     .unwrap();
-                let tx = job.pooled.assemble(&[0u8; EXTRANONCE_SIZE]);
+                let tx = job.pooled_coinbase.assemble(&[0u8; EXTRANONCE_SIZE]);
                 let weight = 4 * (164 + 3 + tx.len() as u64) + 36 + u64::from(t.totals.weight);
                 assert!(
                     weight <= t.weightlimit,

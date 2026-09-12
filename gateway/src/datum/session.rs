@@ -1,21 +1,21 @@
 use super::{
-    AbwSlots, CoinbaserRequestState, Pool, QueuedShare, Settings, validation, wire_username,
+    AbwAssignments, CoinbaserRequestState, PoolConnectionSettings, PoolConnectionState,
+    QueuedShare, validation, wire_username,
 };
 use crate::job::PoolConfig;
 use log::{debug, error, info, warn};
-use ratum::datum::abw::{self, Activation, AssignmentNotice, Candidate, Reveal};
-use ratum::datum::client::Client;
-use ratum::datum::framing::{self, Header};
+use ratum::datum::abw::{self, AbwShareRef, Activation, AssignmentNotice, Reveal};
+use ratum::datum::client::ClientChannel;
+use ratum::datum::framing::{self, FrameHeader};
 use ratum::datum::handshake::KeyPairs;
 use ratum::datum::messages::{
     ClientConfig, ClientConfigV3, CoinbaserRequest, CoinbaserResponse, MigrationRequest,
     ShareResponse, ShareVerdict, server_subcmd,
 };
 use ratum::datum::share::{self, Blake2bSection, CoinbaseSection, JobSection, PowSubmit};
-use ratum::io::read_exact_deadline;
-use ratum::poll::PolledSocket;
+use ratum::poll::{PolledSocket, WRITE_TIMEOUT};
 use ratum::target;
-use std::io::{self, Write};
+use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,13 +23,11 @@ use std::time::{Duration, Instant};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SHARE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const SHARE_ACK_GRACE: Duration = Duration::from_secs(25);
-const HANDSHAKE_READ_POLL: Duration = Duration::from_millis(5);
-const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-const MINING_PAD_MAX: usize = 100;
+const MAX_MINING_PAD_LEN: usize = 100;
 
 pub(super) fn run(
-    settings: &Settings,
-    pool: &Pool,
+    settings: &PoolConnectionSettings,
+    pool: &PoolConnectionState,
     identity: &KeyPairs,
 ) -> Result<(), SessionError> {
     Session::open(settings, pool, identity).and_then(|mut session| session.run())
@@ -40,7 +38,7 @@ pub(super) enum SessionError {
     #[error("io: {0}")]
     Io(#[from] io::Error),
     #[error("handshake: {0}")]
-    Handshake(#[from] ratum::datum::handshake::Error),
+    Handshake(#[from] ratum::datum::channel::Error),
     #[error("no message from the pool for {0:?}")]
     GlobalTimeout(Duration),
     #[error("no share accepted for {0:?}")]
@@ -52,46 +50,51 @@ pub(super) enum SessionError {
 }
 
 struct Session<'a> {
-    settings: &'a Settings,
-    pool: &'a Pool,
+    settings: &'a PoolConnectionSettings,
+    pool: &'a PoolConnectionState,
     identity: &'a KeyPairs,
     socket: PolledSocket,
-    client: Client,
+    channel: ClientChannel,
     last_server_msg: Instant,
     last_share_sent: Option<Instant>,
     last_share_accepted: Option<Instant>,
-    sent_job: Vec<Option<SentSections>>,
-    requested: Option<Arc<CoinbaserRequestState>>,
-    pending_header: [u8; framing::HEADER_LEN],
-    pending_header_len: usize,
+    sent_sections: Vec<Option<SentSections>>,
+    coinbaser_request_sent: Option<Arc<CoinbaserRequestState>>,
+    pending_frame_header: [u8; framing::HEADER_LEN],
+    pending_frame_header_len: usize,
 }
 
-const COINBASE_SLOTS: usize = 8;
+const TRACKED_COINBASE_IDS: usize = 8;
 
 #[derive(Clone, Copy)]
 struct SentSections {
     serial: u64,
-    job: bool,
-    coinbases: [bool; COINBASE_SLOTS],
-    subsidy_only: bool,
+    job_section_sent: bool,
+    coinbase_sent: [bool; TRACKED_COINBASE_IDS],
+    subsidy_only_coinbase_sent: bool,
 }
 
 impl SentSections {
     fn new(serial: u64) -> Self {
-        Self { serial, job: false, coinbases: [false; COINBASE_SLOTS], subsidy_only: false }
+        Self {
+            serial,
+            job_section_sent: false,
+            coinbase_sent: [false; TRACKED_COINBASE_IDS],
+            subsidy_only_coinbase_sent: false,
+        }
     }
 
-    fn coinbase_known(&mut self, coinbase_id: u8) -> bool {
+    fn mark_coinbase_sent(&mut self, coinbase_id: u8) -> bool {
         let slot = if coinbase_id == share::COINBASE_ID_SUBSIDY_ONLY {
-            &mut self.subsidy_only
+            &mut self.subsidy_only_coinbase_sent
         } else {
-            &mut self.coinbases[coinbase_id as usize % COINBASE_SLOTS]
+            &mut self.coinbase_sent[coinbase_id as usize % TRACKED_COINBASE_IDS]
         };
         std::mem::replace(slot, true)
     }
 }
 
-fn connect(settings: &Settings) -> Result<TcpStream, SessionError> {
+fn connect(settings: &PoolConnectionSettings) -> Result<TcpStream, SessionError> {
     let target = format!("{}:{}", settings.host, settings.port);
     let addrs: Vec<_> = target
         .to_socket_addrs()
@@ -118,75 +121,68 @@ fn connect(settings: &Settings) -> Result<TcpStream, SessionError> {
 
 impl<'a> Session<'a> {
     fn open(
-        settings: &'a Settings,
-        pool: &'a Pool,
+        settings: &'a PoolConnectionSettings,
+        pool: &'a PoolConnectionState,
         identity: &'a KeyPairs,
     ) -> Result<Self, SessionError> {
-        let mut stream = connect(settings)?;
-        stream.set_read_timeout(Some(HANDSHAKE_READ_POLL))?;
-        stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
-        let mut client =
-            Client::with_key_pairs(identity.clone(), KeyPairs::generate(), ratum::rand::u32());
+        let mut socket = PolledSocket::new(connect(settings)?)?;
+        let mut channel = ClientChannel::with_key_pairs(
+            identity.clone(),
+            KeyPairs::generate(),
+            ratum::rand::u32(),
+        );
         let hello = if settings.protocol_v3 {
             let token = pool.resume_token();
-            client.hello_resumable(&settings.pool_box_pk, &settings.user_agent, token.as_ref())
+            channel.hello_resumable(&settings.pool_box_pk, &settings.user_agent, token.as_ref())
         } else {
-            client.hello(&settings.pool_box_pk, &settings.user_agent)
+            channel.hello(&settings.pool_box_pk, &settings.user_agent)
         };
-        stream.write_all(&hello)?;
-        stream.flush()?;
+        socket.write_all(&hello, WRITE_TIMEOUT)?;
 
         let started = Instant::now();
-        let mut frame = read_exact_deadline(
-            &mut stream,
-            framing::HEADER_LEN,
-            started,
-            settings.global_timeout,
-        )?;
-        let peeked = client.peek_handshake_header(frame[..].try_into().expect("four bytes"));
+        let left = || settings.global_timeout.saturating_sub(started.elapsed());
+        let mut frame = vec![0u8; framing::HEADER_LEN];
+        socket.read_exact(&mut frame, left(), left())?;
+        let peeked = channel.peek_handshake_header(frame[..].try_into().expect("four bytes"));
         if peeked.cmd_len > framing::MAX_CMD_DATA_SIZE {
             return Err(
                 io::Error::new(io::ErrorKind::InvalidData, "handshake frame too large").into()
             );
         }
-        frame.extend(read_exact_deadline(
-            &mut stream,
-            peeked.cmd_len as usize,
-            started,
-            settings.global_timeout,
-        )?);
-        client.read_handshake_response(&frame, &settings.pool_sign_pk)?;
-        info!("DATUM Server MOTD: {}", client.motd());
+        let mut body = vec![0u8; peeked.cmd_len as usize];
+        socket.read_exact(&mut body, left(), left())?;
+        frame.extend(body);
+        channel.read_handshake_response(&frame, &settings.pool_sign_pk)?;
+        info!("DATUM Server MOTD: {}", channel.motd());
 
-        let socket = PolledSocket::new(stream)?;
-        *ratum::lock(&pool.waker) = Some(Arc::new(socket.waker()?));
+        *ratum::lock(&pool.session_waker) = Some(Arc::new(socket.waker()?));
 
-        let slots = ratum::lock(&pool.slots).len();
+        let slots = ratum::lock(&pool.job_slots).len();
         Ok(Session {
             settings,
             pool,
             identity,
             socket,
-            client,
+            channel,
             last_server_msg: Instant::now(),
             last_share_sent: None,
             last_share_accepted: None,
-            sent_job: vec![None; slots],
-            requested: None,
-            pending_header: [0u8; framing::HEADER_LEN],
-            pending_header_len: 0,
+            sent_sections: vec![None; slots],
+            coinbaser_request_sent: None,
+            pending_frame_header: [0u8; framing::HEADER_LEN],
+            pending_frame_header_len: 0,
         })
     }
 
     fn send_mining(&mut self, payload: &[u8]) -> Result<(), SessionError> {
-        let pad = ratum::rand::bytes::<MINING_PAD_MAX>();
-        let pad_len = 1 + usize::from(pad[0]) % MINING_PAD_MAX;
+        let pad = ratum::rand::bytes::<MAX_MINING_PAD_LEN>();
+        let pad_len = 1 + usize::from(pad[0]) % MAX_MINING_PAD_LEN;
         let mut padded = Vec::with_capacity(payload.len() + pad_len);
         padded.extend_from_slice(payload);
         padded.extend_from_slice(&pad[..pad_len]);
-        let wire = match self.client.encrypt(framing::cmd::MINING, &padded) {
+        let wire = match self.channel.encrypt(framing::cmd::MINING, &padded) {
             Ok(w) => w,
-            Err(ratum::datum::handshake::Error::TooLarge(n)) => {
+            Err(ratum::datum::channel::Error::TooLarge(n)) => {
                 error!("mining message of {n} bytes exceeds the protocol limit; not sent");
                 return Ok(());
             }
@@ -196,24 +192,24 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
-    fn read_body(&mut self, n: usize) -> io::Result<Vec<u8>> {
+    fn read_frame_body(&mut self, n: usize) -> io::Result<Vec<u8>> {
         let left = self.settings.global_timeout.saturating_sub(self.last_server_msg.elapsed());
         let mut buf = vec![0u8; n];
         self.socket.read_exact(&mut buf, left, left)?;
         Ok(buf)
     }
 
-    fn poll_header(&mut self) -> Result<Option<Header>, SessionError> {
-        match self.socket.read(&mut self.pending_header[self.pending_header_len..])? {
+    fn poll_frame_header(&mut self) -> Result<Option<FrameHeader>, SessionError> {
+        match self.socket.read(&mut self.pending_frame_header[self.pending_frame_header_len..])? {
             Some(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
-            Some(n) => self.pending_header_len += n,
+            Some(n) => self.pending_frame_header_len += n,
             None => {}
         }
-        if self.pending_header_len < framing::HEADER_LEN {
+        if self.pending_frame_header_len < framing::HEADER_LEN {
             return Ok(None);
         }
-        self.pending_header_len = 0;
-        let header = self.client.unmask_header(self.pending_header);
+        self.pending_frame_header_len = 0;
+        let header = self.channel.unmask_header(self.pending_frame_header);
         if header.cmd_len > framing::MAX_CMD_DATA_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -244,9 +240,9 @@ impl<'a> Session<'a> {
                 self.socket.wait(Some(timeout))?;
                 continue;
             }
-            let Some(header) = self.poll_header()? else { continue };
-            let body = self.read_body(header.cmd_len as usize)?;
-            let plain = self.client.decrypt(header, &body).map_err(|e| {
+            let Some(header) = self.poll_frame_header()? else { continue };
+            let body = self.read_frame_body(header.cmd_len as usize)?;
+            let plain = self.channel.decrypt(header, &body).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("could not decrypt cmd {}: {e}", header.proto_cmd),
@@ -265,7 +261,7 @@ impl<'a> Session<'a> {
         }
     }
 
-    fn on_mining(&mut self, header: Header, plain: &[u8]) -> Result<(), SessionError> {
+    fn on_mining(&mut self, header: FrameHeader, plain: &[u8]) -> Result<(), SessionError> {
         match plain.first().copied() {
             Some(server_subcmd::CONFIG) => {
                 if !header.is_signed {
@@ -285,7 +281,8 @@ impl<'a> Session<'a> {
             Some(abw::subcmd::ACTIVATION) => self.on_abw_activation(plain),
             Some(abw::subcmd::REVEAL) => self.on_abw_reveal(plain),
             Some(abw::subcmd::CANDIDATE_RECEIPT) => {
-                if let Ok(c) = Candidate::decode(plain, abw::subcmd::CANDIDATE_RECEIPT) {
+                if let Ok(c) = AbwShareRef::decode_candidate(plain, abw::subcmd::CANDIDATE_RECEIPT)
+                {
                     debug!("ABW candidate receipt for slot {}", c.slot);
                 }
             }
@@ -298,7 +295,7 @@ impl<'a> Session<'a> {
             Some(server_subcmd::VALIDATION) => self.on_validation(plain)?,
             Some(server_subcmd::BLOCKNOTIFY) => {
                 debug!("pool blocknotify");
-                self.pool.notify.raise();
+                self.pool.template_waker.raise();
             }
             other => warn!("unknown DATUM mining sub-command {other:?}"),
         }
@@ -306,7 +303,7 @@ impl<'a> Session<'a> {
     }
 
     fn on_coinbaser_response(&self, plain: &[u8]) {
-        let Some(state) = ratum::lock(&self.pool.coinbaser).clone() else {
+        let Some(state) = ratum::lock(&self.pool.coinbaser_request).clone() else {
             warn!("coinbaser response with no request waiting");
             return;
         };
@@ -360,7 +357,7 @@ impl<'a> Session<'a> {
         );
         let previous = self.pool.set_config(config.clone());
         if previous.is_none() {
-            ratum::lock(&self.pool.stats).motd = self.client.motd().to_string();
+            *ratum::lock(&self.pool.motd) = self.channel.motd().to_string();
         }
         if config.protocol_v3 {
             info!(
@@ -369,10 +366,10 @@ impl<'a> Session<'a> {
             );
         }
         if previous.as_ref().is_some_and(|p| p.abw_disabled != config.abw_disabled) {
-            *ratum::lock(&self.pool.abw) = AbwSlots::default();
+            *ratum::lock(&self.pool.abw) = AbwAssignments::default();
         }
         if previous.as_ref() != Some(&config) {
-            self.pool.notify.rebuild();
+            self.pool.template_waker.rebuild();
         }
     }
 
@@ -383,7 +380,7 @@ impl<'a> Session<'a> {
         ratum::lock(&self.pool.abw).install(notice.slot, notice.key_hash, notice.active);
         debug!("ABW assignment for slot {} (active {})", notice.slot, notice.active);
         if notice.active {
-            self.pool.notify.rebuild();
+            self.pool.template_waker.rebuild();
         }
     }
 
@@ -391,7 +388,7 @@ impl<'a> Session<'a> {
         let Some(act) = decoded("activation", Activation::decode(plain)) else { return };
         if ratum::lock(&self.pool.abw).activate(act.slot) {
             debug!("ABW slot {} activated", act.slot);
-            self.pool.notify.rebuild();
+            self.pool.template_waker.rebuild();
         } else {
             error!("ABW activation for slot {} that was not seeded", act.slot);
         }
@@ -407,15 +404,15 @@ impl<'a> Session<'a> {
     }
 
     fn on_share_response(&mut self, r: ShareResponse) {
-        let diff = if r.target_byte == ratum::datum::coinbase::POT_TARGET_PLACEHOLDER {
+        let diff = if r.target_byte == ratum::datum::coinbase::TARGET_BYTE_PLACEHOLDER {
             self.pool.min_difficulty().max(1)
         } else {
-            target::diff_for_pot(r.target_byte)
+            target::difficulty_for_exponent(r.target_byte)
         };
         let accepted =
             matches!(r.verdict, ShareVerdict::Accepted | ShareVerdict::AcceptedTentatively);
         {
-            let mut st = ratum::lock(&self.pool.stats);
+            let mut st = ratum::lock(&self.pool.tallies);
             if accepted { &mut st.accepted } else { &mut st.rejected }.add(diff);
         }
         let what = format!("job {} nonce {:08x} diff {diff}", r.job_id, r.nonce);
@@ -446,14 +443,14 @@ impl<'a> Session<'a> {
     }
 
     fn send_pending(&mut self) -> Result<(), SessionError> {
-        let request = ratum::lock(&self.pool.coinbaser).clone();
+        let request = ratum::lock(&self.pool.coinbaser_request).clone();
         if let Some(state) = request
-            && !self.requested.as_ref().is_some_and(|r| Arc::ptr_eq(r, &state))
+            && !self.coinbaser_request_sent.as_ref().is_some_and(|r| Arc::ptr_eq(r, &state))
         {
             let req = CoinbaserRequest { value: state.value, prev_hash: state.prev_hash };
             debug!("coinbaser request: {} sats", state.value);
             self.send_mining(&req.encode())?;
-            self.requested = Some(state);
+            self.coinbaser_request_sent = Some(state);
         }
         if self.settings.protocol_v3
             && (!self.pool.is_active()
@@ -473,25 +470,26 @@ impl<'a> Session<'a> {
         share: &QueuedShare,
     ) -> (Option<JobSection>, Option<CoinbaseSection>) {
         let job = &share.job;
-        let sent = self.sent_job[job.datum_slot as usize]
+        let sent = self.sent_sections[job.datum_slot as usize]
             .get_or_insert_with(|| SentSections::new(job.serial));
         if sent.serial != job.serial {
             *sent = SentSections::new(job.serial);
         }
-        let job_section = (!std::mem::replace(&mut sent.job, true)).then(|| JobSection {
-            prev_hash: job.template.prev_hash,
-            target_byte_index: job.pooled.pot_index as u16,
-            nbits: job.template.nbits.to_le_bytes(),
-            coinbaser_id: job.coinbaser_id,
-            height: job.template.height,
-            coinbase_value: job.template.coinbase_value,
-            txn_count: job.template.txns.len() as u32,
-            txn_total_weight: job.template.totals.weight,
-            txn_total_size: job.template.totals.size,
-            txn_total_sigops: job.template.totals.sigops,
-            merkle_branches: job.merkle_branches.clone(),
-        });
-        let coinbase_section = (!sent.coinbase_known(share.coinbase_id)).then(|| {
+        let job_section =
+            (!std::mem::replace(&mut sent.job_section_sent, true)).then(|| JobSection {
+                prev_hash: job.template.prev_hash,
+                target_byte_index: job.pooled_coinbase.target_byte_index as u16,
+                nbits: job.template.nbits.to_le_bytes(),
+                coinbaser_id: job.coinbaser_id,
+                height: job.template.height,
+                coinbase_value: job.template.coinbase_value,
+                txn_count: job.template.txns.len() as u32,
+                txn_total_weight: job.template.totals.weight,
+                txn_total_size: job.template.totals.size,
+                txn_total_sigops: job.template.totals.sigops,
+                merkle_branches: job.merkle_branches.clone(),
+            });
+        let coinbase_section = (!sent.mark_coinbase_sent(share.coinbase_id)).then(|| {
             let c = job.coinbase(share.coinbase_id);
             CoinbaseSection {
                 coinbase_id: share.coinbase_id,
@@ -505,7 +503,7 @@ impl<'a> Session<'a> {
     fn send_share(&mut self, share: &QueuedShare) -> Result<(), SessionError> {
         let job = &share.job;
         let current =
-            ratum::lock(&self.pool.slots)[job.datum_slot as usize].as_ref().map(|j| j.serial);
+            ratum::lock(&self.pool.job_slots)[job.datum_slot as usize].as_ref().map(|j| j.serial);
         if current != Some(job.serial) {
             debug!("share for job {} whose DATUM slot was reused; not sent", job.serial);
             return Ok(());

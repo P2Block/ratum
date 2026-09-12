@@ -1,12 +1,13 @@
 use super::framing::STRUCT_END;
-use crate::cursor::Cursor;
+use crate::reader::ByteReader;
 use bytes::BufMut as _;
 
 pub const DRAFT_REVISION: u8 = 0;
 pub const ASSIGNMENT_SLOTS: u8 = 16;
 pub const SHARE_TARGET_BASE_BITS: u8 = 32;
+pub const ASSIGNMENT_ACTIVE: u8 = 0x01;
 
-pub type XorKey = crate::header::U128;
+pub type XorKey = [u8; 16];
 pub type SlotKeys = [Option<XorKey>; ASSIGNMENT_SLOTS as usize];
 
 pub mod subcmd {
@@ -17,11 +18,11 @@ pub mod subcmd {
     pub const REVEAL: u8 = 0xA9;
 }
 
-pub fn clear_bits(target_pot: u8) -> u8 {
-    (u32::from(SHARE_TARGET_BASE_BITS) + u32::from(target_pot)).min(u32::from(u8::MAX)) as u8
+pub fn clear_bits(target_byte: u8) -> u8 {
+    (u32::from(SHARE_TARGET_BASE_BITS) + u32::from(target_byte)).min(u32::from(u8::MAX)) as u8
 }
 
-pub use crate::header::xor_key_hash;
+use crate::header::xor_key_hash;
 
 pub fn key_matches_hash(xor_key: &XorKey, hash: &[u8; 32]) -> bool {
     xor_key_hash(xor_key) == *hash
@@ -31,8 +32,8 @@ pub fn random_key() -> XorKey {
     crate::rand::bytes()
 }
 
-pub fn raw_hash_le(hash2: &[u8; 32]) -> [u8; 32] {
-    crate::bitcoin::reversed(hash2)
+pub fn raw_pow_hash_le(raw_pow_hash: &[u8; 32]) -> [u8; 32] {
+    crate::bitcoin::reversed(raw_pow_hash)
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -49,8 +50,8 @@ pub enum Error {
     BadShape,
 }
 
-impl From<crate::cursor::Truncated> for Error {
-    fn from(t: crate::cursor::Truncated) -> Self {
+impl From<crate::reader::Truncated> for Error {
+    fn from(t: crate::reader::Truncated) -> Self {
         Self::Truncated(t.0)
     }
 }
@@ -68,9 +69,9 @@ pub struct Activation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Candidate {
+pub struct AbwShareRef {
     pub slot: u8,
-    pub raw_pow_hash: [u8; 32],
+    pub raw_pow_hash_le: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,10 +80,10 @@ pub struct Reveal {
     pub xor_key: XorKey,
 }
 
-const MAX_FRAME_LEN: usize = 2 + 1 + 32 + 1;
+const MAX_MESSAGE_LEN: usize = 2 + 1 + 32 + 1;
 
-fn frame(subcmd: u8, body: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
-    let mut out = Vec::with_capacity(MAX_FRAME_LEN);
+fn message(subcmd: u8, body: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    let mut out = Vec::with_capacity(MAX_MESSAGE_LEN);
     out.put_u8(subcmd);
     out.put_u8(DRAFT_REVISION);
     body(&mut out);
@@ -90,8 +91,8 @@ fn frame(subcmd: u8, body: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
     out
 }
 
-fn open(data: &[u8], subcmd: u8) -> Result<Cursor<'_>, Error> {
-    let mut c = Cursor::new(data);
+fn open(data: &[u8], subcmd: u8) -> Result<ByteReader<'_>, Error> {
+    let mut c = ByteReader::new(data);
     c.skip_if(subcmd);
     let rev = c.u8("revision")?;
     if rev != DRAFT_REVISION {
@@ -107,7 +108,7 @@ fn slot_checked(slot: u8) -> Result<u8, Error> {
     Ok(slot)
 }
 
-fn close(c: &mut Cursor<'_>) -> Result<(), Error> {
+fn close(c: &mut ByteReader<'_>) -> Result<(), Error> {
     if c.u8("terminator")? != STRUCT_END || !c.at_end() {
         return Err(Error::BadShape);
     }
@@ -116,8 +117,8 @@ fn close(c: &mut Cursor<'_>) -> Result<(), Error> {
 
 impl AssignmentNotice {
     pub fn encode(&self) -> Vec<u8> {
-        frame(subcmd::ASSIGNMENT_NOTICE, |out| {
-            out.put_u8(u8::from(self.active));
+        message(subcmd::ASSIGNMENT_NOTICE, |out| {
+            out.put_u8(if self.active { ASSIGNMENT_ACTIVE } else { 0 });
             out.put_u8(self.slot);
             out.put_slice(&self.key_hash);
         })
@@ -126,19 +127,19 @@ impl AssignmentNotice {
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
         let mut c = open(data, subcmd::ASSIGNMENT_NOTICE)?;
         let flags = c.u8("flags")?;
-        if flags & !0x01 != 0 {
+        if flags & !ASSIGNMENT_ACTIVE != 0 {
             return Err(Error::BadFlags(flags));
         }
         let slot = slot_checked(c.u8("slot")?)?;
         let key_hash: [u8; 32] = c.arr("key hash")?;
         close(&mut c)?;
-        Ok(Self { active: flags & 0x01 != 0, slot, key_hash })
+        Ok(Self { active: flags & ASSIGNMENT_ACTIVE != 0, slot, key_hash })
     }
 }
 
 impl Activation {
     pub fn encode(&self) -> Vec<u8> {
-        frame(subcmd::ACTIVATION, |out| out.put_u8(self.slot))
+        message(subcmd::ACTIVATION, |out| out.put_u8(self.slot))
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
@@ -149,27 +150,27 @@ impl Activation {
     }
 }
 
-impl Candidate {
-    pub fn encode(&self, subcmd: u8) -> Vec<u8> {
+impl AbwShareRef {
+    pub fn encode_candidate(&self, subcmd: u8) -> Vec<u8> {
         debug_assert!(matches!(subcmd, subcmd::CANDIDATE_RECEIPT | subcmd::CANDIDATE_RELEASE));
-        frame(subcmd, |out| {
+        message(subcmd, |out| {
             out.put_u8(self.slot);
-            out.put_slice(&self.raw_pow_hash);
+            out.put_slice(&self.raw_pow_hash_le);
         })
     }
 
-    pub fn decode(data: &[u8], subcmd: u8) -> Result<Self, Error> {
+    pub fn decode_candidate(data: &[u8], subcmd: u8) -> Result<Self, Error> {
         let mut c = open(data, subcmd)?;
         let slot = slot_checked(c.u8("slot")?)?;
-        let raw_pow_hash: [u8; 32] = c.arr("raw pow hash")?;
+        let raw_pow_hash_le: [u8; 32] = c.arr("raw pow hash")?;
         close(&mut c)?;
-        Ok(Self { slot, raw_pow_hash })
+        Ok(Self { slot, raw_pow_hash_le })
     }
 }
 
 impl Reveal {
     pub fn encode(&self) -> Vec<u8> {
-        frame(subcmd::REVEAL, |out| {
+        message(subcmd::REVEAL, |out| {
             out.put_u8(self.slot);
             out.put_slice(&self.xor_key);
         })
@@ -187,7 +188,7 @@ impl Reveal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::header::{HeaderV2, xor_mask};
+    use crate::header::{BlockHeaderV2, xor_key_mask};
 
     #[test]
     fn clear_bits_matches_the_c_vectors() {
@@ -203,8 +204,8 @@ mod tests {
         for (i, b) in key.iter_mut().enumerate() {
             *b = i as u8 + 1;
         }
-        let h = HeaderV2 { xor_key: key, ..Default::default() };
-        assert_eq!(h.precompute(), h.precompute_with_key_hash(xor_key_hash(&key)));
+        let h = BlockHeaderV2 { xor_key: key, ..Default::default() };
+        assert_eq!(h.hash_stages(), h.hash_stages_with_key_hash(xor_key_hash(&key)));
         assert!(key_matches_hash(&key, &xor_key_hash(&key)));
         let mut wrong = xor_key_hash(&key);
         wrong[0] ^= 1;
@@ -214,15 +215,15 @@ mod tests {
     #[test]
     fn the_mask_leaves_exactly_the_share_bits_clear() {
         let key = [0x5au8; 16];
-        let m = xor_mask(&key, clear_bits(10));
+        let m = xor_key_mask(&key, clear_bits(10));
         assert!(m[..5].iter().all(|&b| b == 0));
         assert_eq!(m[5] & 0xC0, 0);
         assert!(m[6..].iter().any(|&b| b != 0));
-        assert_eq!(xor_mask(&[0u8; 16], 0), [0u8; 32]);
+        assert_eq!(xor_key_mask(&[0u8; 16], 0), [0u8; 32]);
     }
 
     #[test]
-    fn the_pool_and_a_commitment_only_gateway_compute_the_same_raw_hash() {
+    fn the_pool_and_a_commitment_only_gateway_compute_the_same_raw_pow_hash() {
         let key = {
             let mut k = [0u8; 16];
             for (i, b) in k.iter_mut().enumerate() {
@@ -230,10 +231,10 @@ mod tests {
             }
             k
         };
-        let pot = 10u8;
-        let cb = clear_bits(pot);
+        let target_byte = 10u8;
+        let cb = clear_bits(target_byte);
 
-        let mut pool = HeaderV2 {
+        let mut pool = BlockHeaderV2 {
             version: 0x2000_0000,
             merkle_root: [0x33; 32],
             time: 1_700_000_000,
@@ -247,13 +248,13 @@ mod tests {
             ..Default::default()
         };
         pool.prev_block = [0x22; 32];
-        let (pool_pow, pool_block) = pool.pow_and_block_hash();
+        let (pool_pow, pool_block) = pool.raw_pow_and_block_hash();
 
         let mut gw = pool.clone();
         gw.xor_key = [0u8; 16];
-        let gw_pre = gw.precompute_with_key_hash(xor_key_hash(&key));
+        let gw_pre = gw.hash_stages_with_key_hash(xor_key_hash(&key));
 
-        let gw_asic = gw.asic_input_with(&gw_pre.hash1, &gw_pre.h2);
+        let gw_asic = gw.asic_input_with(&gw_pre.work_root, &gw_pre.h2);
         let gw_raw = crate::header::blake2b_256(&gw_asic);
         assert_eq!(gw_raw, pool_pow, "raw hash must not depend on holding the key");
 
@@ -263,12 +264,12 @@ mod tests {
     }
 
     #[test]
-    fn raw_hash_le_reverses_the_blake2b_output() {
-        let hash2: [u8; 32] = std::array::from_fn(|i| i as u8);
-        let le = raw_hash_le(&hash2);
+    fn raw_pow_hash_le_reverses_the_blake2b_output() {
+        let raw_pow_hash: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let le = raw_pow_hash_le(&raw_pow_hash);
         assert_eq!(le[0], 31);
         assert_eq!(le[31], 0);
-        assert_eq!(raw_hash_le(&le), hash2);
+        assert_eq!(raw_pow_hash_le(&le), raw_pow_hash);
     }
 
     #[test]
@@ -285,14 +286,14 @@ mod tests {
         assert_eq!(b, vec![0xA6, 0, 3, 0xFE]);
         assert_eq!(Activation::decode(&b).unwrap(), act);
 
-        let cand = Candidate { slot: 3, raw_pow_hash: [0x80; 32] };
-        let b = cand.encode(subcmd::CANDIDATE_RECEIPT);
+        let cand = AbwShareRef { slot: 3, raw_pow_hash_le: [0x80; 32] };
+        let b = cand.encode_candidate(subcmd::CANDIDATE_RECEIPT);
         assert_eq!(b.len(), 36);
         assert_eq!(b[0], 0xA5);
-        assert_eq!(Candidate::decode(&b, subcmd::CANDIDATE_RECEIPT).unwrap(), cand);
-        let b = cand.encode(subcmd::CANDIDATE_RELEASE);
+        assert_eq!(AbwShareRef::decode_candidate(&b, subcmd::CANDIDATE_RECEIPT).unwrap(), cand);
+        let b = cand.encode_candidate(subcmd::CANDIDATE_RELEASE);
         assert_eq!(b[0], 0xA7);
-        assert_eq!(Candidate::decode(&b, subcmd::CANDIDATE_RELEASE).unwrap(), cand);
+        assert_eq!(AbwShareRef::decode_candidate(&b, subcmd::CANDIDATE_RELEASE).unwrap(), cand);
 
         let reveal = Reveal { slot: 3, xor_key: [0x11; 16] };
         let b = reveal.encode();

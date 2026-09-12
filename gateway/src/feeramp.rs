@@ -6,66 +6,66 @@ pub const BUCKETS: usize = 64;
 const NEVER: u64 = 0;
 
 struct AddressWindow {
-    slots: [u64; BUCKETS],
+    buckets: [u64; BUCKETS],
 }
 
 impl Default for AddressWindow {
     fn default() -> Self {
-        Self { slots: [NEVER; BUCKETS] }
+        Self { buckets: [NEVER; BUCKETS] }
     }
 }
 
 impl AddressWindow {
-    fn mark(&mut self, slot: u64) {
-        self.slots[(slot % BUCKETS as u64) as usize] = slot;
+    fn mark(&mut self, bucket: u64) {
+        self.buckets[(bucket % BUCKETS as u64) as usize] = bucket;
     }
 
-    fn active_buckets(&self, slot: u64) -> usize {
-        self.slots
+    fn active_buckets(&self, bucket: u64) -> usize {
+        self.buckets
             .iter()
-            .filter(|&&s| s != NEVER && slot.saturating_sub(s) < BUCKETS as u64)
+            .filter(|&&s| s != NEVER && bucket.saturating_sub(s) < BUCKETS as u64)
             .count()
     }
 }
 
 #[derive(Default)]
-struct State {
+struct RampState {
     addresses: HashMap<String, AddressWindow>,
-    pruned_at_slot: u64,
+    pruned_at_bucket: u64,
 }
 
 pub struct Ramp {
     bucket_secs: u64,
-    state: Mutex<State>,
+    state: Mutex<RampState>,
 }
 
 impl Ramp {
     pub fn new(window_secs: u64) -> Self {
         Self {
             bucket_secs: (window_secs / BUCKETS as u64).max(1),
-            state: Mutex::new(State::default()),
+            state: Mutex::new(RampState::default()),
         }
     }
 
-    fn slot(&self, now: u64) -> u64 {
+    fn bucket(&self, now: u64) -> u64 {
         now / self.bucket_secs
     }
 
     pub fn record(&self, address: &str, now: u64) -> usize {
-        let slot = self.slot(now);
+        let bucket = self.bucket(now);
         let mut state = ratum::lock(&self.state);
-        if slot != state.pruned_at_slot && !state.addresses.contains_key(address) {
-            state.pruned_at_slot = slot;
-            state.addresses.retain(|_, w| w.active_buckets(slot) != 0);
+        if bucket != state.pruned_at_bucket && !state.addresses.contains_key(address) {
+            state.pruned_at_bucket = bucket;
+            state.addresses.retain(|_, w| w.active_buckets(bucket) != 0);
         }
         let window = state.addresses.entry(address.to_string()).or_default();
-        window.mark(slot);
-        window.active_buckets(slot)
+        window.mark(bucket);
+        window.active_buckets(bucket)
     }
 
     pub fn active_buckets(&self, address: &str, now: u64) -> usize {
-        let slot = self.slot(now);
-        ratum::lock(&self.state).addresses.get(address).map_or(0, |w| w.active_buckets(slot))
+        let bucket = self.bucket(now);
+        ratum::lock(&self.state).addresses.get(address).map_or(0, |w| w.active_buckets(bucket))
     }
 
     pub fn tracked_addresses(&self) -> usize {
@@ -172,7 +172,7 @@ mod tests {
         let now = 1_800_000_000;
         ramp.record("bc1qalice", now);
         ramp.record("bc1qbob", now);
-        assert_eq!(ramp.tracked_addresses(), 2, "a new address in the same slot does not prune");
+        assert_eq!(ramp.tracked_addresses(), 2, "a new address in the same bucket does not prune");
 
         ramp.record("bc1qcarol", now + 2 * DAY);
         assert_eq!(ramp.tracked_addresses(), 1, "only carol is still inside the window");

@@ -1,4 +1,7 @@
-use ratum::datum::abw::{self, AssignmentNotice, Candidate, Reveal, SlotKeys, raw_hash_le, subcmd};
+use ratum::datum::abw::{
+    self, AbwShareRef, AssignmentNotice, Reveal, SlotKeys, raw_pow_hash_le, subcmd,
+};
+use ratum::header::xor_key_hash;
 use ratum_prime::verify::AbwKeys;
 use std::time::{Duration, Instant};
 
@@ -11,59 +14,59 @@ const MAX_TIP_ROTATIONS_PER_REVEAL: u32 = 4;
 #[derive(Clone, Copy, Debug)]
 struct Retired {
     slot: u8,
-    at: Instant,
-    sent: bool,
+    retired_at: Instant,
+    reveal_sent: bool,
 }
 
-pub(crate) struct Revealed {
+pub(crate) struct PendingReveal {
     pub(crate) slot: u8,
-    pub(crate) again: bool,
+    pub(crate) resend: bool,
     pub(crate) payload: Vec<u8>,
 }
 
-pub(crate) struct AbwManager {
-    keys: SlotKeys,
+pub(crate) struct AbwSlotState {
+    seeded: SlotKeys,
     revealed: SlotKeys,
     active: u8,
     retired: Vec<Retired>,
-    shares: u64,
+    shares_since_activation: u64,
     activated_at: Instant,
     reveal_after: Duration,
 }
 
-impl AbwManager {
+impl AbwSlotState {
     pub(crate) fn start(now: Instant, reveal_after: Duration) -> Self {
-        let mut m = Self {
-            keys: [None; abw::ASSIGNMENT_SLOTS as usize],
+        let mut abw = Self {
+            seeded: [None; abw::ASSIGNMENT_SLOTS as usize],
             revealed: [None; abw::ASSIGNMENT_SLOTS as usize],
             active: 0,
             retired: Vec::new(),
-            shares: 0,
+            shares_since_activation: 0,
             activated_at: now,
             reveal_after,
         };
-        m.seed(0);
-        m
+        abw.seed(0);
+        abw
     }
 
     pub(crate) fn keys(&self) -> AbwKeys {
-        AbwKeys { seeded: self.keys, revealed: self.revealed }
+        AbwKeys { seeded: self.seeded, revealed: self.revealed }
     }
 
     fn seed(&mut self, slot: u8) {
-        self.keys[slot as usize] = Some(abw::random_key());
+        self.seeded[slot as usize] = Some(abw::random_key());
         self.revealed[slot as usize] = None;
         self.active = slot;
     }
 
     fn notice(&self, slot: u8, active: bool) -> Vec<u8> {
-        let key = self.keys[slot as usize].expect("a notice names a seeded slot");
-        AssignmentNotice { active, slot, key_hash: abw::xor_key_hash(&key) }.encode()
+        let key = self.seeded[slot as usize].expect("a notice names a seeded slot");
+        AssignmentNotice { active, slot, key_hash: xor_key_hash(&key) }.encode()
     }
 
     pub(crate) fn notices(&self) -> Vec<Vec<u8>> {
         let mut out = Vec::with_capacity(self.retired.len() + 1);
-        for r in self.retired.iter().filter(|r| !r.sent) {
+        for r in self.retired.iter().filter(|r| !r.reveal_sent) {
             out.push(self.notice(r.slot, false));
         }
         out.push(self.notice(self.active, true));
@@ -72,50 +75,56 @@ impl AbwManager {
 
     pub(crate) fn resumed(&mut self, now: Instant) {
         for r in &mut self.retired {
-            r.at = now;
+            r.retired_at = now;
         }
         for slot in 0..abw::ASSIGNMENT_SLOTS {
             if self.revealed[slot as usize].is_some()
                 && !self.retired.iter().any(|r| r.slot == slot)
             {
-                self.retired.push(Retired { slot, at: now, sent: true });
+                self.retired.push(Retired { slot, retired_at: now, reveal_sent: true });
             }
         }
         self.activated_at = now;
     }
 
-    fn reveal(&mut self, r: Retired) -> Revealed {
-        let xor_key = if r.sent {
+    fn reveal(&mut self, r: Retired) -> PendingReveal {
+        let xor_key = if r.reveal_sent {
             self.revealed[r.slot as usize].expect("a sent reveal's key is kept")
         } else {
-            let key = self.keys[r.slot as usize].take().expect("a retired slot is seeded");
+            let key = self.seeded[r.slot as usize].take().expect("a retired slot is seeded");
             self.revealed[r.slot as usize] = Some(key);
             key
         };
-        Revealed { slot: r.slot, again: r.sent, payload: Reveal { slot: r.slot, xor_key }.encode() }
+        PendingReveal {
+            slot: r.slot,
+            resend: r.reveal_sent,
+            payload: Reveal { slot: r.slot, xor_key }.encode(),
+        }
     }
 
     pub(crate) fn next_due(&self) -> Instant {
         let rotation = self.activated_at + ROTATE_AFTER;
         self.retired
             .iter()
-            .map(|r| r.at + self.reveal_after)
+            .map(|r| r.retired_at + self.reveal_after)
             .min()
             .map_or(rotation, |reveal| rotation.min(reveal))
     }
 
     pub(crate) fn reveal_due(&self, now: Instant) -> bool {
-        self.retired.iter().any(|r| now.duration_since(r.at) >= self.reveal_after)
+        self.retired.iter().any(|r| now.duration_since(r.retired_at) >= self.reveal_after)
     }
 
-    pub(crate) fn reveals_due(&mut self, now: Instant) -> Vec<Revealed> {
+    pub(crate) fn reveals_due(&mut self, now: Instant) -> Vec<PendingReveal> {
         let reveal_after = self.reveal_after;
-        let due: Vec<Retired> =
-            self.retired.extract_if(.., |r| now.duration_since(r.at) >= reveal_after).collect();
+        let due: Vec<Retired> = self
+            .retired
+            .extract_if(.., |r| now.duration_since(r.retired_at) >= reveal_after)
+            .collect();
         due.into_iter().map(|r| self.reveal(r)).collect()
     }
 
-    pub(crate) fn rotate(&mut self, now: Instant) -> (Vec<Revealed>, Vec<u8>) {
+    pub(crate) fn rotate(&mut self, now: Instant) -> (Vec<PendingReveal>, Vec<u8>) {
         let old = self.active;
         let next = (old + 1) % abw::ASSIGNMENT_SLOTS;
         let mut reveals = Vec::new();
@@ -123,19 +132,19 @@ impl AbwManager {
             let r = self.retired.remove(pos);
             reveals.push(self.reveal(r));
         }
-        self.retired.push(Retired { slot: old, at: now, sent: false });
+        self.retired.push(Retired { slot: old, retired_at: now, reveal_sent: false });
         self.seed(next);
-        self.shares = 0;
+        self.shares_since_activation = 0;
         self.activated_at = now;
         (reveals, self.notice(next, true))
     }
 
     pub(crate) fn note_share(&mut self) {
-        self.shares = self.shares.saturating_add(1);
+        self.shares_since_activation = self.shares_since_activation.saturating_add(1);
     }
 
     pub(crate) fn rotation_due(&self, now: Instant) -> Option<&'static str> {
-        if self.shares >= ROTATE_AFTER_SHARES {
+        if self.shares_since_activation >= ROTATE_AFTER_SHARES {
             Some("share count")
         } else if now.duration_since(self.activated_at) >= ROTATE_AFTER {
             Some("slot age")
@@ -148,8 +157,9 @@ impl AbwManager {
         now.duration_since(self.activated_at) >= self.reveal_after / MAX_TIP_ROTATIONS_PER_REVEAL
     }
 
-    pub(crate) fn receipt(slot: u8, raw_hash2: [u8; 32]) -> Vec<u8> {
-        Candidate { slot, raw_pow_hash: raw_hash_le(&raw_hash2) }.encode(subcmd::CANDIDATE_RECEIPT)
+    pub(crate) fn receipt(slot: u8, raw_pow_hash: [u8; 32]) -> Vec<u8> {
+        AbwShareRef { slot, raw_pow_hash_le: raw_pow_hash_le(&raw_pow_hash) }
+            .encode_candidate(subcmd::CANDIDATE_RECEIPT)
     }
 }
 
@@ -160,8 +170,8 @@ mod tests {
 
     const AFTER: Duration = Duration::from_secs(180);
 
-    fn decoded_notices(m: &AbwManager) -> Vec<(u8, bool)> {
-        m.notices()
+    fn decoded_notices(abw: &AbwSlotState) -> Vec<(u8, bool)> {
+        abw.notices()
             .iter()
             .map(|n| {
                 let n = Notice::decode(n).unwrap();
@@ -170,7 +180,7 @@ mod tests {
             .collect()
     }
 
-    fn decoded_reveals(reveals: &[Revealed]) -> Vec<(u8, [u8; 16])> {
+    fn decoded_reveals(reveals: &[PendingReveal]) -> Vec<(u8, [u8; 16])> {
         reveals
             .iter()
             .map(|r| {
@@ -183,88 +193,88 @@ mod tests {
 
     #[test]
     fn start_seeds_an_active_slot_zero() {
-        let m = AbwManager::start(Instant::now(), AFTER);
-        assert_eq!(decoded_notices(&m), [(0, true)]);
-        assert_eq!(m.active, 0);
-        let key = m.keys().seeded[0].expect("slot 0 seeded");
-        let notice = Notice::decode(&m.notices()[0]).unwrap();
-        assert_eq!(notice.key_hash, abw::xor_key_hash(&key));
-        assert!(m.keys().seeded[1..].iter().all(Option::is_none));
-        assert!(m.keys().revealed.iter().all(Option::is_none));
-        assert!(m.retired.iter().map(|r| r.slot).collect::<Vec<u8>>().is_empty());
+        let abw = AbwSlotState::start(Instant::now(), AFTER);
+        assert_eq!(decoded_notices(&abw), [(0, true)]);
+        assert_eq!(abw.active, 0);
+        let key = abw.keys().seeded[0].expect("slot 0 seeded");
+        let notice = Notice::decode(&abw.notices()[0]).unwrap();
+        assert_eq!(notice.key_hash, xor_key_hash(&key));
+        assert!(abw.keys().seeded[1..].iter().all(Option::is_none));
+        assert!(abw.keys().revealed.iter().all(Option::is_none));
+        assert!(abw.retired.iter().map(|r| r.slot).collect::<Vec<u8>>().is_empty());
     }
 
     #[test]
     fn a_rotation_retires_the_active_slot_and_its_reveal_follows_after_the_delay() {
         let now = Instant::now();
-        let mut m = AbwManager::start(now, AFTER);
-        let key0 = m.keys().seeded[0].unwrap();
+        let mut abw = AbwSlotState::start(now, AFTER);
+        let key0 = abw.keys().seeded[0].unwrap();
 
-        let (reveals, notice) = m.rotate(now);
+        let (reveals, notice) = abw.rotate(now);
         assert!(reveals.is_empty(), "slot 1 awaits no reveal");
         let n = Notice::decode(&notice).unwrap();
         assert!(n.active);
         assert_eq!(n.slot, 1);
-        assert_eq!(m.active, 1);
-        assert_eq!(m.keys().seeded[0], Some(key0), "the retired slot stays seeded");
-        assert_eq!(decoded_notices(&m), [(0, false), (1, true)]);
-        assert_eq!(m.retired.iter().map(|r| r.slot).collect::<Vec<u8>>(), [0]);
-        assert!(m.reveals_due(now).is_empty());
-        assert!(!m.reveal_due(now + AFTER - Duration::from_secs(1)));
-        assert!(m.reveals_due(now + AFTER - Duration::from_secs(1)).is_empty(), "not yet due");
-        assert!(m.reveal_due(now + AFTER));
+        assert_eq!(abw.active, 1);
+        assert_eq!(abw.keys().seeded[0], Some(key0), "the retired slot stays seeded");
+        assert_eq!(decoded_notices(&abw), [(0, false), (1, true)]);
+        assert_eq!(abw.retired.iter().map(|r| r.slot).collect::<Vec<u8>>(), [0]);
+        assert!(abw.reveals_due(now).is_empty());
+        assert!(!abw.reveal_due(now + AFTER - Duration::from_secs(1)));
+        assert!(abw.reveals_due(now + AFTER - Duration::from_secs(1)).is_empty(), "not yet due");
+        assert!(abw.reveal_due(now + AFTER));
 
-        let reveals = m.reveals_due(now + AFTER);
+        let reveals = abw.reveals_due(now + AFTER);
         assert_eq!(decoded_reveals(&reveals), [(0, key0)]);
-        assert!(abw::key_matches_hash(&key0, &abw::xor_key_hash(&key0)));
-        assert!(m.keys().seeded[0].is_none(), "a revealed slot is no longer seeded");
-        assert_eq!(m.keys().revealed[0], Some(key0), "its key is kept for refused shares");
-        assert!(m.retired.iter().map(|r| r.slot).collect::<Vec<u8>>().is_empty());
-        assert_eq!(decoded_notices(&m), [(1, true)]);
-        assert!(m.reveals_due(now + AFTER * 2).is_empty(), "revealed once");
+        assert!(abw::key_matches_hash(&key0, &xor_key_hash(&key0)));
+        assert!(abw.keys().seeded[0].is_none(), "a revealed slot is no longer seeded");
+        assert_eq!(abw.keys().revealed[0], Some(key0), "its key is kept for refused shares");
+        assert!(abw.retired.iter().map(|r| r.slot).collect::<Vec<u8>>().is_empty());
+        assert_eq!(decoded_notices(&abw), [(1, true)]);
+        assert!(abw.reveals_due(now + AFTER * 2).is_empty(), "revealed once");
     }
 
     #[test]
     fn two_rotations_within_the_delay_leave_two_slots_retired_until_each_is_due() {
         let now = Instant::now();
-        let mut m = AbwManager::start(now, AFTER);
-        m.rotate(now);
+        let mut abw = AbwSlotState::start(now, AFTER);
+        abw.rotate(now);
         let later = now + Duration::from_secs(100);
-        m.rotate(later);
-        assert_eq!(m.retired.iter().map(|r| r.slot).collect::<Vec<u8>>(), [0, 1]);
-        assert_eq!(m.keys().seeded.iter().filter(|k| k.is_some()).count(), 3);
-        assert_eq!(decoded_notices(&m), [(0, false), (1, false), (2, true)]);
+        abw.rotate(later);
+        assert_eq!(abw.retired.iter().map(|r| r.slot).collect::<Vec<u8>>(), [0, 1]);
+        assert_eq!(abw.keys().seeded.iter().filter(|k| k.is_some()).count(), 3);
+        assert_eq!(decoded_notices(&abw), [(0, false), (1, false), (2, true)]);
 
-        let reveals = m.reveals_due(now + AFTER);
+        let reveals = abw.reveals_due(now + AFTER);
         assert_eq!(reveals.iter().map(|r| r.slot).collect::<Vec<_>>(), [0], "slot 1 is younger");
-        assert_eq!(m.retired.iter().map(|r| r.slot).collect::<Vec<u8>>(), [1]);
-        let reveals = m.reveals_due(later + AFTER);
+        assert_eq!(abw.retired.iter().map(|r| r.slot).collect::<Vec<u8>>(), [1]);
+        let reveals = abw.reveals_due(later + AFTER);
         assert_eq!(reveals.iter().map(|r| r.slot).collect::<Vec<_>>(), [1]);
-        assert!(m.retired.iter().map(|r| r.slot).collect::<Vec<u8>>().is_empty());
+        assert!(abw.retired.iter().map(|r| r.slot).collect::<Vec<u8>>().is_empty());
     }
 
     #[test]
     fn a_slot_seeded_again_before_its_reveal_is_revealed_first() {
         let now = Instant::now();
-        let mut m = AbwManager::start(now, AFTER);
-        let key0 = m.keys().seeded[0].unwrap();
+        let mut abw = AbwSlotState::start(now, AFTER);
+        let key0 = abw.keys().seeded[0].unwrap();
         for _ in 0..15 {
-            m.rotate(now);
+            abw.rotate(now);
         }
-        assert_eq!(m.active, 15);
+        assert_eq!(abw.active, 15);
         assert_eq!(
-            m.retired.iter().map(|r| r.slot).collect::<Vec<u8>>(),
+            abw.retired.iter().map(|r| r.slot).collect::<Vec<u8>>(),
             (0..15).collect::<Vec<u8>>()
         );
-        let (reveals, notice) = m.rotate(now);
+        let (reveals, notice) = abw.rotate(now);
         assert_eq!(decoded_reveals(&reveals), [(0, key0)]);
-        assert!(!reveals[0].again);
+        assert!(!reveals[0].resend);
         assert_eq!(Notice::decode(&notice).unwrap().slot, 0);
-        assert_eq!(m.active, 0);
-        assert_ne!(m.keys().seeded[0], Some(key0), "seeded anew");
-        assert!(m.keys().revealed[0].is_none(), "the old key is dropped with the new seed");
+        assert_eq!(abw.active, 0);
+        assert_ne!(abw.keys().seeded[0], Some(key0), "seeded anew");
+        assert!(abw.keys().revealed[0].is_none(), "the old key is dropped with the new seed");
         assert_eq!(
-            m.retired.iter().map(|r| r.slot).collect::<Vec<u8>>(),
+            abw.retired.iter().map(|r| r.slot).collect::<Vec<u8>>(),
             (1..=15).collect::<Vec<u8>>()
         );
     }
@@ -272,70 +282,73 @@ mod tests {
     #[test]
     fn a_resume_answers_replays_before_any_reveal_and_sends_the_reveals_again() {
         let now = Instant::now();
-        let mut m = AbwManager::start(now, AFTER);
-        let key0 = m.keys().seeded[0].unwrap();
-        m.rotate(now);
-        let key1 = m.keys().seeded[1].unwrap();
+        let mut abw = AbwSlotState::start(now, AFTER);
+        let key0 = abw.keys().seeded[0].unwrap();
+        abw.rotate(now);
+        let key1 = abw.keys().seeded[1].unwrap();
         let t1 = now + AFTER;
-        assert_eq!(m.reveals_due(t1).len(), 1, "slot 0 revealed; the gateway may miss it");
-        m.rotate(t1);
-        assert_eq!(m.active, 2);
+        assert_eq!(abw.reveals_due(t1).len(), 1, "slot 0 revealed; the gateway may miss it");
+        abw.rotate(t1);
+        assert_eq!(abw.active, 2);
         let t2 = t1 + Duration::from_secs(170);
-        m.resumed(t2);
-        assert_eq!(m.retired.iter().map(|r| r.slot).collect::<Vec<u8>>(), [1, 0]);
-        assert!(m.reveals_due(t2 + Duration::from_secs(10)).is_empty(), "retired anew");
-        assert_eq!(decoded_notices(&m), [(1, false), (2, true)], "seeded slots only");
-        assert_eq!(m.keys().seeded[1], Some(key1));
-        assert_eq!(m.keys().revealed[0], Some(key0));
-        assert!(m.keys().seeded[0].is_none());
+        abw.resumed(t2);
+        assert_eq!(abw.retired.iter().map(|r| r.slot).collect::<Vec<u8>>(), [1, 0]);
+        assert!(abw.reveals_due(t2 + Duration::from_secs(10)).is_empty(), "retired anew");
+        assert_eq!(decoded_notices(&abw), [(1, false), (2, true)], "seeded slots only");
+        assert_eq!(abw.keys().seeded[1], Some(key1));
+        assert_eq!(abw.keys().revealed[0], Some(key0));
+        assert!(abw.keys().seeded[0].is_none());
 
-        let reveals = m.reveals_due(t2 + AFTER);
+        let reveals = abw.reveals_due(t2 + AFTER);
         assert_eq!(decoded_reveals(&reveals), [(1, key1), (0, key0)]);
-        assert_eq!(reveals.iter().map(|r| r.again).collect::<Vec<_>>(), [false, true]);
-        assert_eq!(m.keys().revealed[0], Some(key0), "kept until the slot is seeded again");
-        assert_eq!(m.keys().revealed[1], Some(key1));
-        assert!(m.retired.iter().map(|r| r.slot).collect::<Vec<u8>>().is_empty());
-        assert_eq!(m.rotation_due(t2 + ROTATE_AFTER - Duration::from_secs(1)), None);
-        assert_eq!(m.rotation_due(t2 + ROTATE_AFTER), Some("slot age"));
+        assert_eq!(reveals.iter().map(|r| r.resend).collect::<Vec<_>>(), [false, true]);
+        assert_eq!(abw.keys().revealed[0], Some(key0), "kept until the slot is seeded again");
+        assert_eq!(abw.keys().revealed[1], Some(key1));
+        assert!(abw.retired.iter().map(|r| r.slot).collect::<Vec<u8>>().is_empty());
+        assert_eq!(abw.rotation_due(t2 + ROTATE_AFTER - Duration::from_secs(1)), None);
+        assert_eq!(abw.rotation_due(t2 + ROTATE_AFTER), Some("slot age"));
     }
 
     #[test]
     fn a_rotation_is_due_by_share_count_or_slot_age() {
         let now = Instant::now();
-        let mut m = AbwManager::start(now, AFTER);
-        assert_eq!(m.rotation_due(now), None);
+        let mut abw = AbwSlotState::start(now, AFTER);
+        assert_eq!(abw.rotation_due(now), None);
         for _ in 0..ROTATE_AFTER_SHARES - 1 {
-            m.note_share();
+            abw.note_share();
         }
-        assert_eq!(m.rotation_due(now), None);
-        m.note_share();
-        assert_eq!(m.rotation_due(now), Some("share count"));
-        m.rotate(now);
-        assert_eq!(m.rotation_due(now), None, "a rotation resets the count");
-        assert_eq!(m.rotation_due(now + ROTATE_AFTER), Some("slot age"));
-        m.rotate(now + ROTATE_AFTER);
-        assert_eq!(m.rotation_due(now + ROTATE_AFTER), None);
+        assert_eq!(abw.rotation_due(now), None);
+        abw.note_share();
+        assert_eq!(abw.rotation_due(now), Some("share count"));
+        abw.rotate(now);
+        assert_eq!(abw.rotation_due(now), None, "a rotation resets the count");
+        assert_eq!(abw.rotation_due(now + ROTATE_AFTER), Some("slot age"));
+        abw.rotate(now + ROTATE_AFTER);
+        assert_eq!(abw.rotation_due(now + ROTATE_AFTER), None);
     }
 
     #[test]
     fn a_tip_rotates_the_assignment_only_once_the_active_slot_is_old_enough() {
         let now = Instant::now();
-        let mut m = AbwManager::start(now, AFTER);
-        assert!(!m.tip_rotation_allowed(now));
-        assert!(!m.tip_rotation_allowed(now + AFTER / 4 - Duration::from_secs(1)));
-        assert!(m.tip_rotation_allowed(now + AFTER / 4));
-        m.rotate(now + AFTER / 4);
-        assert!(!m.tip_rotation_allowed(now + AFTER / 4), "a rotation resets the age");
-        assert!(m.tip_rotation_allowed(now + AFTER / 2));
+        let mut abw = AbwSlotState::start(now, AFTER);
+        assert!(!abw.tip_rotation_allowed(now));
+        assert!(!abw.tip_rotation_allowed(now + AFTER / 4 - Duration::from_secs(1)));
+        assert!(abw.tip_rotation_allowed(now + AFTER / 4));
+        abw.rotate(now + AFTER / 4);
+        assert!(!abw.tip_rotation_allowed(now + AFTER / 4), "a rotation resets the age");
+        assert!(abw.tip_rotation_allowed(now + AFTER / 2));
     }
 
     #[test]
     fn a_receipt_names_the_slot_and_the_reversed_hash() {
-        let hash2: [u8; 32] = std::array::from_fn(|i| i as u8);
-        let c =
-            Candidate::decode(&AbwManager::receipt(3, hash2), subcmd::CANDIDATE_RECEIPT).unwrap();
+        let raw_pow_hash: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let c = AbwShareRef::decode_candidate(
+            &AbwSlotState::receipt(3, raw_pow_hash),
+            subcmd::CANDIDATE_RECEIPT,
+        )
+        .unwrap();
         assert_eq!(c.slot, 3);
-        assert_eq!(c.raw_pow_hash, raw_hash_le(&hash2));
-        assert_eq!(c.raw_pow_hash[0], 31);
+        assert_eq!(c.raw_pow_hash_le, raw_pow_hash_le(&raw_pow_hash));
+        assert_eq!(c.raw_pow_hash_le[0], 31);
     }
 }

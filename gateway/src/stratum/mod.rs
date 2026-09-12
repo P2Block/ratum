@@ -2,12 +2,13 @@ mod connection;
 
 use crate::config::Config;
 use crate::datum;
-use crate::dupes::Dupes;
-use crate::job::{Job, MAX_JOBS};
+use crate::job::Job;
+use crate::seen_shares::SeenShareHashes;
 use crate::tally::Tally;
 use connection::{Connection, Disconnect};
 use log::{debug, info, warn};
 use mio::Waker;
+use ratum::datum::share::MAX_JOBS;
 use std::io;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,28 +17,28 @@ use std::time::{Duration, Instant};
 
 const HASHRATE_WINDOW_VALID: Duration = Duration::from_secs(3 * ratum::SECS_PER_MINUTE);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
-const REJECT_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const DIFF_TO_THS: f64 = ratum::HASHES_PER_DIFFICULTY / ratum::HASHES_PER_TERAHASH;
 
 #[derive(Default)]
 pub struct Jobs {
     pub ring: Vec<Option<Arc<Job>>>,
     pub current: Option<Arc<Job>>,
-    pub empty: bool,
+    pub current_is_empty_work: bool,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct ClientStats {
     pub remote: String,
     pub unique_id: u64,
-    pub useragent: String,
+    pub user_agent: String,
     pub username: String,
     pub subscribed: bool,
     pub subscribed_at: Option<Instant>,
     pub current_diff: u64,
     pub accepted: Tally,
     pub rejected: Tally,
-    pub fee: Tally,
+    pub fee_shares: Tally,
     pub last_accepted: Option<Instant>,
     pub window_diff: u64,
     pub window: Duration,
@@ -55,7 +56,7 @@ impl ClientStats {
 }
 
 pub struct ClientEntry {
-    pub kill: AtomicBool,
+    pub kill_requested: AtomicBool,
     pub stats: Mutex<ClientStats>,
     pub(in crate::stratum) waker: Arc<Waker>,
 }
@@ -68,13 +69,13 @@ impl ClientEntry {
     }
 
     fn request_kill(&self) {
-        self.kill.store(true, Ordering::Relaxed);
+        self.kill_requested.store(true, Ordering::Relaxed);
         self.wake();
     }
 }
 
 #[derive(Default)]
-pub struct ClientSummary {
+pub struct ClientsSummary {
     pub connections: usize,
     pub subscribed: usize,
     pub hashrate_ths: f64,
@@ -82,19 +83,19 @@ pub struct ClientSummary {
 
 pub struct Server {
     pub config: Arc<Config>,
-    pub datum: Arc<datum::Pool>,
+    pub pool: Arc<datum::PoolConnectionState>,
     pub node: ratum::rpc::Client,
-    pub notify: Arc<crate::template::Notify>,
+    pub template_waker: Arc<crate::template::TemplateWaker>,
     pub jobs: Mutex<Jobs>,
     pub(in crate::stratum) generation: AtomicU64,
     pub(in crate::stratum) clients: Mutex<Vec<Arc<ClientEntry>>>,
-    pub(in crate::stratum) dupes: Mutex<Dupes>,
+    pub(in crate::stratum) seen_share_hashes: Mutex<SeenShareHashes>,
     pub(in crate::stratum) next_unique_id: AtomicU64,
-    pub rejecting: AtomicBool,
+    pub refuse_while_pool_unreachable: AtomicBool,
     network_hashps: Mutex<Option<f64>>,
     node_warnings: Mutex<Vec<String>>,
     pub fee_ramp: crate::feeramp::Ramp,
-    pub fee: Mutex<Tally>,
+    pub fee_tally: Mutex<Tally>,
     pub extra_nodes: Vec<ratum::rpc::Client>,
     pub listening: AtomicBool,
 }
@@ -102,9 +103,9 @@ pub struct Server {
 impl Server {
     pub fn new(
         config: Arc<Config>,
-        datum: Arc<datum::Pool>,
+        pool: Arc<datum::PoolConnectionState>,
         node: ratum::rpc::Client,
-        notify: Arc<crate::template::Notify>,
+        template_waker: Arc<crate::template::TemplateWaker>,
     ) -> Arc<Self> {
         let extra_nodes = config
             .extra_block_submissions
@@ -118,31 +119,32 @@ impl Server {
                 c
             })
             .collect();
-        let dupes = Dupes::new(config.dupe_table_capacity(), config.stale_window());
+        let seen_share_hashes =
+            SeenShareHashes::new(config.seen_share_hashes_capacity(), config.stale_window());
         let ramp_window_secs = config.datum.gateway_fee_ramp_window_seconds;
         Arc::new(Self {
             config,
-            datum,
+            pool,
             node,
-            notify,
+            template_waker,
             jobs: Mutex::new(Jobs { ring: vec![None; MAX_JOBS], ..Default::default() }),
             generation: AtomicU64::new(0),
             clients: Mutex::new(Vec::new()),
-            dupes: Mutex::new(dupes),
+            seen_share_hashes: Mutex::new(seen_share_hashes),
             next_unique_id: AtomicU64::new(1),
-            rejecting: AtomicBool::new(false),
+            refuse_while_pool_unreachable: AtomicBool::new(false),
             network_hashps: Mutex::new(None),
             node_warnings: Mutex::new(Vec::new()),
             fee_ramp: crate::feeramp::Ramp::new(ramp_window_secs),
-            fee: Mutex::new(Tally::default()),
+            fee_tally: Mutex::new(Tally::default()),
             extra_nodes,
             listening: AtomicBool::new(false),
         })
     }
 
-    pub fn publish(&self, job: Arc<Job>, empty: bool) {
+    pub fn publish(&self, job: Arc<Job>, empty_work: bool) {
         {
-            let mut slots = ratum::lock(&self.datum.slots);
+            let mut slots = ratum::lock(&self.pool.job_slots);
             let i = job.datum_slot as usize;
             if i < slots.len() {
                 slots[i] = Some(Arc::clone(&job));
@@ -156,7 +158,7 @@ impl Server {
         }
         j.ring[job.global_index as usize] = Some(Arc::clone(&job));
         j.current = Some(job);
-        j.empty = empty;
+        j.current_is_empty_work = empty_work;
         self.generation.fetch_add(1, Ordering::Release);
         drop(j);
         for c in ratum::lock(&self.clients).iter() {
@@ -170,15 +172,15 @@ impl Server {
 
     pub(in crate::stratum) fn current_for_send(&self) -> (Option<Arc<Job>>, bool, u64) {
         let j = ratum::lock(&self.jobs);
-        (j.current.clone(), j.empty, self.generation.load(Ordering::Acquire))
+        (j.current.clone(), j.current_is_empty_work, self.generation.load(Ordering::Acquire))
     }
 
     pub fn connection_count(&self) -> usize {
         ratum::lock(&self.clients).len()
     }
 
-    pub fn summary(&self) -> ClientSummary {
-        let mut s = ClientSummary::default();
+    pub fn summary(&self) -> ClientsSummary {
+        let mut s = ClientsSummary::default();
         for c in ratum::lock(&self.clients).iter() {
             let st = ratum::lock(&c.stats);
             s.connections += 1;
@@ -283,7 +285,7 @@ struct Refusals {
 impl Refusals {
     fn note(&mut self) -> Option<u64> {
         self.count += 1;
-        if self.last_logged.is_none_or(|t| t.elapsed() >= REJECT_LOG_INTERVAL) {
+        if self.last_logged.is_none_or(|t| t.elapsed() >= REFUSAL_LOG_INTERVAL) {
             self.last_logged = Some(Instant::now());
             Some(self.count)
         } else {
@@ -310,7 +312,7 @@ pub fn listen(server: Arc<Server>) -> io::Result<()> {
                 continue;
             }
         };
-        if server.rejecting.load(Ordering::Relaxed) {
+        if server.refuse_while_pool_unreachable.load(Ordering::Relaxed) {
             if let Some(refused) = pool_refusals.note() {
                 warn!(
                     "Refusing stratum connections while the pool is unreachable and datum.pooled_mining_only is set ({refused} refused)"
@@ -361,15 +363,15 @@ pub(in crate::stratum) mod tests {
         let mut config = config();
         edit(&mut config);
         let config = Arc::new(config);
-        let notify = Arc::new(crate::template::Notify::default());
-        let shared = Arc::new(datum::Pool::new(
+        let template_waker = Arc::new(crate::template::TemplateWaker::default());
+        let shared = Arc::new(datum::PoolConnectionState::new(
             config.datum.protocol_job_slots,
             64,
-            Arc::clone(&notify),
+            Arc::clone(&template_waker),
             None,
         ));
         let node = ratum::rpc::Client::new("http://127.0.0.1:1", "u", "p").unwrap();
-        Server::new(config, shared, node, notify)
+        Server::new(config, shared, node, template_waker)
     }
 
     fn add_client(server: &Server, hashrate_ths: f64) -> mio::Poll {
@@ -377,7 +379,7 @@ pub(in crate::stratum) mod tests {
         let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(0)).unwrap());
         let window = Duration::from_secs(1);
         ratum::lock(&server.clients).push(Arc::new(ClientEntry {
-            kill: AtomicBool::new(false),
+            kill_requested: AtomicBool::new(false),
             waker,
             stats: Mutex::new(ClientStats {
                 subscribed: true,
@@ -525,7 +527,7 @@ pub(in crate::stratum) mod tests {
         assert_eq!(refusals.note(), Some(1), "the first refusal is logged");
         assert_eq!(refusals.note(), None, "the second is counted and not logged");
         assert_eq!(refusals.note(), None);
-        refusals.last_logged = Some(Instant::now() - REJECT_LOG_INTERVAL);
+        refusals.last_logged = Some(Instant::now() - REFUSAL_LOG_INTERVAL);
         assert_eq!(refusals.note(), Some(4), "the next interval logs the running total");
         assert_eq!(refusals.note(), None);
     }

@@ -3,11 +3,11 @@ mod api;
 mod coinbase;
 mod config;
 mod datum;
-mod dupes;
 mod feeramp;
 mod job;
 mod logger;
 mod publish;
+mod seen_shares;
 mod settings;
 #[cfg(unix)]
 mod signals;
@@ -43,11 +43,11 @@ struct Cli {
 }
 
 #[derive(Clone)]
-struct Runtime {
+struct SharedHandles {
     config: Arc<Config>,
     node: ratum::rpc::Client,
-    notify: Arc<template::Notify>,
-    pool: Arc<datum::Pool>,
+    template_waker: Arc<template::TemplateWaker>,
+    pool: Arc<datum::PoolConnectionState>,
 }
 
 fn install_panic_exit() {
@@ -90,19 +90,19 @@ fn connect_node(config: &Config) -> ratum::rpc::Client {
     })
 }
 
-fn start_datum(rt: &Runtime) {
+fn start_datum(handles: &SharedHandles) {
     let identity = ratum::datum::handshake::KeyPairs::generate();
     info!(
         "DATUM gateway identity: {}{}",
         hex::encode(identity.sign_pk),
         hex::encode(identity.box_pk)
     );
-    let settings = datum::Settings::from_config(&rt.config);
-    let pool = Arc::clone(&rt.pool);
+    let settings = datum::PoolConnectionSettings::from_config(&handles.config);
+    let pool = Arc::clone(&handles.pool);
     ratum::thread::spawn("datum", move || datum::run_forever(settings, pool, identity));
     let started = Instant::now();
     let mut last_report = 0;
-    while started.elapsed() < POOL_CONNECT_WAIT && !rt.pool.is_active() {
+    while started.elapsed() < POOL_CONNECT_WAIT && !handles.pool.is_active() {
         std::thread::sleep(POOL_CONNECT_POLL);
         let waited = started.elapsed().as_secs();
         if waited != last_report {
@@ -110,7 +110,7 @@ fn start_datum(rt: &Runtime) {
             info!("Waiting for the DATUM pool connection ({waited}s)");
         }
     }
-    if !rt.pool.is_active() && rt.config.datum.pooled_mining_only {
+    if !handles.pool.is_active() && handles.config.datum.pooled_mining_only {
         error!(
             "Could not connect to the DATUM pool within {} seconds; datum.pooled_mining_only is set, so no work is served until it connects",
             POOL_CONNECT_WAIT.as_secs()
@@ -184,25 +184,25 @@ fn spawn_stratum_listener(server: Arc<stratum::Server>) {
 }
 
 fn start_template_thread(
-    rt: &Runtime,
+    handles: &SharedHandles,
     server: Arc<stratum::Server>,
     last_error: Arc<template::LastError>,
 ) {
-    let rt = rt.clone();
+    let handles = handles.clone();
     ratum::thread::spawn("template", move || {
         let publisher = publish::Publisher::new(
-            job::Builder::new(Arc::clone(&rt.config)),
+            job::JobBuilder::new(Arc::clone(&handles.config)),
             Arc::clone(&server),
-            Arc::clone(&rt.pool),
+            Arc::clone(&handles.pool),
         );
         let mut listener_started = false;
-        let (pool, config) = (Arc::clone(&rt.pool), Arc::clone(&rt.config));
+        let (pool, config) = (Arc::clone(&handles.pool), Arc::clone(&handles.config));
         let payout_script =
             move || pool.payout_script().unwrap_or_else(|| config.pool_output_script.clone());
         template::run(
-            rt.node.clone(),
-            Arc::clone(&rt.config),
-            Arc::clone(&rt.notify),
+            handles.node.clone(),
+            Arc::clone(&handles.config),
+            Arc::clone(&handles.template_waker),
             last_error,
             payout_script,
             |t, new_block| {
@@ -249,26 +249,28 @@ fn report_stats(server: &stratum::Server, last: &mut Instant) {
     );
 }
 
-fn enforce_pooled_only(rt: &Runtime, server: &stratum::Server, warned: &mut bool) {
-    let active = rt.pool.is_active();
+fn enforce_pooled_only(handles: &SharedHandles, server: &stratum::Server, warned: &mut bool) {
+    let active = handles.pool.is_active();
     if active {
-        rt.pool.failures.store(0, Ordering::Relaxed);
+        handles.pool.connect_failures.store(0, Ordering::Relaxed);
     }
-    let reject = rt.config.datum.pooled_mining_only && !active;
+    let reject = handles.config.datum.pooled_mining_only && !active;
     if !reject {
         *warned = false;
-    } else if !*warned && rt.pool.failures.load(Ordering::Relaxed) >= FAILURES_BEFORE_SHUTDOWN {
+    } else if !*warned
+        && handles.pool.connect_failures.load(Ordering::Relaxed) >= FAILURES_BEFORE_SHUTDOWN
+    {
         warn!(
             "The DATUM pool is unreachable and datum.pooled_mining_only is set: disconnecting stratum clients until it is reached again"
         );
         server.shutdown_all();
         *warned = true;
     }
-    server.rejecting.store(reject, Ordering::Relaxed);
+    server.refuse_while_pool_unreachable.store(reject, Ordering::Relaxed);
 }
 
-fn watch_loop(rt: &Runtime, server: &stratum::Server) -> ! {
-    let pooled = !rt.config.datum.pool_host.is_empty();
+fn watch_loop(handles: &SharedHandles, server: &stratum::Server) -> ! {
+    let pooled = !handles.config.datum.pool_host.is_empty();
     let started = Instant::now();
     let mut warned = false;
     let mut last_stats = Instant::now();
@@ -278,7 +280,7 @@ fn watch_loop(rt: &Runtime, server: &stratum::Server) -> ! {
         report_missing_job(server, started, &mut last_no_job_report);
         report_stats(server, &mut last_stats);
         if pooled {
-            enforce_pooled_only(rt, server, &mut warned);
+            enforce_pooled_only(handles, server, &mut warned);
         }
     }
 }
@@ -291,7 +293,7 @@ fn main() {
         std::process::exit(1);
     });
     info!("ratum-gateway {} starting", ratum::VERSION);
-    for (level, message) in notes.iter().chain(&config.warnings) {
+    for (level, message) in notes.iter().chain(&config.startup_notes) {
         log::log!(*level, "{message}");
     }
     install_panic_exit();
@@ -306,35 +308,37 @@ fn main() {
         );
     }
 
-    let notify = Arc::new(template::Notify::default());
-    let pool = Arc::new(datum::Pool::new(
+    let template_waker = Arc::new(template::TemplateWaker::default());
+    let pool = Arc::new(datum::PoolConnectionState::new(
         config.datum.protocol_job_slots,
         config.share_queue_capacity(),
-        Arc::clone(&notify),
+        Arc::clone(&template_waker),
         Some(node.clone()),
     ));
     #[cfg(unix)]
-    signals::install(Arc::clone(&notify));
-    let rt = Runtime { config, node, notify, pool };
-    if rt.config.datum.pool_host.is_empty() {
+    signals::install(Arc::clone(&template_waker));
+    let handles = SharedHandles { config, node, template_waker, pool };
+    if handles.config.datum.pool_host.is_empty() {
         info!("NON-POOLED MINING: datum.pool_host is empty; every block pays mining.pool_address");
     } else {
-        start_datum(&rt);
+        start_datum(&handles);
     }
 
     let server = stratum::Server::new(
-        Arc::clone(&rt.config),
-        Arc::clone(&rt.pool),
-        rt.node.clone(),
-        Arc::clone(&rt.notify),
+        Arc::clone(&handles.config),
+        Arc::clone(&handles.pool),
+        handles.node.clone(),
+        Arc::clone(&handles.template_waker),
     );
     let template_error: Arc<template::LastError> = Arc::default();
 
-    start_node_info_thread(rt.node.clone(), Arc::clone(&server));
+    start_node_info_thread(handles.node.clone(), Arc::clone(&server));
 
-    if rt.config.bitcoind.notify_fallback {
-        let (node, notify) = (rt.node.clone(), Arc::clone(&rt.notify));
-        ratum::thread::spawn("notify-fallback", move || template::fallback_notifier(node, notify));
+    if handles.config.bitcoind.notify_fallback {
+        let (node, template_waker) = (handles.node.clone(), Arc::clone(&handles.template_waker));
+        ratum::thread::spawn("notify-fallback", move || {
+            template::fallback_notifier(node, template_waker)
+        });
     }
 
     api::start(Arc::new(api::Context {
@@ -343,8 +347,8 @@ fn main() {
         started: Instant::now(),
         csrf: api::csrf_token(),
         config_path: cli.config,
-        history: Mutex::default(),
+        hashrate_history: Mutex::default(),
     }));
-    start_template_thread(&rt, Arc::clone(&server), template_error);
-    watch_loop(&rt, &server)
+    start_template_thread(&handles, Arc::clone(&server), template_error);
+    watch_loop(&handles, &server)
 }

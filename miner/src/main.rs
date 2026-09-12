@@ -1,4 +1,4 @@
-use ratum::datum::share::{self, EXTRANONCE_SIZE_V2, SIA_FIELD_SIZE};
+use ratum::datum::share::{self, HEADER_EXTRANONCE_SIZE, SIA_FIELD_SIZE};
 use ratum::header::blake2b_256;
 use ratum::target;
 use std::io::{BufRead, BufReader, Write};
@@ -6,19 +6,18 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-const HEADER_LEN: usize = 80;
+const WORK_HEADER_LEN: usize = ratum::header::ASIC_INPUT_LEN[0];
 const HEADER_PREVBLOCK_HIDDEN_AT: usize = 0;
 const HEADER_NONCE_AT: usize = 32;
 const HEADER_NTIME_AT: usize = HEADER_NONCE_AT + SIA_FIELD_SIZE;
 const HEADER_ROOT_AT: usize = HEADER_NTIME_AT + SIA_FIELD_SIZE;
-const EXTRANONCE_LEN: usize = EXTRANONCE_SIZE_V2;
 const SUBMIT_ID_BASE: u64 = 100;
 const WORK_ROOT_LEAF_PREFIX: u8 = 0x00;
 
 #[derive(Clone)]
 struct Job {
     job_id: String,
-    prevhash: [u8; 32],
+    prevblock_hidden: [u8; 32],
     coinb1: Vec<u8>,
     coinb2: Vec<u8>,
     ntime: [u8; SIA_FIELD_SIZE],
@@ -26,7 +25,7 @@ struct Job {
 }
 
 #[derive(Default)]
-struct Work {
+struct MinerState {
     extranonce1: Vec<u8>,
     extranonce2_size: usize,
     difficulty: f64,
@@ -35,7 +34,7 @@ struct Work {
     closed: bool,
 }
 
-impl Work {
+impl MinerState {
     fn has_work_after(&self, last_generation: u64) -> bool {
         self.generation > last_generation && self.job.is_some() && self.extranonce2_size != 0
     }
@@ -57,7 +56,7 @@ enum Outcome {
 }
 
 fn mine(
-    header: &[u8; HEADER_LEN],
+    header: &[u8; WORK_HEADER_LEN],
     target: &target::Target,
     generation: &AtomicU64,
     job_generation: u64,
@@ -72,7 +71,7 @@ fn mine(
 
 fn read_messages(
     stream: TcpStream,
-    state: Arc<(Mutex<Work>, Condvar)>,
+    state: Arc<(Mutex<MinerState>, Condvar)>,
     generation: Arc<AtomicU64>,
 ) {
     let (lock, waiting) = &*state;
@@ -100,9 +99,9 @@ fn read_messages(
                 hex::encode(&extranonce1),
                 extranonce1.len()
             );
-            if extranonce1.len() + extranonce2_size != EXTRANONCE_LEN {
+            if extranonce1.len() + extranonce2_size != HEADER_EXTRANONCE_SIZE {
                 println!(
-                    "!! extranonce1 plus extranonce2_size totals {}B, not {EXTRANONCE_LEN}",
+                    "!! extranonce1 plus extranonce2_size totals {}B, not {HEADER_EXTRANONCE_SIZE}",
                     extranonce1.len() + extranonce2_size
                 );
             }
@@ -123,15 +122,18 @@ fn read_messages(
                 let prev = hex::decode(p[1].as_str().unwrap_or_default()).unwrap_or_default();
                 let ntime_hex = p[7].as_str().unwrap_or_default().to_string();
                 let ntime_raw = hex::decode(&ntime_hex).unwrap_or_default();
-                let (Ok(prevhash), Ok(ntime)) =
+                let (Ok(prevblock_hidden), Ok(ntime)) =
                     (<[u8; 32]>::try_from(prev), <[u8; SIA_FIELD_SIZE]>::try_from(ntime_raw))
                 else {
-                    println!("!! notify has a {}-char ntime or a bad prevhash", ntime_hex.len());
+                    println!(
+                        "!! notify has a {}-char ntime or a bad prevblock_hidden",
+                        ntime_hex.len()
+                    );
                     continue;
                 };
                 let job = Job {
                     job_id: p[0].as_str().unwrap_or_default().to_string(),
-                    prevhash,
+                    prevblock_hidden,
                     coinb1: hex::decode(p[2].as_str().unwrap_or_default()).unwrap_or_default(),
                     coinb2: hex::decode(p[3].as_str().unwrap_or_default()).unwrap_or_default(),
                     ntime,
@@ -141,7 +143,7 @@ fn read_messages(
                 println!(
                     "job {} prev={} coinb1={}B coinb2={}B branches={branches}",
                     job.job_id,
-                    &hex::encode(job.prevhash)[..16],
+                    &hex::encode(job.prevblock_hidden)[..16],
                     job.coinb1.len(),
                     job.coinb2.len(),
                 );
@@ -181,7 +183,10 @@ fn main() -> std::io::Result<()> {
     writeln!(w, r#"{{"id":"2","method":"mining.authorize","params":["{user}","x"]}}"#)?;
     w.flush()?;
 
-    let state = Arc::new((Mutex::new(Work { difficulty: 1.0, ..Work::default() }), Condvar::new()));
+    let state = Arc::new((
+        Mutex::new(MinerState { difficulty: 1.0, ..MinerState::default() }),
+        Condvar::new(),
+    ));
     let generation = Arc::new(AtomicU64::new(0));
     let reader = {
         let state = Arc::clone(&state);
@@ -215,12 +220,12 @@ fn main() -> std::io::Result<()> {
         let extranonce2 = vec![0x42u8; extranonce2_size];
         let mut extranonce = extranonce1;
         extranonce.extend_from_slice(&extranonce2);
-        let hash1 = leaf(&job.coinb1, &extranonce, &job.coinb2);
+        let work_root = leaf(&job.coinb1, &extranonce, &job.coinb2);
 
-        let mut header = [0u8; HEADER_LEN];
-        header[HEADER_PREVBLOCK_HIDDEN_AT..HEADER_NONCE_AT].copy_from_slice(&job.prevhash);
+        let mut header = [0u8; WORK_HEADER_LEN];
+        header[HEADER_PREVBLOCK_HIDDEN_AT..HEADER_NONCE_AT].copy_from_slice(&job.prevblock_hidden);
         header[HEADER_NTIME_AT..HEADER_ROOT_AT].copy_from_slice(&job.ntime);
-        header[HEADER_ROOT_AT..].copy_from_slice(&hash1);
+        header[HEADER_ROOT_AT..].copy_from_slice(&work_root);
 
         let t = target::target_for_difficulty(difficulty);
         println!("mining job {} at difficulty {difficulty}...", job.job_id);

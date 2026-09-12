@@ -87,7 +87,7 @@ pub struct Tip {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NextBlock {
+pub struct TemplateSummary {
     pub coinbase_value: u64,
     pub bits: u32,
 }
@@ -273,7 +273,7 @@ impl Client {
         self.call("getblocktemplate", serde_json::json!([{"rules": TEMPLATE_RULES}]))
     }
 
-    pub fn next_block(&self) -> Result<NextBlock, Error> {
+    pub fn template_summary(&self) -> Result<TemplateSummary, Error> {
         let result = self.block_template()?;
         let coinbase_value = result["coinbasevalue"]
             .as_u64()
@@ -282,7 +282,7 @@ impl Client {
             result["bits"].as_str().ok_or_else(|| Error::BadResponse("no bits".into()))?;
         let bits = u32::from_str_radix(bits_hex, 16)
             .map_err(|_| Error::BadResponse(format!("bits {bits_hex:?}")))?;
-        Ok(NextBlock { coinbase_value, bits })
+        Ok(TemplateSummary { coinbase_value, bits })
     }
 
     pub fn mining_info(&self) -> Result<MiningInfo, Error> {

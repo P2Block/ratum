@@ -1,13 +1,14 @@
 use crate::server::{Server, dictated_outputs};
 use log::{error, info, warn};
-use ratum::datum::messages::{CoinbaseOutput, CoinbaserResponse};
+use ratum::bitcoin::TxOut;
+use ratum::datum::messages::CoinbaserResponse;
 use ratum::lock;
 use std::io;
 use std::net::SocketAddr;
 
 const COINBASE_VALUE_TOLERANCE: f64 = 2.0;
 
-pub(crate) struct Split {
+pub(crate) struct DictatedSplitReply {
     pub(crate) response: CoinbaserResponse,
     pub(crate) identities: Vec<String>,
     pub(crate) payload: Vec<u8>,
@@ -39,10 +40,10 @@ pub(crate) fn dictate(
     peer: SocketAddr,
     value: u64,
     coinbaser_id: u8,
-) -> io::Result<Split> {
+) -> io::Result<DictatedSplitReply> {
     let (dictated, shares, work) = dictated_outputs(server, value);
     let paid: u64 = dictated.iter().map(|(_, o)| o.value).sum();
-    let outputs: Vec<CoinbaseOutput> = dictated.iter().map(|(_, o)| o.clone()).collect();
+    let outputs: Vec<TxOut> = dictated.iter().map(|(_, o)| o.clone()).collect();
     info!(
         "[{peer}]      paying {} miners {paid} of {value} sats from a window of {shares} \
          shares ({work} work)",
@@ -56,7 +57,7 @@ pub(crate) fn dictate(
     }
     let payload = encode_shrinking(server, peer, &mut response)?;
     let identities = identities_of(&response, &dictated);
-    Ok(Split { response, identities, payload })
+    Ok(DictatedSplitReply { response, identities, payload })
 }
 
 fn encode_shrinking(
@@ -76,9 +77,9 @@ fn encode_shrinking(
             }
             Err(e) => {
                 error!("[{peer}]      could not build the split ({e}); paying the pool");
-                response.outputs = vec![CoinbaseOutput {
+                response.outputs = vec![TxOut {
                     value: response.value,
-                    script: server.policy.payout_script.clone(),
+                    script_pubkey: server.share_policy.payout_script.clone(),
                 }];
                 return response.encode().map_err(|e| io::Error::other(e.to_string()));
             }
@@ -86,17 +87,14 @@ fn encode_shrinking(
     }
 }
 
-fn identities_of(
-    response: &CoinbaserResponse,
-    dictated: &[(String, CoinbaseOutput)],
-) -> Vec<String> {
+fn identities_of(response: &CoinbaserResponse, dictated: &[(String, TxOut)]) -> Vec<String> {
     let mut rest = dictated.iter();
     response
         .outputs
         .iter()
         .map(|o| {
             rest.by_ref()
-                .find(|(_, d)| d.value == o.value && d.script == o.script)
+                .find(|(_, d)| d.value == o.value && d.script_pubkey == o.script_pubkey)
                 .map_or_else(String::new, |(identity, _)| identity.clone())
         })
         .collect()

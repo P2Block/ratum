@@ -1,13 +1,13 @@
-use crate::abw::AbwManager;
+use crate::abw::AbwSlotState;
 use log::{debug, error, info, warn};
 use mio::Waker;
-use ratum::bitcoin::output_script_size_is_valid;
+use ratum::bitcoin::{TxOut, output_script_size_is_valid};
 use ratum::datum::handshake::KeyPairs;
-use ratum::datum::messages::{self, CoinbaseOutput};
+use ratum::datum::messages;
 use ratum::{lock, rpc};
 use ratum_prime::bounded::BoundedMap;
 use ratum_prime::ledger::{Ledger, OwedBlock};
-use ratum_prime::verify::{PoolPolicy, ReplayGuard, Splits};
+use ratum_prime::verify::{AcceptedShareHashes, SharePolicy, Splits};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,7 +42,7 @@ impl NodeView {
             "node tip: height {} difficulty {} {} (chain {})",
             t.height,
             t.difficulty,
-            ratum::header::u256_to_display_hex(&t.hash),
+            ratum::header::hash_to_display_hex(&t.hash),
             t.chain.name()
         );
         let mut history = lock(&self.tip_history);
@@ -98,8 +98,8 @@ fn refresh_mining_info(node: &rpc::Client, view: &NodeView) {
     *held = info.warnings;
 }
 
-fn refresh_next_block(node: &rpc::Client, view: &NodeView) -> bool {
-    match node.next_block() {
+fn refresh_template_summary(node: &rpc::Client, view: &NodeView) -> bool {
+    match node.template_summary() {
         Ok(n) => {
             info!(
                 "node template: the next coinbase may pay {} sats at bits {:#010x}",
@@ -144,7 +144,7 @@ pub(crate) fn watch_node(
                     have_template = false;
                 }
                 if !have_template {
-                    have_template = refresh_next_block(&node, &view);
+                    have_template = refresh_template_summary(&node, &view);
                 }
                 *lock(&view.tip) = Some(t);
                 if tip_changed || *lock(&view.next_bits) != previous_bits {
@@ -199,16 +199,16 @@ pub(crate) struct Server {
     pub(crate) abw_reveal_after: Duration,
     pub(crate) node: rpc::Client,
     pub(crate) node_view: Arc<NodeView>,
-    pub(crate) replay: Arc<Mutex<ReplayGuard>>,
+    pub(crate) accepted_hashes: Arc<Mutex<AcceptedShareHashes>>,
     pub(crate) ledger: Mutex<Ledger>,
-    pub(crate) resolver: Mutex<Resolver>,
-    pub(crate) payout: PayoutPolicy,
-    pub(crate) policy: PoolPolicy,
+    pub(crate) resolver: Mutex<AddressResolver>,
+    pub(crate) payout_policy: PayoutPolicy,
+    pub(crate) share_policy: SharePolicy,
     pub(crate) config_payload: Vec<u8>,
     pub(crate) open_connections: AtomicUsize,
     pub(crate) max_connections: usize,
     pub(crate) datum_port: u16,
-    pub(crate) advertise: Option<String>,
+    pub(crate) advertise_address: Option<String>,
     pub(crate) public_gateway: Option<String>,
 }
 
@@ -253,11 +253,11 @@ impl SessionStore {
 impl Server {
     pub(crate) fn config_payload_v3(&self, token: &messages::ResumeToken) -> Vec<u8> {
         messages::ClientConfigV3 {
-            payout_script: self.policy.payout_script.clone(),
-            prime_id: self.policy.prime_id,
+            payout_script: self.share_policy.payout_script.clone(),
+            prime_id: self.share_policy.prime_id,
             resume_token: *token,
-            coinbase_tag: self.policy.coinbase_tag.clone(),
-            min_difficulty: self.policy.min_difficulty,
+            coinbase_tag: self.share_policy.coinbase_tag.clone(),
+            min_difficulty: self.share_policy.min_difficulty,
             bulk_framing: true,
             abw_disabled: false,
         }
@@ -267,11 +267,11 @@ impl Server {
 
     pub(crate) fn resume_or_start(
         &self,
-        client_key: [u8; 32],
+        client_sign_pk: [u8; 32],
         presented: Option<&messages::ResumeToken>,
         now: Instant,
     ) -> (SessionState, bool) {
-        let saved = lock(&self.sessions).take(&client_key);
+        let saved = lock(&self.sessions).take(&client_sign_pk);
         if let (Some(presented), Some(saved)) = (presented, saved)
             && !saved.expired(now)
             && saved.state.token == *presented
@@ -281,8 +281,8 @@ impl Server {
             return (state, true);
         }
         let state = SessionState {
-            token: messages::new_resume_token(self.policy.prime_id),
-            abw: AbwManager::start(now, self.abw_reveal_after),
+            token: messages::new_resume_token(self.share_policy.prime_id),
+            abw: AbwSlotState::start(now, self.abw_reveal_after),
             splits: HashMap::new(),
             coinbaser_id: 0,
         };
@@ -292,7 +292,7 @@ impl Server {
 
 pub(crate) struct SessionState {
     pub(crate) token: messages::ResumeToken,
-    pub(crate) abw: AbwManager,
+    pub(crate) abw: AbwSlotState,
     pub(crate) splits: Splits,
     pub(crate) coinbaser_id: u8,
 }
@@ -328,7 +328,7 @@ pub(crate) fn split_after_fee(l: &Ledger, payout: &PayoutPolicy, value: u64) -> 
     l.split(payout.miners_share(value), payout.min_payout, messages::MAX_COINBASER_OUTPUTS)
 }
 
-pub(crate) struct Resolver {
+pub(crate) struct AddressResolver {
     scripts: BoundedMap<String, Result<Vec<u8>, Unpayable>>,
 }
 
@@ -356,10 +356,10 @@ impl std::fmt::Display for Unpayable {
 pub(crate) enum Payability {
     Script(Vec<u8>),
     Unpayable(Unpayable),
-    Unknown,
+    Unknown(rpc::Error),
 }
 
-impl Resolver {
+impl AddressResolver {
     pub(crate) fn new() -> Self {
         Self { scripts: BoundedMap::new(MAX_CACHED_ADDRESSES) }
     }
@@ -377,10 +377,11 @@ impl Resolver {
             return known.into();
         }
         let resolved = match resolve_address(node, address) {
-            Ok(r) => classify(r),
-            Err(e) => {
+            Payability::Script(script) => Ok(script),
+            Payability::Unpayable(why) => Err(why),
+            Payability::Unknown(e) => {
                 warn!("could not resolve payout address {address:?}: {e}");
-                return Payability::Unknown;
+                return Payability::Unknown(e);
             }
         };
         if let Err(why) = &resolved {
@@ -400,32 +401,26 @@ impl From<Result<Vec<u8>, Unpayable>> for Payability {
     }
 }
 
-fn classify(resolved: Resolved) -> Result<Vec<u8>, Unpayable> {
-    match resolved {
-        Resolved::Script(script) if !output_script_size_is_valid(&script) => {
-            Err(Unpayable::ScriptTooLong(script.len()))
-        }
-        Resolved::Script(script) => Ok(script),
-        Resolved::Invalid => Err(Unpayable::NotAnAddress),
-        Resolved::NoScript => Err(Unpayable::NoScript),
+pub(crate) fn payable_script(script: Vec<u8>) -> Result<Vec<u8>, Unpayable> {
+    if output_script_size_is_valid(&script) {
+        Ok(script)
+    } else {
+        Err(Unpayable::ScriptTooLong(script.len()))
     }
 }
 
-pub(crate) enum Resolved {
-    Script(Vec<u8>),
-    Invalid,
-    NoScript,
-}
-
-pub(crate) fn resolve_address(node: &rpc::Client, address: &str) -> Result<Resolved, rpc::Error> {
-    let v = node.call("validateaddress", serde_json::json!([address]))?;
+pub(crate) fn resolve_address(node: &rpc::Client, address: &str) -> Payability {
+    let v = match node.call("validateaddress", serde_json::json!([address])) {
+        Ok(v) => v,
+        Err(e) => return Payability::Unknown(e),
+    };
     if v["isvalid"] != serde_json::Value::Bool(true) {
-        return Ok(Resolved::Invalid);
+        return Payability::Unpayable(Unpayable::NotAnAddress);
     }
-    Ok(match v["scriptPubKey"].as_str().and_then(|h| hex::decode(h).ok()) {
-        Some(script) => Resolved::Script(script),
-        None => Resolved::NoScript,
-    })
+    match v["scriptPubKey"].as_str().and_then(|h| hex::decode(h).ok()) {
+        Some(script) => payable_script(script).into(),
+        None => Payability::Unpayable(Unpayable::NoScript),
+    }
 }
 
 fn payable_entries(
@@ -435,13 +430,13 @@ fn payable_entries(
 ) -> Vec<(String, u64, Vec<u8>)> {
     let mut kept = Vec::with_capacity(split.len());
     for (identity, sats) in split {
-        match Resolver::payability(&server.resolver, &server.node, &identity) {
+        match AddressResolver::payability(&server.resolver, &server.node, &identity) {
             Payability::Script(script) => kept.push((identity, sats, script)),
             Payability::Unpayable(why) => warn!(
                 "      {identity} cannot be paid ({why}); its {sats} sats are left out of \
                  {left_out} and stay with the pool"
             ),
-            Payability::Unknown => warn!(
+            Payability::Unknown(_) => warn!(
                 "      {identity} could not be resolved; its {sats} sats are left out of \
                  {left_out} and stay with the pool"
             ),
@@ -450,17 +445,14 @@ fn payable_entries(
     kept
 }
 
-pub(crate) fn dictated_outputs(
-    server: &Server,
-    value: u64,
-) -> (Vec<(String, CoinbaseOutput)>, usize, u128) {
+pub(crate) fn dictated_outputs(server: &Server, value: u64) -> (Vec<(String, TxOut)>, usize, u128) {
     let (split, shares, work) = {
         let l = lock(&server.ledger);
-        (split_after_fee(&l, &server.payout, value), l.len(), l.total_work())
+        (split_after_fee(&l, &server.payout_policy, value), l.len(), l.total_work())
     };
     let outputs = payable_entries(server, split, "the dictated outputs")
         .into_iter()
-        .map(|(identity, value, script)| (identity, CoinbaseOutput { value, script }))
+        .map(|(identity, value, script)| (identity, TxOut { value, script_pubkey: script }))
         .collect();
     (outputs, shares, work)
 }
@@ -472,7 +464,7 @@ pub(crate) fn owed_for_block(
     value: u64,
     at: u64,
 ) -> Option<OwedBlock> {
-    let split = split_after_fee(&lock(&server.ledger), &server.payout, value);
+    let split = split_after_fee(&lock(&server.ledger), &server.payout_policy, value);
     let entries: Vec<(String, u64)> = payable_entries(server, split, "the owed record")
         .into_iter()
         .map(|(identity, sats, _)| (identity, sats))
@@ -488,11 +480,12 @@ pub(crate) fn owed_for_block(
 mod tests {
     use super::*;
 
-    fn coinbaser_outputs(server: &Server, value: u64) -> (Vec<CoinbaseOutput>, usize, u128) {
+    fn coinbaser_outputs(server: &Server, value: u64) -> (Vec<TxOut>, usize, u128) {
         let (dictated, shares, work) = dictated_outputs(server, value);
         (dictated.into_iter().map(|(_, o)| o).collect(), shares, work)
     }
     use ratum::datum::messages::ClientConfig;
+    use ratum::fixtures::p2wpkh;
 
     fn server_with(
         shares: &[(&str, u64)],
@@ -514,7 +507,7 @@ mod tests {
             hash[0] = i as u8;
             ledger.record(1_000 + i as u64, identity, *difficulty, &hash, "").unwrap();
         }
-        let mut resolver = Resolver::new();
+        let mut resolver = AddressResolver::new();
         for (address, script) in resolved {
             resolver.remember(address, script.clone());
         }
@@ -533,26 +526,26 @@ mod tests {
             abw_reveal_after: crate::abw::DEFAULT_REVEAL_AFTER,
             node: rpc::Client::new("http://127.0.0.1:1", "u", "p").unwrap(),
             node_view: Arc::new(NodeView::default()),
-            replay: Arc::new(Mutex::new(ReplayGuard::default())),
+            accepted_hashes: Arc::new(Mutex::new(AcceptedShareHashes::default())),
             ledger: Mutex::new(ledger),
             resolver: Mutex::new(resolver),
-            payout: PayoutPolicy { min_payout, window_multiple: 8.0, window_floor: 1, fee_bps },
+            payout_policy: PayoutPolicy {
+                min_payout,
+                window_multiple: 8.0,
+                window_floor: 1,
+                fee_bps,
+            },
             config_payload: config.encode().unwrap(),
-            policy: PoolPolicy::from_config(&config),
+            share_policy: SharePolicy::from_config(&config),
             open_connections: AtomicUsize::new(0),
             max_connections: 8,
             datum_port: 28915,
-            advertise: None,
+            advertise_address: None,
             public_gateway: None,
         }
     }
 
     const POOL: [u8; 4] = [0x00, 0x14, 0xee, 0xee];
-    fn p2wpkh(fill: u8) -> Vec<u8> {
-        let mut v = vec![0x00, 0x14];
-        v.extend_from_slice(&[fill; 20]);
-        v
-    }
 
     #[test]
     fn a_saved_session_is_resumed_once_by_its_token() {
@@ -560,9 +553,9 @@ mod tests {
         let key = [7u8; 32];
         let now = Instant::now();
         let token = messages::new_resume_token(1);
-        let abw = AbwManager::start(now, crate::abw::DEFAULT_REVEAL_AFTER);
-        let hash0 = ratum::datum::abw::xor_key_hash(&abw.keys().seeded[0].unwrap());
-        let split = vec![messages::CoinbaseOutput { value: 5, script: vec![0x51] }];
+        let abw = AbwSlotState::start(now, crate::abw::DEFAULT_REVEAL_AFTER);
+        let hash0 = ratum::header::xor_key_hash(&abw.keys().seeded[0].unwrap());
+        let split = vec![TxOut { value: 5, script_pubkey: vec![0x51] }];
         let mut splits = HashMap::new();
         splits.insert(
             7u8,
@@ -578,7 +571,7 @@ mod tests {
         let (state, resumed) = server.resume_or_start(key, Some(&token), now);
         assert!(resumed);
         assert_eq!(state.token, token);
-        assert_eq!(ratum::datum::abw::xor_key_hash(&state.abw.keys().seeded[0].unwrap()), hash0);
+        assert_eq!(ratum::header::xor_key_hash(&state.abw.keys().seeded[0].unwrap()), hash0);
         assert_eq!(
             state.splits.get(&7).map(|d| &d.outputs),
             Some(&split),
@@ -602,7 +595,7 @@ mod tests {
         let now = Instant::now();
         let token = messages::new_resume_token(1);
         let save = |server: &Server, saved_at: Instant| {
-            let abw = AbwManager::start(now, crate::abw::DEFAULT_REVEAL_AFTER);
+            let abw = AbwSlotState::start(now, crate::abw::DEFAULT_REVEAL_AFTER);
             lock(&server.sessions).save(key, saved(token, abw, saved_at, now));
         };
 
@@ -629,7 +622,7 @@ mod tests {
 
     fn saved(
         token: messages::ResumeToken,
-        abw: AbwManager,
+        abw: AbwSlotState,
         saved_at: Instant,
         held_since: Instant,
     ) -> SavedSession {
@@ -645,7 +638,7 @@ mod tests {
         for i in 0..=MAX_SAVED_SESSIONS {
             let mut key = [0u8; 32];
             key[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            let abw = AbwManager::start(now, crate::abw::DEFAULT_REVEAL_AFTER);
+            let abw = AbwSlotState::start(now, crate::abw::DEFAULT_REVEAL_AFTER);
             store.save(key, saved(token, abw, now, now));
         }
         assert_eq!(store.0.len(), MAX_SAVED_SESSIONS);
@@ -656,7 +649,7 @@ mod tests {
         assert_eq!(store.0.len(), MAX_SAVED_SESSIONS - 1);
         let mut second = [0u8; 32];
         second[..8].copy_from_slice(&1u64.to_le_bytes());
-        let abw = AbwManager::start(now, crate::abw::DEFAULT_REVEAL_AFTER);
+        let abw = AbwSlotState::start(now, crate::abw::DEFAULT_REVEAL_AFTER);
         store.save(second, saved(token, abw, now, now));
         assert_eq!(store.0.len(), MAX_SAVED_SESSIONS - 1);
         assert_eq!(store.0.order().back(), Some(&second));
@@ -667,10 +660,10 @@ mod tests {
         let mut store = SessionStore::default();
         let t0 = Instant::now();
         let token = messages::new_resume_token(1);
-        let abw = AbwManager::start(t0, crate::abw::DEFAULT_REVEAL_AFTER);
+        let abw = AbwSlotState::start(t0, crate::abw::DEFAULT_REVEAL_AFTER);
         store.save([1u8; 32], saved(token, abw, t0, t0));
         let later = t0 + SESSION_KEEP + Duration::from_secs(1);
-        let abw = AbwManager::start(later, crate::abw::DEFAULT_REVEAL_AFTER);
+        let abw = AbwSlotState::start(later, crate::abw::DEFAULT_REVEAL_AFTER);
         store.save([2u8; 32], saved(token, abw, later, later));
         assert_eq!(store.0.len(), 1, "the expired entry is gone");
         assert!(store.take(&[1u8; 32]).is_none());
@@ -687,7 +680,7 @@ mod tests {
         let later = messages::new_resume_token(1);
         let earlier = messages::new_resume_token(1);
         let session = |token, held_since| {
-            let abw = AbwManager::start(t0, crate::abw::DEFAULT_REVEAL_AFTER);
+            let abw = AbwSlotState::start(t0, crate::abw::DEFAULT_REVEAL_AFTER);
             saved(token, abw, t1 + Duration::from_secs(1), held_since)
         };
         store.save(key, session(later, t1));
@@ -714,11 +707,11 @@ mod tests {
         assert_eq!(shares, 2);
         assert_eq!(work, 4);
         assert_eq!(
-            outputs.iter().map(|o| (o.value, o.script.clone())).collect::<Vec<_>>(),
+            outputs.iter().map(|o| (o.value, o.script_pubkey.clone())).collect::<Vec<_>>(),
             vec![(750_000, p2wpkh(0xa1)), (250_000, p2wpkh(0xb2))]
         );
         assert_eq!(outputs.iter().map(|o| o.value).sum::<u64>(), 1_000_000);
-        assert!(outputs.iter().all(|o| o.script != POOL));
+        assert!(outputs.iter().all(|o| o.script_pubkey != POOL));
     }
 
     #[test]
@@ -731,13 +724,13 @@ mod tests {
         );
         let (outputs, _, _) = coinbaser_outputs(&server, 1_000_000);
         assert_eq!(
-            outputs.iter().map(|o| (o.value, o.script.clone())).collect::<Vec<_>>(),
+            outputs.iter().map(|o| (o.value, o.script_pubkey.clone())).collect::<Vec<_>>(),
             vec![(742_500, p2wpkh(0xa1)), (247_500, p2wpkh(0xb2))]
         );
         let paid: u64 = outputs.iter().map(|o| o.value).sum();
         assert_eq!(paid, 990_000);
         assert_eq!(1_000_000 - paid, 10_000);
-        assert!(outputs.iter().all(|o| o.script != POOL));
+        assert!(outputs.iter().all(|o| o.script_pubkey != POOL));
     }
 
     #[test]
@@ -771,7 +764,7 @@ mod tests {
         );
         let (outputs, _, _) = coinbaser_outputs(&server, 1_000_000);
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].script, p2wpkh(0xa1));
+        assert_eq!(outputs[0].script_pubkey, p2wpkh(0xa1));
         assert_eq!(outputs[0].value, 750_000);
         assert_eq!(1_000_000 - outputs[0].value, 250_000);
     }
@@ -780,7 +773,7 @@ mod tests {
     fn a_script_too_long_to_pay_is_left_out_rather_than_sent() {
         let long = vec![0x00; 35];
         assert!(!output_script_size_is_valid(&long));
-        assert_eq!(classify(Resolved::Script(long)), Err(Unpayable::ScriptTooLong(35)));
+        assert_eq!(payable_script(long), Err(Unpayable::ScriptTooLong(35)));
         let server = server_with(
             &[("alice", 3), ("toolong", 1)],
             &[("alice", Ok(p2wpkh(0xa1))), ("toolong", Err(Unpayable::ScriptTooLong(35)))],
@@ -788,18 +781,16 @@ mod tests {
         );
         let (outputs, _, _) = coinbaser_outputs(&server, 1_000_000);
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].script, p2wpkh(0xa1));
+        assert_eq!(outputs[0].script_pubkey, p2wpkh(0xa1));
     }
 
     #[test]
-    fn classify_sorts_what_the_node_returns() {
-        assert_eq!(classify(Resolved::Invalid), Err(Unpayable::NotAnAddress));
-        assert_eq!(classify(Resolved::NoScript), Err(Unpayable::NoScript));
-        assert_eq!(classify(Resolved::Script(p2wpkh(0xa1))), Ok(p2wpkh(0xa1)));
-        assert_eq!(classify(Resolved::Script(vec![0x00; 42])), Err(Unpayable::ScriptTooLong(42)));
-        assert!(classify(Resolved::Script(vec![ratum::bitcoin::opcode::OP_RETURN; 83])).is_ok());
+    fn a_payable_script_fits_a_coinbase_output() {
+        assert_eq!(payable_script(p2wpkh(0xa1)), Ok(p2wpkh(0xa1)));
+        assert_eq!(payable_script(vec![0x00; 42]), Err(Unpayable::ScriptTooLong(42)));
+        assert!(payable_script(vec![ratum::bitcoin::opcode::OP_RETURN; 83]).is_ok());
         assert_eq!(
-            classify(Resolved::Script(vec![ratum::bitcoin::opcode::OP_RETURN; 84])),
+            payable_script(vec![ratum::bitcoin::opcode::OP_RETURN; 84]),
             Err(Unpayable::ScriptTooLong(84))
         );
     }
@@ -808,14 +799,14 @@ mod tests {
     fn a_cached_answer_is_returned_without_asking_the_node() {
         let server = server_with(&[], &[("alice", Ok(p2wpkh(0xa1)))], 0);
         assert!(matches!(
-            Resolver::payability(&server.resolver, &server.node, "alice"),
+            AddressResolver::payability(&server.resolver, &server.node, "alice"),
             Payability::Script(s) if s == p2wpkh(0xa1)
         ));
         assert!(matches!(
-            Resolver::payability(&server.resolver, &server.node, "unseen"),
-            Payability::Unknown
+            AddressResolver::payability(&server.resolver, &server.node, "unseen"),
+            Payability::Unknown(_)
         ));
-        assert!(Resolver::cached(&server.resolver, "unseen").is_none());
+        assert!(AddressResolver::cached(&server.resolver, "unseen").is_none());
     }
 
     #[test]

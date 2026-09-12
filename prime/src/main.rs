@@ -1,8 +1,8 @@
 mod abw;
 mod admin;
-mod chainstate;
 mod cli;
 mod coinbaser;
+mod confirmations;
 mod connection;
 mod credit;
 mod relay;
@@ -18,8 +18,8 @@ use ratum::datum::handshake::KeyPairs;
 use ratum::datum::messages::ClientConfig;
 use ratum::rpc;
 use ratum_prime::ledger;
-use ratum_prime::verify::{PoolPolicy, ReplayGuard};
-use server::{NodeView, OpenConnectionGuard, PayoutPolicy, Resolver, Server, watch_node};
+use ratum_prime::verify::{AcceptedShareHashes, SharePolicy};
+use server::{AddressResolver, NodeView, OpenConnectionGuard, PayoutPolicy, Server, watch_node};
 use settings::Settings;
 use std::io;
 use std::net::TcpListener;
@@ -78,7 +78,7 @@ fn startup_chain_and_window(
     let tip = loop {
         match node.tip() {
             Ok(t) => break Some(t),
-            Err(e) if matches!(location, LedgerLocation::None) => {
+            Err(e) if matches!(location, LedgerLocation::MemoryOnly) => {
                 warn!(
                     "could not read the node difficulty to size the share window ({e}); \
                      starting from the floor of {}, so shares recorded before this restart \
@@ -120,13 +120,13 @@ fn watch_node_in_background(
     );
 }
 
-fn replay_guard(ledger: &ledger::Ledger) -> Arc<Mutex<ReplayGuard>> {
-    let mut guard = ReplayGuard::default();
-    let seeded = ledger.hashes().fold(0usize, |n, h| n + usize::from(guard.accept(*h)));
+fn accepted_hashes_from(ledger: &ledger::Ledger) -> Arc<Mutex<AcceptedShareHashes>> {
+    let mut hashes = AcceptedShareHashes::default();
+    let seeded = ledger.block_hashes().fold(0usize, |n, h| n + usize::from(hashes.accept(*h)));
     if seeded != 0 {
-        info!("ReplayGuard seeded with {seeded} share hash(es) from the ledger");
+        info!("{seeded} accepted share hash(es) seeded from the ledger");
     }
-    Arc::new(Mutex::new(guard))
+    Arc::new(Mutex::new(hashes))
 }
 
 fn accept_connections(listener: TcpListener, server: &Arc<Server>) {
@@ -192,12 +192,12 @@ fn main() -> io::Result<()> {
     let loaded = cli::load();
     info!("ratum-prime {}", ratum::VERSION);
 
-    let mut s = Settings::resolve(&loaded.cli, loaded.file);
+    let mut s = Settings::resolve(&loaded.command_line, loaded.file);
     if let Some(dir) = &s.data_dir {
         std::fs::create_dir_all(dir)?;
     }
     let ledger_location = LedgerLocation::new(s.ledger_path.clone(), s.data_dir.as_ref());
-    if let Some(done) = admin::run_command(&loaded.cli, &ledger_location) {
+    if let Some(done) = admin::run_command(&loaded.command_line, &ledger_location) {
         return done;
     }
 
@@ -235,8 +235,8 @@ fn main() -> io::Result<()> {
         Ok(p) => p,
         Err(e) => fatal!("cannot build the client config: {e}"),
     };
-    let mut policy = PoolPolicy::from_config(&config);
-    policy.require_split = s.require_split;
+    let mut share_policy = SharePolicy::from_config(&config);
+    share_policy.require_split = s.require_split;
 
     let server = Arc::new(Server {
         pool_keys,
@@ -246,26 +246,26 @@ fn main() -> io::Result<()> {
         require_v3: s.require_v3,
         sessions: Mutex::new(server::SessionStore::default()),
         abw_reveal_after: s.abw_reveal_after,
-        replay: replay_guard(&ledger),
+        accepted_hashes: accepted_hashes_from(&ledger),
         node,
         ledger: Mutex::new(ledger),
-        resolver: Mutex::new(Resolver::new()),
-        payout: PayoutPolicy {
+        resolver: Mutex::new(AddressResolver::new()),
+        payout_policy: PayoutPolicy {
             min_payout: s.min_payout,
             window_multiple: s.window_multiple,
             window_floor: s.window_floor,
             fee_bps: s.fee_bps,
         },
-        policy,
+        share_policy,
         config_payload,
         open_connections: AtomicUsize::new(0),
         max_connections: s.max_connections,
         datum_port: s.listen.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(0),
-        advertise: s.advertise_address,
+        advertise_address: s.advertise_address,
         public_gateway: s.public_gateway,
     });
 
-    chainstate::watch(Arc::clone(&server));
+    confirmations::watch(Arc::clone(&server));
 
     if let Some(addr) = &s.stats_listen {
         match stats::spawn(Arc::clone(&server), addr) {

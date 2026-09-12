@@ -1,6 +1,7 @@
-use crate::cli::{Cli, fatal};
+use crate::cli::fatal;
 use log::{info, warn};
 use ratum::rpc;
+use ratum_prime::config::Config;
 use ratum_prime::ledger::{self, Ledger};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -8,7 +9,7 @@ use std::path::{Path, PathBuf};
 pub(crate) enum LedgerLocation {
     File(PathBuf),
     InDir(PathBuf),
-    None,
+    MemoryOnly,
 }
 
 impl LedgerLocation {
@@ -16,7 +17,7 @@ impl LedgerLocation {
         match (ledger_path, data_dir) {
             (Some(p), _) => Self::File(PathBuf::from(p)),
             (None, Some(dir)) => Self::InDir(dir.clone()),
-            (None, None) => Self::None,
+            (None, None) => Self::MemoryOnly,
         }
     }
 
@@ -32,7 +33,7 @@ impl LedgerLocation {
             (Self::InDir(_), None) => {
                 unreachable!("a data directory waits for the chain")
             }
-            (Self::None, _) => None,
+            (Self::MemoryOnly, _) => None,
         }
     }
 
@@ -51,7 +52,7 @@ impl LedgerLocation {
                     )
                 }
             },
-            Self::None => fatal!("{flag} needs a ledger: give --ledger or --data-dir"),
+            Self::MemoryOnly => fatal!("{flag} needs a ledger: give --ledger or --data-dir"),
         })
     }
 
@@ -70,18 +71,21 @@ fn ledger_files_in(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(found)
 }
 
-pub(crate) fn run_command(cli: &Cli, location: &LedgerLocation) -> Option<io::Result<()>> {
-    if cli.dump_ledger {
+pub(crate) fn run_command(
+    command_line: &Config,
+    location: &LedgerLocation,
+) -> Option<io::Result<()>> {
+    if command_line.dump_ledger {
         return Some(dump_ledger(location));
     }
-    if let Some(arg) = &cli.settle_block {
+    if let Some(arg) = &command_line.settle_block {
         return Some(settle_block(location, arg));
     }
-    if let Some(arg) = &cli.void_block {
+    if let Some(arg) = &command_line.void_block {
         return Some(void_block(location, arg));
     }
-    if let Some(arg) = &cli.record_owed {
-        return Some(record_owed(location, arg, &cli.owed));
+    if let Some(arg) = &command_line.record_owed {
+        return Some(record_owed(location, arg, &command_line.owed));
     }
     None
 }
@@ -98,7 +102,7 @@ fn block_hash_arg(flag: &str, arg: &str, also: &str) -> [u8; 32] {
 fn print_or_refuse(
     arg: &str,
     record: Option<ledger::OwedBlock>,
-    state: Option<ledger::ChainState>,
+    state: Option<ledger::ConfirmationReading>,
 ) {
     let Some(owed) = record else {
         fatal!("no owed block under {arg}; --settle-block list prints them")
@@ -106,7 +110,7 @@ fn print_or_refuse(
     print_owed(&owed, state);
 }
 
-fn chain_state_text(state: Option<ledger::ChainState>) -> String {
+fn confirmations_text(state: Option<ledger::ConfirmationReading>) -> String {
     match state {
         Some(s) if s.on_best_chain() => format!(" {} confirmations", s.confirmations),
         Some(s) => format!(" NOT ON THE BEST CHAIN as of {}", s.checked_at),
@@ -114,7 +118,7 @@ fn chain_state_text(state: Option<ledger::ChainState>) -> String {
     }
 }
 
-fn print_owed(o: &ledger::OwedBlock, state: Option<ledger::ChainState>) {
+fn print_owed(o: &ledger::OwedBlock, state: Option<ledger::ConfirmationReading>) {
     let status = match o.settled_at {
         Some(at) => format!("settled at {at}"),
         None => "unsettled".to_string(),
@@ -125,7 +129,7 @@ fn print_owed(o: &ledger::OwedBlock, state: Option<ledger::ChainState>) {
         hex::encode(o.block_hash),
         o.at,
         o.total,
-        chain_state_text(state)
+        confirmations_text(state)
     );
     for (identity, sats) in &o.entries {
         println!("  {identity} {sats}");
@@ -143,7 +147,7 @@ fn dump_ledger(location: &LedgerLocation) -> io::Result<()> {
             share.at,
             share.difficulty,
             share.identity,
-            share.hash.map(hex::encode).unwrap_or_default()
+            hex::encode(share.block_hash)
         );
     }
     print!("{out}");
@@ -180,7 +184,7 @@ fn record_owed(location: &LedgerLocation, arg: &str, entries: &[String]) -> io::
     };
     if let Some(existing) = ledger.owed().iter().find(|o| o.block_hash == hash) {
         eprintln!("block {arg} already has an owed record; --void-block removes it first:");
-        print_owed(existing, ledger.chain_state(&hash));
+        print_owed(existing, ledger.confirmations(&hash));
         std::process::exit(crate::cli::USAGE_EXIT);
     }
     let entries = owed_entries(entries);
@@ -202,7 +206,7 @@ fn record_owed(location: &LedgerLocation, arg: &str, entries: &[String]) -> io::
         entries,
     };
     ledger.record_owed(owed.clone())?;
-    print_owed(&owed, ledger.chain_state(&hash));
+    print_owed(&owed, ledger.confirmations(&hash));
     Ok(())
 }
 
@@ -213,12 +217,12 @@ fn settle_block(location: &LedgerLocation, arg: &str) -> io::Result<()> {
             println!("no owed blocks");
         }
         for o in ledger.owed() {
-            print_owed(o, ledger.chain_state(&o.block_hash));
+            print_owed(o, ledger.confirmations(&o.block_hash));
         }
         return Ok(());
     }
     let hash = block_hash_arg("--settle-block", arg, " or 'list'");
-    let state = ledger.chain_state(&hash);
+    let state = ledger.confirmations(&hash);
     if let Some(s) = state.filter(|s| !s.on_best_chain()) {
         if let Some(owed) = ledger.owed().iter().find(|o| o.block_hash == hash) {
             print_owed(owed, state);
@@ -236,7 +240,7 @@ fn settle_block(location: &LedgerLocation, arg: &str) -> io::Result<()> {
 fn void_block(location: &LedgerLocation, arg: &str) -> io::Result<()> {
     let mut ledger = location.open("--void-block")?;
     let hash = block_hash_arg("--void-block", arg, "");
-    let state = ledger.chain_state(&hash);
+    let state = ledger.confirmations(&hash);
     print_or_refuse(arg, ledger.void_owed(&hash)?, state);
     Ok(())
 }

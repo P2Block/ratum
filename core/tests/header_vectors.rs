@@ -3,7 +3,7 @@ use serde_json::Value;
 
 struct Vector {
     name: String,
-    header: HeaderV2,
+    header: BlockHeaderV2,
     serialized: String,
     xor_key_hash: String,
     h1: String,
@@ -16,17 +16,17 @@ struct Vector {
     asic_input: String,
 }
 
-fn u128_from_display_hex(s: &str) -> U128 {
-    let mut v: U128 = hex::decode(s).expect("hex").try_into().expect("16 bytes");
+fn u128_from_display_hex(s: &str) -> [u8; 16] {
+    let mut v: [u8; 16] = hex::decode(s).expect("hex").try_into().expect("16 bytes");
     v.reverse();
     v
 }
 
-fn u256(v: &Value, key: &str) -> U256 {
-    u256_from_display_hex(v[key].as_str().expect(key)).expect(key)
+fn u256(v: &Value, key: &str) -> [u8; 32] {
+    hash_from_display_hex(v[key].as_str().expect(key)).expect(key)
 }
 
-fn u128(v: &Value, key: &str) -> U128 {
+fn u128(v: &Value, key: &str) -> [u8; 16] {
     u128_from_display_hex(v[key].as_str().expect(key))
 }
 
@@ -50,7 +50,7 @@ fn load() -> Vec<Vector> {
             let f = &v["fields"];
             Vector {
                 name: text(v, "name"),
-                header: HeaderV2 {
+                header: BlockHeaderV2 {
                     version: num(f, "nVersion") as i32,
                     prev_block: u256(f, "hashPrevBlock"),
                     merkle_root: u256(f, "hashMerkleRoot"),
@@ -91,7 +91,7 @@ fn all_vectors_reproduce() {
         let h = &v.header;
         let ser = h.serialize();
         assert_eq!(hex::encode(ser), v.serialized, "{}: serialized", v.name);
-        assert_eq!(HeaderV2::deserialize(&ser).unwrap(), *h, "{}: roundtrip", v.name);
+        assert_eq!(BlockHeaderV2::deserialize(&ser).unwrap(), *h, "{}: roundtrip", v.name);
 
         assert_eq!(
             hex::encode(xor_key_hash(&h.xor_key)),
@@ -100,22 +100,14 @@ fn all_vectors_reproduce() {
             v.name
         );
 
-        let pre = h.precompute();
-        let mut hook = [0u8; H2_PREIMAGE_SIZE];
-        hook[..32].copy_from_slice(&hex::decode(&v.h1).expect("h1 hex"));
-        hook[H2_PREIMAGE_SIZE - 32..].copy_from_slice(&h.mm_rhs);
-        assert_eq!(
-            tagged_sha256("Merge-mining hook", &hook),
-            pre.h2,
-            "{}: h1 is the first stage h2 commits to",
-            v.name
-        );
-        assert_eq!(hex::encode(pre.h2), v.h2, "{}: h2", v.name);
-        assert_eq!(hex::encode(pre.hash1), v.blake2b_1, "{}: blake2b_1", v.name);
-        assert_eq!(hex::encode(pre.mask), v.mask, "{}: mask", v.name);
+        let stages = h.hash_stages();
+        assert_eq!(hex::encode(stages.h1), v.h1, "{}: h1", v.name);
+        assert_eq!(hex::encode(stages.h2), v.h2, "{}: h2", v.name);
+        assert_eq!(hex::encode(stages.work_root), v.blake2b_1, "{}: blake2b_1", v.name);
+        assert_eq!(hex::encode(stages.xor_key_mask), v.mask, "{}: mask", v.name);
         assert_eq!(h.asic_profile(), v.asic_profile, "{}: profile", v.name);
 
-        let asic_input = h.asic_input_with(&pre.hash1, &pre.h2);
+        let asic_input = h.asic_input_with(&stages.work_root, &stages.h2);
         assert_eq!(hex::encode(&asic_input), v.asic_input, "{}: asic_input", v.name);
         assert_eq!(
             asic_input.len(),
@@ -124,7 +116,7 @@ fn all_vectors_reproduce() {
             v.name
         );
 
-        let (pow, block) = h.pow_and_block_hash();
+        let (pow, block) = h.raw_pow_and_block_hash();
         assert_eq!(hex::encode(pow), v.blake2b_2, "{}: blake2b_2", v.name);
         assert_eq!(hex::encode(block), v.block_hash, "{}: block_hash", v.name);
         assert_eq!(blake2b_256(&asic_input), pow, "{}: pow is blake2b of the asic input", v.name);
@@ -137,13 +129,13 @@ fn profile0_is_sia_header() {
     let v = &vectors[0];
     assert_eq!(v.asic_profile, 0);
     let h = &v.header;
-    let pre = h.precompute();
+    let stages = h.hash_stages();
 
     let mut leaf = vec![0u8; WORK_ROOT_H2_OFFSET];
-    leaf.extend_from_slice(&pre.h2);
+    leaf.extend_from_slice(&stages.h2);
     leaf.extend_from_slice(&h.extranonce);
     assert_eq!(leaf.len(), WORK_ROOT_LEAF_SIZE);
-    assert_eq!(blake2b_256(&leaf), pre.hash1);
+    assert_eq!(blake2b_256(&leaf), stages.work_root);
 
     let mut sia = Vec::new();
     sia.extend_from_slice(&prevblock_hidden(&h.prev_block));
@@ -151,14 +143,14 @@ fn profile0_is_sia_header() {
     sia.extend_from_slice(&h.nonce2.to_le_bytes());
     sia.extend_from_slice(&h.time_offset.to_le_bytes());
     sia.extend_from_slice(&h.nonce3.to_le_bytes());
-    sia.extend_from_slice(&pre.hash1);
-    assert_eq!(sia, h.asic_input_with(&pre.hash1, &pre.h2));
+    sia.extend_from_slice(&stages.work_root);
+    assert_eq!(sia, h.asic_input_with(&stages.work_root, &stages.h2));
 }
 
 #[test]
 fn display_hex_round_trips_through_the_internal_order() {
     for v in &load() {
-        let display = u256_to_display_hex(&v.header.prev_block);
-        assert_eq!(u256_from_display_hex(&display).unwrap(), v.header.prev_block, "{}", v.name);
+        let display = hash_to_display_hex(&v.header.prev_block);
+        assert_eq!(hash_from_display_hex(&display).unwrap(), v.header.prev_block, "{}", v.name);
     }
 }

@@ -1,5 +1,5 @@
-use crate::cursor::{Cursor, Truncated};
-use crate::header::HeaderV2;
+use crate::header::BlockHeaderV2;
+use crate::reader::{ByteReader, Truncated};
 use bytes::BufMut as _;
 
 use super::messages::client_subcmd::SUBMIT_POW;
@@ -16,18 +16,18 @@ pub const FLAG_BLAKE2B: u8 = 0x08;
 pub const RESERVED_USE_TIME_OFFSET: u8 = 0x01;
 use super::framing::STRUCT_END;
 pub const EXTRANONCE_SIZE: usize = 12;
-pub const EXTRANONCE_SIZE_V2: usize = 16;
-pub const EXTRANONCE_V2_PAD: usize = EXTRANONCE_SIZE_V2 - EXTRANONCE_SIZE;
-pub const EXTRANONCE1_SIZE: usize = EXTRANONCE_V2_PAD + size_of::<u32>();
-pub const EXTRANONCE2_SIZE: usize = EXTRANONCE_SIZE_V2 - EXTRANONCE1_SIZE;
+pub const HEADER_EXTRANONCE_SIZE: usize = 16;
+pub const HEADER_EXTRANONCE_PAD: usize = HEADER_EXTRANONCE_SIZE - EXTRANONCE_SIZE;
+pub const EXTRANONCE1_SIZE: usize = HEADER_EXTRANONCE_PAD + size_of::<u32>();
+pub const EXTRANONCE2_SIZE: usize = HEADER_EXTRANONCE_SIZE - EXTRANONCE1_SIZE;
 pub const SIA_FIELD_SIZE: usize = 2 * size_of::<u32>();
 pub const SIA_FIELD_HALF: usize = size_of::<u32>();
 pub const RESERVED_SIZE: usize = 4;
 pub const COINBASE_ID_SUBSIDY_ONLY: u8 = 0xFF;
 pub const MAX_JOBS: usize = 256;
-pub const MAX_COINBASE_SECTION_BYTES: usize = crate::datum::messages::MAX_COINBASER_BLOB + 1024;
+pub const MAX_COINBASE_SECTION_BYTES: usize = crate::datum::messages::MAX_COINBASER_BLOB_LEN + 1024;
 pub const MAX_MERKLE_BRANCHES: usize = 24;
-pub const MAX_USERNAME: usize = 384;
+pub const MAX_USERNAME_LEN: usize = 384;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
@@ -92,20 +92,20 @@ pub struct Blake2bSection {
     pub time_on_wire: u32,
 }
 
-pub fn header_extranonce(extranonce: &[u8]) -> Option<[u8; EXTRANONCE_SIZE_V2]> {
+pub fn header_extranonce(extranonce: &[u8]) -> Option<[u8; HEADER_EXTRANONCE_SIZE]> {
     if extranonce.len() != EXTRANONCE_SIZE {
         return None;
     }
-    let mut out = [0u8; EXTRANONCE_SIZE_V2];
-    out[EXTRANONCE_V2_PAD..].copy_from_slice(extranonce);
+    let mut out = [0u8; HEADER_EXTRANONCE_SIZE];
+    out[HEADER_EXTRANONCE_PAD..].copy_from_slice(extranonce);
     Some(out)
 }
 
-pub fn share_extranonce(field: &[u8; EXTRANONCE_SIZE_V2]) -> Option<Vec<u8>> {
-    if field[..EXTRANONCE_V2_PAD] != [0u8; EXTRANONCE_V2_PAD] {
+pub fn share_extranonce(field: &[u8; HEADER_EXTRANONCE_SIZE]) -> Option<Vec<u8>> {
+    if field[..HEADER_EXTRANONCE_PAD] != [0u8; HEADER_EXTRANONCE_PAD] {
         return None;
     }
-    Some(field[EXTRANONCE_V2_PAD..].to_vec())
+    Some(field[HEADER_EXTRANONCE_PAD..].to_vec())
 }
 
 pub fn sia_field(low: u32, high: u32) -> [u8; SIA_FIELD_SIZE] {
@@ -123,7 +123,7 @@ pub fn sia_halves(field: &[u8; SIA_FIELD_SIZE]) -> (u32, u32) {
 }
 
 impl Blake2bSection {
-    pub fn from_header(h: &HeaderV2) -> Self {
+    pub fn from_header(h: &BlockHeaderV2) -> Self {
         Self {
             sia_ntime: sia_field(h.time_offset, h.nonce3),
             sia_nonce: sia_field(h.nonce, h.nonce2),
@@ -140,7 +140,7 @@ impl Blake2bSection {
     }
 }
 
-fn decode_job_section(r: &mut Cursor<'_>) -> Result<JobSection, Error> {
+fn decode_job_section(r: &mut ByteReader<'_>) -> Result<JobSection, Error> {
     let prev_hash: [u8; 32] = r.arr("prev hash")?;
     let target_byte_index = r.u16("target byte index")?;
     let nbits: [u8; 4] = r.arr("nbits")?;
@@ -192,7 +192,7 @@ fn encode_job_section(out: &mut Vec<u8>, j: &JobSection) {
     }
 }
 
-fn decode_coinbase_section(r: &mut Cursor<'_>) -> Result<CoinbaseSection, Error> {
+fn decode_coinbase_section(r: &mut ByteReader<'_>) -> Result<CoinbaseSection, Error> {
     let coinbase_id = r.u8("coinbase section id")?;
     let len1 = r.u16("coinb1 len")? as usize;
     let len2 = r.u16("coinb2 len")? as usize;
@@ -210,7 +210,7 @@ fn encode_coinbase_section(out: &mut Vec<u8>, c: &CoinbaseSection) {
     out.put_slice(&c.coinb2);
 }
 
-fn decode_blake2b_section(r: &mut Cursor<'_>) -> Result<Blake2bSection, Error> {
+fn decode_blake2b_section(r: &mut ByteReader<'_>) -> Result<Blake2bSection, Error> {
     if r.u8("algorithm")? != BLAKE2B_ALGORITHM {
         return Err(Error::BadBlake2bSection);
     }
@@ -242,7 +242,7 @@ struct Prefix {
 }
 
 impl Prefix {
-    fn read(r: &mut Cursor<'_>) -> Result<Self, Truncated> {
+    fn read(r: &mut ByteReader<'_>) -> Result<Self, Truncated> {
         r.skip_if(SUBMIT_POW);
         Ok(Self {
             job_id: r.u8("job id")?,
@@ -281,16 +281,16 @@ impl PowSubmit {
     }
 
     pub fn difficulty(&self) -> u64 {
-        crate::target::diff_for_pot(self.target_byte)
+        crate::target::difficulty_for_exponent(self.target_byte)
     }
 
     pub fn prefix(data: &[u8]) -> Option<(u8, u8, u32)> {
-        let p = Prefix::read(&mut Cursor::new(data)).ok()?;
+        let p = Prefix::read(&mut ByteReader::new(data)).ok()?;
         Some((p.job_id, p.target_byte, p.nonce))
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
-        let mut r = Cursor::new(data);
+        let mut r = ByteReader::new(data);
         let Prefix { job_id, coinbase_id, flags, target_byte, ntime, nonce } =
             Prefix::read(&mut r)?;
         let version = r.u32("version")?;
@@ -301,8 +301,11 @@ impl PowSubmit {
         let extranonce = r.take(en_size as usize, "extranonce")?.to_vec();
 
         let rest = r.rest();
-        let nul =
-            rest.iter().take(MAX_USERNAME + 1).position(|&b| b == 0).ok_or(Error::BadUsername)?;
+        let nul = rest
+            .iter()
+            .take(MAX_USERNAME_LEN + 1)
+            .position(|&b| b == 0)
+            .ok_or(Error::BadUsername)?;
         let username = String::from_utf8_lossy(&rest[..nul]).into_owned();
         r.advance(nul + 1, "username")?;
         let reserved = r.take(RESERVED_SIZE, "reserved")?;
@@ -618,15 +621,15 @@ mod tests {
     fn the_header_extranonce_is_the_twelve_left_padded() {
         let twelve: Vec<u8> = (1..=12u8).collect();
         let field = header_extranonce(&twelve).unwrap();
-        assert_eq!(&field[..EXTRANONCE_V2_PAD], &[0u8; 4]);
-        assert_eq!(&field[EXTRANONCE_V2_PAD..], &twelve[..]);
+        assert_eq!(&field[..HEADER_EXTRANONCE_PAD], &[0u8; 4]);
+        assert_eq!(&field[HEADER_EXTRANONCE_PAD..], &twelve[..]);
         assert_eq!(header_extranonce(&[0u8; 16]), None, "the field is not what is sent");
         assert_eq!(header_extranonce(&[]), None);
     }
 
     #[test]
     fn the_section_from_a_header_splits_back_into_its_fields() {
-        let h = HeaderV2 {
+        let h = BlockHeaderV2 {
             nonce: 0x1413_1211,
             nonce2: 0x1817_1615,
             time_offset: 0x0403_0201,
@@ -640,7 +643,7 @@ mod tests {
         assert_eq!(b.time_fields(), (h.time_offset, h.nonce3));
         assert_eq!(b.time_on_wire, h.time_on_wire());
         assert_eq!(b.time_on_wire.wrapping_add(h.time_offset), h.time);
-        let mut field = [0u8; EXTRANONCE_SIZE_V2];
+        let mut field = [0u8; HEADER_EXTRANONCE_SIZE];
         field[4..].copy_from_slice(&[9u8; 12]);
         let twelve = share_extranonce(&field).unwrap();
         assert_eq!(header_extranonce(&twelve), Some(field));

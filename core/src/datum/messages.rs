@@ -1,5 +1,6 @@
-use crate::cursor::Cursor;
+use crate::bitcoin::TxOut;
 use crate::datum::codes::wire_codes;
+use crate::reader::ByteReader;
 use bytes::BufMut as _;
 
 pub mod server_subcmd {
@@ -17,11 +18,13 @@ pub mod client_subcmd {
     pub const VALIDATION: u8 = 0x50;
 }
 
+use super::abw::AbwShareRef;
+use super::bulk::DBF_MARKER;
 use super::framing::STRUCT_END;
 pub const CONFIG_VERSION: u8 = 1;
 const CONFIG_FIXED_LEN: usize = 4 + size_of::<u32>() + size_of::<u64>() + 2;
-pub const MAX_PAYOUT_SCRIPT: usize = 83;
-pub const MAX_COINBASE_TAG: usize = 81;
+pub const MAX_PAYOUT_SCRIPT_LEN: usize = 83;
+pub const MAX_COINBASE_TAG_LEN: usize = 81;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
@@ -30,7 +33,7 @@ pub enum Error {
     #[error("{field} length {len} is out of range")]
     OutOfRange { field: &'static str, len: usize },
     #[error("min difficulty {0} is not a power of two")]
-    MinDiffNotPowerOfTwo(u64),
+    MinDifficultyNotPowerOfTwo(u64),
     #[error("payout split totals {total} sats, exceeding the job's {value}")]
     SplitExceedsValue { total: u64, value: u64 },
 }
@@ -40,14 +43,14 @@ fn check_config_fields(
     coinbase_tag: &str,
     min_difficulty: u64,
 ) -> Result<(), Error> {
-    if payout_script.len() > MAX_PAYOUT_SCRIPT {
+    if payout_script.len() > MAX_PAYOUT_SCRIPT_LEN {
         return Err(Error::TooLong { field: "payout script", len: payout_script.len() });
     }
-    if coinbase_tag.len() > MAX_COINBASE_TAG {
+    if coinbase_tag.len() > MAX_COINBASE_TAG_LEN {
         return Err(Error::TooLong { field: "coinbase tag", len: coinbase_tag.len() });
     }
     if !min_difficulty.is_power_of_two() {
-        return Err(Error::MinDiffNotPowerOfTwo(min_difficulty));
+        return Err(Error::MinDifficultyNotPowerOfTwo(min_difficulty));
     }
     Ok(())
 }
@@ -57,7 +60,7 @@ fn push_counted(out: &mut Vec<u8>, bytes: &[u8]) {
     out.put_slice(bytes);
 }
 
-fn take_counted<'a>(c: &mut Cursor<'a>, what: &'static str, max: usize) -> Option<&'a [u8]> {
+fn take_counted<'a>(c: &mut ByteReader<'a>, what: &'static str, max: usize) -> Option<&'a [u8]> {
     let len = usize::from(c.u8(what).ok()?);
     if len > max {
         return None;
@@ -90,14 +93,14 @@ impl ClientConfig {
     }
 
     pub fn decode(data: &[u8]) -> Option<Self> {
-        let mut c = Cursor::new(data);
+        let mut c = ByteReader::new(data);
         c.skip_if(server_subcmd::CONFIG);
         if c.u8("version").ok()? != CONFIG_VERSION {
             return None;
         }
-        let payout_script = take_counted(&mut c, "payout script", MAX_PAYOUT_SCRIPT)?.to_vec();
+        let payout_script = take_counted(&mut c, "payout script", MAX_PAYOUT_SCRIPT_LEN)?.to_vec();
         let prime_id = c.u32("prime id").ok()?;
-        let tag = take_counted(&mut c, "coinbase tag", MAX_COINBASE_TAG)?;
+        let tag = take_counted(&mut c, "coinbase tag", MAX_COINBASE_TAG_LEN)?;
         let coinbase_tag = String::from_utf8_lossy(tag).into_owned();
         let min_difficulty = c.u64("min difficulty").ok()?;
         if c.arr("terminator").ok()? != [0, STRUCT_END] {
@@ -113,7 +116,6 @@ const CONFIG_V3_FIXED_LEN: usize =
 
 pub const RESUME_TOKEN_LEN: usize = 40;
 pub type ResumeToken = [u8; RESUME_TOKEN_LEN];
-pub const DBF_MARKER: [u8; 4] = *b"DBF\x01";
 pub const CONFIG_FLAG_ABW_DISABLED: u8 = 0x01;
 
 const TOKEN_PRIME_ID_LEN: usize = size_of::<u64>();
@@ -160,15 +162,15 @@ impl ClientConfigV3 {
     }
 
     pub fn decode(data: &[u8]) -> Option<Self> {
-        let mut c = Cursor::new(data);
+        let mut c = ByteReader::new(data);
         c.skip_if(server_subcmd::CONFIG);
         if c.u8("version").ok()? != CONFIG_VERSION_V3 {
             return None;
         }
-        let payout_script = take_counted(&mut c, "payout script", MAX_PAYOUT_SCRIPT)?.to_vec();
+        let payout_script = take_counted(&mut c, "payout script", MAX_PAYOUT_SCRIPT_LEN)?.to_vec();
         let prime_id = c.u64("prime id").ok()?;
         let resume_token: ResumeToken = c.arr("resume token").ok()?;
-        let tag = take_counted(&mut c, "coinbase tag", MAX_COINBASE_TAG)?;
+        let tag = take_counted(&mut c, "coinbase tag", MAX_COINBASE_TAG_LEN)?;
         let coinbase_tag = String::from_utf8_lossy(tag).into_owned();
         let min_difficulty = c.u64("min difficulty").ok()?;
         let flags = c.u8("flags").ok()?;
@@ -203,12 +205,12 @@ pub struct MigrationTarget {
 pub const MIGRATION_REVISION: u8 = 0;
 pub const MIGRATION_ACTION_REDIRECT: u8 = 0;
 pub const MIGRATION_ACTION_RETURN_HOME: u8 = 1;
-pub const MAX_MIGRATION_HOST: usize = 1024;
+pub const MAX_MIGRATION_HOST_LEN: usize = 1024;
 pub const MIGRATION_PUBKEY_LEN: usize = 2 * 32;
 
 impl MigrationRequest {
     pub fn decode(data: &[u8]) -> Option<Self> {
-        let mut c = Cursor::new(data);
+        let mut c = ByteReader::new(data);
         c.skip_if(server_subcmd::MIGRATION);
         if c.u8("revision").ok()? != MIGRATION_REVISION {
             return None;
@@ -222,7 +224,7 @@ impl MigrationRequest {
             }
             MIGRATION_ACTION_REDIRECT => {
                 let host_len = c.u16("host length").ok()? as usize;
-                if host_len == 0 || host_len >= MAX_MIGRATION_HOST {
+                if host_len == 0 || host_len >= MAX_MIGRATION_HOST_LEN {
                     return None;
                 }
                 let host = c.take(host_len, "host").ok()?;
@@ -245,9 +247,9 @@ impl MigrationRequest {
     }
 }
 
-pub const MAX_COINBASER_BLOB: usize = 32767;
-pub const MIN_OUTPUT_SCRIPT: usize = 2;
-pub const MAX_OUTPUT_SCRIPT: usize = 64;
+pub const MAX_COINBASER_BLOB_LEN: usize = 32767;
+pub const MIN_COINBASER_OUTPUT_SCRIPT_LEN: usize = 2;
+pub const MAX_COINBASER_OUTPUT_SCRIPT_LEN: usize = 64;
 pub const MAX_COINBASER_OUTPUTS: usize = 512;
 const COINBASER_OUTPUT_FIXED_LEN: usize = size_of::<u64>() + 1;
 const COINBASER_RESPONSE_HEADER_LEN: usize = 1 + size_of::<u64>() + size_of::<u32>();
@@ -261,7 +263,7 @@ pub struct CoinbaserRequest {
 
 impl CoinbaserRequest {
     pub fn decode(data: &[u8]) -> Option<Self> {
-        let mut c = Cursor::new(data);
+        let mut c = ByteReader::new(data);
         c.skip_if(client_subcmd::COINBASER_REQUEST);
         let value = c.u64("value").ok()?;
         let prev_hash: [u8; 32] = c.arr("prev hash").ok()?;
@@ -282,23 +284,19 @@ impl CoinbaserRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CoinbaseOutput {
-    pub value: u64,
-    pub script: Vec<u8>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoinbaserResponse {
     pub value: u64,
     pub coinbaser_id: u8,
-    pub outputs: Vec<CoinbaseOutput>,
+    pub outputs: Vec<TxOut>,
 }
 
 impl CoinbaserResponse {
     pub fn retain_payable(&mut self) -> usize {
         let before = self.outputs.len();
         self.outputs.retain(|o| {
-            o.value > 0 && (MIN_OUTPUT_SCRIPT..=MAX_OUTPUT_SCRIPT).contains(&o.script.len())
+            o.value > 0
+                && (MIN_COINBASER_OUTPUT_SCRIPT_LEN..=MAX_COINBASER_OUTPUT_SCRIPT_LEN)
+                    .contains(&o.script_pubkey.len())
         });
         if self.outputs.len() > MAX_COINBASER_OUTPUTS {
             self.outputs.truncate(MAX_COINBASER_OUTPUTS);
@@ -311,23 +309,28 @@ impl CoinbaserResponse {
             return Err(Error::TooLong { field: "coinbaser outputs", len: self.outputs.len() });
         }
         let blob_len: usize =
-            self.outputs.iter().map(|o| COINBASER_OUTPUT_FIXED_LEN + o.script.len()).sum();
+            self.outputs.iter().map(|o| COINBASER_OUTPUT_FIXED_LEN + o.script_pubkey.len()).sum();
         let mut blob = Vec::with_capacity(1 + blob_len);
         blob.put_u8(self.coinbaser_id);
         let mut total: u64 = 0;
         for o in &self.outputs {
-            if o.script.len() < MIN_OUTPUT_SCRIPT || o.script.len() > MAX_OUTPUT_SCRIPT {
-                return Err(Error::OutOfRange { field: "output script", len: o.script.len() });
+            if o.script_pubkey.len() < MIN_COINBASER_OUTPUT_SCRIPT_LEN
+                || o.script_pubkey.len() > MAX_COINBASER_OUTPUT_SCRIPT_LEN
+            {
+                return Err(Error::OutOfRange {
+                    field: "output script",
+                    len: o.script_pubkey.len(),
+                });
             }
             total = total.saturating_add(o.value);
             blob.put_u64_le(o.value);
-            blob.put_u8(o.script.len() as u8);
-            blob.put_slice(&o.script);
+            blob.put_u8(o.script_pubkey.len() as u8);
+            blob.put_slice(&o.script_pubkey);
         }
         if total > self.value {
             return Err(Error::SplitExceedsValue { total, value: self.value });
         }
-        if blob.len() > MAX_COINBASER_BLOB {
+        if blob.len() > MAX_COINBASER_BLOB_LEN {
             return Err(Error::TooLong { field: "coinbaser blob", len: blob.len() });
         }
 
@@ -340,14 +343,14 @@ impl CoinbaserResponse {
     }
 
     pub fn decode(data: &[u8]) -> Option<Self> {
-        let mut c = Cursor::new(data);
+        let mut c = ByteReader::new(data);
         c.skip_if(server_subcmd::COINBASER);
         let value = c.u64("value").ok()?;
         let blob_len = c.u32("blob length").ok()? as usize;
-        if !(1..=MAX_COINBASER_BLOB).contains(&blob_len) {
+        if !(1..=MAX_COINBASER_BLOB_LEN).contains(&blob_len) {
             return None;
         }
-        let mut b = Cursor::new(c.take(blob_len, "blob").ok()?);
+        let mut b = ByteReader::new(c.take(blob_len, "blob").ok()?);
         let coinbaser_id = b.u8("coinbaser id").ok()?;
         let mut outputs = Vec::new();
         let mut total: u64 = 0;
@@ -357,12 +360,13 @@ impl CoinbaserResponse {
                 break;
             }
             let slen = b.u8("script length").ok()? as usize;
-            if !(MIN_OUTPUT_SCRIPT..=MAX_OUTPUT_SCRIPT).contains(&slen) {
+            if !(MIN_COINBASER_OUTPUT_SCRIPT_LEN..=MAX_COINBASER_OUTPUT_SCRIPT_LEN).contains(&slen)
+            {
                 return None;
             }
             let script = b.take(slen, "output script").ok()?.to_vec();
             total += v;
-            outputs.push(CoinbaseOutput { value: v, script });
+            outputs.push(TxOut { value: v, script_pubkey: script });
             if outputs.len() >= MAX_COINBASER_OUTPUTS {
                 break;
             }
@@ -424,12 +428,6 @@ const ABW_REF_TAIL_LEN: usize = crate::bitcoin::HASH_SIZE + 1;
 const SHARE_RESPONSE_ABW_LEN: usize = SHARE_RESPONSE_LEN + 2 + ABW_REF_TAIL_LEN;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AbwShareRef {
-    pub slot: u8,
-    pub raw_pow_hash: [u8; 32],
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShareResponse {
     pub verdict: ShareVerdict,
     pub nonce: u32,
@@ -460,14 +458,14 @@ impl ShareResponse {
         if let Some(r) = &self.abw_ref {
             out.put_u8(SHARE_RESPONSE_ABW_MARKER);
             out.put_u8(r.slot);
-            out.put_slice(&r.raw_pow_hash);
+            out.put_slice(&r.raw_pow_hash_le);
             out.put_u8(STRUCT_END);
         }
         out
     }
 
     pub fn decode(data: &[u8]) -> Option<Self> {
-        let mut c = Cursor::new(data);
+        let mut c = ByteReader::new(data);
         c.skip_if(server_subcmd::SHARE_RESPONSE);
         let status = c.u8("status").ok()?;
         let reason = c.u16("reason").ok()?;
@@ -490,7 +488,7 @@ impl ShareResponse {
                 let (hash, end) = tail.split_at(crate::bitcoin::HASH_SIZE);
                 (end == [STRUCT_END]).then(|| AbwShareRef {
                     slot: *slot,
-                    raw_pow_hash: hash.try_into().expect("HASH_SIZE bytes"),
+                    raw_pow_hash_le: hash.try_into().expect("HASH_SIZE bytes"),
                 })
             }
             _ => None,
@@ -547,7 +545,7 @@ mod tests {
     fn rejects_non_power_of_two_difficulty() {
         let mut c = sample();
         c.min_difficulty = 3000;
-        assert_eq!(c.encode(), Err(Error::MinDiffNotPowerOfTwo(3000)));
+        assert_eq!(c.encode(), Err(Error::MinDifficultyNotPowerOfTwo(3000)));
     }
 
     #[test]
@@ -593,8 +591,8 @@ mod tests {
             value: 312_500_000,
             coinbaser_id: 9,
             outputs: vec![
-                CoinbaseOutput { value: 200_000_000, script: p2wpkh(0x01) },
-                CoinbaseOutput { value: 100_000_000, script: p2wpkh(0x02) },
+                TxOut { value: 200_000_000, script_pubkey: p2wpkh(0x01) },
+                TxOut { value: 100_000_000, script_pubkey: p2wpkh(0x02) },
             ],
         };
         let bytes = r.encode().unwrap();
@@ -609,14 +607,14 @@ mod tests {
         let over = CoinbaserResponse {
             value: 100,
             coinbaser_id: 0,
-            outputs: vec![CoinbaseOutput { value: 101, script: p2wpkh(0) }],
+            outputs: vec![TxOut { value: 101, script_pubkey: p2wpkh(0) }],
         };
         assert_eq!(over.encode(), Err(Error::SplitExceedsValue { total: 101, value: 100 }));
 
         let short_script = CoinbaserResponse {
             value: 100,
             coinbaser_id: 0,
-            outputs: vec![CoinbaseOutput { value: 10, script: vec![0x51] }],
+            outputs: vec![TxOut { value: 10, script_pubkey: vec![0x51] }],
         };
         assert!(matches!(
             short_script.encode(),
@@ -626,7 +624,7 @@ mod tests {
         let long_script = CoinbaserResponse {
             value: 100,
             coinbaser_id: 0,
-            outputs: vec![CoinbaseOutput { value: 10, script: vec![0x51; 65] }],
+            outputs: vec![TxOut { value: 10, script_pubkey: vec![0x51; 65] }],
         };
         assert!(matches!(
             long_script.encode(),
@@ -640,12 +638,12 @@ mod tests {
             value: 1_000_000,
             coinbaser_id: 0,
             outputs: vec![
-                CoinbaseOutput { value: 100, script: p2wpkh(0x01) },
-                CoinbaseOutput { value: 100, script: vec![0x51] },
-                CoinbaseOutput { value: 100, script: vec![0x51; 65] },
-                CoinbaseOutput { value: 0, script: p2wpkh(0x02) },
-                CoinbaseOutput { value: 100, script: vec![0x51; 64] },
-                CoinbaseOutput { value: 100, script: vec![0x51, 0x52] },
+                TxOut { value: 100, script_pubkey: p2wpkh(0x01) },
+                TxOut { value: 100, script_pubkey: vec![0x51] },
+                TxOut { value: 100, script_pubkey: vec![0x51; 65] },
+                TxOut { value: 0, script_pubkey: p2wpkh(0x02) },
+                TxOut { value: 100, script_pubkey: vec![0x51; 64] },
+                TxOut { value: 100, script_pubkey: vec![0x51, 0x52] },
             ],
         };
         assert_eq!(r.retain_payable(), 3);
@@ -655,7 +653,7 @@ mod tests {
         let mut valid = CoinbaserResponse {
             value: 1_000,
             coinbaser_id: 0,
-            outputs: vec![CoinbaseOutput { value: 10, script: p2wpkh(0) }],
+            outputs: vec![TxOut { value: 10, script_pubkey: p2wpkh(0) }],
         };
         assert_eq!(valid.retain_payable(), 0);
     }
@@ -666,7 +664,7 @@ mod tests {
             value: u64::MAX,
             coinbaser_id: 0,
             outputs: (0..MAX_COINBASER_OUTPUTS + 10)
-                .map(|i| CoinbaseOutput { value: 1, script: p2wpkh(i as u8) })
+                .map(|i| TxOut { value: 1, script_pubkey: p2wpkh(i as u8) })
                 .collect(),
         };
         assert_eq!(r.retain_payable(), 10);

@@ -1,5 +1,5 @@
-use crate::cursor::{Cursor, Truncated};
 use crate::datum::codes::wire_codes;
+use crate::reader::{ByteReader, Truncated};
 use bytes::BufMut as _;
 
 use super::messages::client_subcmd::VALIDATION;
@@ -24,7 +24,7 @@ pub const MAX_SHORT_LIST_TXNS: u16 = 16383;
 
 wire_codes! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum Status: u8 {
+    pub enum TxnListStatus: u8 {
         Ok = 0x01,
         JobEmpty = 0xF0,
         NoTemplate = 0xF1,
@@ -35,7 +35,7 @@ wire_codes! {
     unknown Unknown;
 }
 
-impl std::fmt::Display for Status {
+impl std::fmt::Display for TxnListStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Ok => write!(f, "ok"),
@@ -80,7 +80,7 @@ pub fn request_block_txns(job_index: u8) -> Vec<u8> {
 
 wire_codes! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum ParentStatus: u8 {
+    pub enum ParentFetchStatus: u8 {
         Success = 0x01,
         JobMismatch = 0xF0,
         Busy = 0xF6,
@@ -93,7 +93,7 @@ wire_codes! {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParentFetchReply {
     pub job_index: u8,
-    pub status: ParentStatus,
+    pub status: ParentFetchStatus,
     pub parent_hash: [u8; 32],
     pub block: Vec<u8>,
 }
@@ -101,7 +101,7 @@ pub struct ParentFetchReply {
 pub const PARENT_FETCH_REPLY_OVERHEAD: usize =
     (REQUEST_HEADER_LEN + 1) + crate::bitcoin::HASH_SIZE + size_of::<u32>() + 1;
 
-pub const MAX_PARENT_FETCH_BLOCK: usize =
+pub const MAX_PARENT_FETCH_BLOCK_LEN: usize =
     super::framing::MAX_CMD_DATA_SIZE as usize - (PARENT_FETCH_REPLY_OVERHEAD + 1);
 
 impl ParentFetchReply {
@@ -122,7 +122,7 @@ impl ParentFetchReply {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShortTxnList {
     pub job_index: u8,
-    pub status: Status,
+    pub status: TxnListStatus,
     pub txn_count: u16,
     pub short_ids: Vec<u64>,
     pub crosscheck: Option<[u8; 32]>,
@@ -137,14 +137,14 @@ pub const CROSSCHECK_SEED: [u8; 32] = [
 ];
 
 impl ShortTxnList {
-    pub fn empty(job_index: u8, status: Status) -> Self {
+    pub fn empty(job_index: u8, status: TxnListStatus) -> Self {
         Self { job_index, status, txn_count: 0, short_ids: Vec::new(), crosscheck: None }
     }
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out =
             vec![VALIDATION, response::SHORT_TXN_LIST, self.job_index, self.status.code()];
-        if self.status != Status::Ok {
+        if self.status != TxnListStatus::Ok {
             return out;
         }
         out.put_u16_le(self.txn_count);
@@ -163,23 +163,23 @@ impl ShortTxnList {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TxnBundle {
+pub struct TxnList {
     pub selector: u8,
     pub job_index: u8,
-    pub status: Status,
+    pub status: TxnListStatus,
     pub txns: Vec<Vec<u8>>,
 }
 
-impl TxnBundle {
-    pub fn empty(selector: u8, job_index: u8, status: Status) -> Self {
+impl TxnList {
+    pub fn empty(selector: u8, job_index: u8, status: TxnListStatus) -> Self {
         Self { selector, job_index, status, txns: Vec::new() }
     }
 
     pub fn decode(data: &[u8], selector: u8) -> Result<Self, Error> {
         let mut c = body_of(data, selector)?;
         let job_index = c.u8("job index")?;
-        let status = Status::from_code(c.u8("status")?);
-        if status != Status::Ok {
+        let status = TxnListStatus::from_code(c.u8("status")?);
+        if status != TxnListStatus::Ok {
             return Ok(Self::empty(selector, job_index, status));
         }
         let stated = usize::from(c.u16("txn count")?);
@@ -201,7 +201,7 @@ impl TxnBundle {
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = vec![VALIDATION, self.selector, self.job_index, self.status.code()];
-        if self.status != Status::Ok {
+        if self.status != TxnListStatus::Ok {
             return out;
         }
         out.put_u16_le(self.txns.len() as u16);
@@ -216,7 +216,7 @@ impl TxnBundle {
 
 const TXN_SIZE_LEN: usize = 3;
 
-fn decode_txn_size(c: &mut Cursor<'_>) -> Result<usize, Error> {
+fn decode_txn_size(c: &mut ByteReader<'_>) -> Result<usize, Error> {
     let b: [u8; TXN_SIZE_LEN] = c.arr("txn size")?;
     Ok(usize::from(u16::from_le_bytes([b[0], b[1]])) | (usize::from(b[2]) << 16))
 }
@@ -226,8 +226,8 @@ fn encode_txn_size(out: &mut Vec<u8>, len: usize) {
     out.put_u8((len >> 16) as u8);
 }
 
-fn body_of(data: &[u8], want: u8) -> Result<Cursor<'_>, Error> {
-    let mut c = Cursor::new(data);
+fn body_of(data: &[u8], want: u8) -> Result<ByteReader<'_>, Error> {
+    let mut c = ByteReader::new(data);
     c.skip_if(VALIDATION);
     let got = c.u8("response selector")?;
     if got != want {
@@ -369,11 +369,11 @@ mod tests {
         assert_eq!(PARENT_FETCH_REQUEST_LEN, REQUEST_HEADER_LEN + 32);
     }
 
-    fn sample_list() -> ShortTxnList {
+    fn sample_short_list() -> ShortTxnList {
         let hashes = [ramp(0), ramp(0x20), ramp(0x40)];
         ShortTxnList {
             job_index: 4,
-            status: Status::Ok,
+            status: TxnListStatus::Ok,
             txn_count: 3,
             short_ids: hashes.iter().map(|h| short_id(h, &KEY)).collect(),
             crosscheck: Some(crosscheck(&hashes)),
@@ -382,10 +382,10 @@ mod tests {
 
     #[test]
     fn short_list_encodes_at_the_c_offsets() {
-        let l = sample_list();
+        let l = sample_short_list();
         let bytes = l.encode();
         assert_eq!(bytes.len(), 4 + 2 + 3 * SHORT_ID_SIZE + 32 + 1);
-        assert_eq!(&bytes[..4], &[0x50, response::SHORT_TXN_LIST, 4, Status::Ok.code()]);
+        assert_eq!(&bytes[..4], &[0x50, response::SHORT_TXN_LIST, 4, TxnListStatus::Ok.code()]);
         assert_eq!(&bytes[4..6], &3u16.to_le_bytes());
         for (i, id) in l.short_ids.iter().enumerate() {
             let at = 6 + i * SHORT_ID_SIZE;
@@ -399,16 +399,19 @@ mod tests {
     fn short_list_encodes_the_shapes_without_a_terminator() {
         let empty = ShortTxnList {
             job_index: 1,
-            status: Status::Ok,
+            status: TxnListStatus::Ok,
             txn_count: 0,
             short_ids: vec![],
             crosscheck: None,
         };
         assert_eq!(empty.encode(), vec![0x50, 0x90, 1, 0x01, 0x00, 0x00]);
 
-        for status in
-            [Status::JobEmpty, Status::NoTemplate, Status::TooManyTxns, Status::BadJobIndex]
-        {
+        for status in [
+            TxnListStatus::JobEmpty,
+            TxnListStatus::NoTemplate,
+            TxnListStatus::TooManyTxns,
+            TxnListStatus::BadJobIndex,
+        ] {
             let e = ShortTxnList {
                 job_index: JOB_INDEX_INVALID,
                 status,
@@ -420,65 +423,68 @@ mod tests {
         }
     }
 
-    fn sample_bundle(selector: u8) -> TxnBundle {
-        TxnBundle {
+    fn sample_txn_list(selector: u8) -> TxnList {
+        TxnList {
             selector,
             job_index: 6,
-            status: Status::Ok,
+            status: TxnListStatus::Ok,
             txns: vec![vec![0xab; 10], vec![0xcd; 300], vec![]],
         }
     }
 
     #[test]
-    fn txn_bundle_roundtrips_both_selectors() {
+    fn txn_list_roundtrips_both_selectors() {
         for selector in [response::TXNS, response::BLOCK_TXNS] {
-            let b = sample_bundle(selector);
+            let b = sample_txn_list(selector);
             let bytes = b.encode();
-            assert_eq!(TxnBundle::decode(&bytes, selector).unwrap(), b);
+            assert_eq!(TxnList::decode(&bytes, selector).unwrap(), b);
             let mut padded = bytes.clone();
             padded.extend_from_slice(&[0x33; 50]);
-            assert_eq!(TxnBundle::decode(&padded, selector).unwrap(), b);
+            assert_eq!(TxnList::decode(&padded, selector).unwrap(), b);
         }
     }
 
     #[test]
     fn txn_size_prefix_is_three_bytes_little_endian() {
-        let b = TxnBundle {
+        let b = TxnList {
             selector: response::BLOCK_TXNS,
             job_index: 0,
-            status: Status::Ok,
+            status: TxnListStatus::Ok,
             txns: vec![vec![0x11; 0x01_2345]],
         };
         let bytes = b.encode();
         assert_eq!(&bytes[6..9], &[0x45, 0x23, 0x01]);
-        assert_eq!(TxnBundle::decode(&bytes, response::BLOCK_TXNS).unwrap(), b);
+        assert_eq!(TxnList::decode(&bytes, response::BLOCK_TXNS).unwrap(), b);
     }
 
     #[test]
-    fn txn_bundle_carries_error_statuses() {
-        for status in
-            [Status::JobEmpty, Status::NoTemplate, Status::BadJobIndex, Status::BadRequest]
-        {
-            let e = TxnBundle { selector: response::TXNS, job_index: 2, status, txns: vec![] };
+    fn txn_list_carries_error_statuses() {
+        for status in [
+            TxnListStatus::JobEmpty,
+            TxnListStatus::NoTemplate,
+            TxnListStatus::BadJobIndex,
+            TxnListStatus::BadRequest,
+        ] {
+            let e = TxnList { selector: response::TXNS, job_index: 2, status, txns: vec![] };
             let bytes = e.encode();
             assert_eq!(bytes.len(), 4);
-            assert_eq!(TxnBundle::decode(&bytes, response::TXNS).unwrap(), e);
+            assert_eq!(TxnList::decode(&bytes, response::TXNS).unwrap(), e);
         }
     }
 
     #[test]
-    fn txn_bundle_rejects_malformed_messages() {
-        let bytes = sample_bundle(response::BLOCK_TXNS).encode();
+    fn txn_list_rejects_malformed_messages() {
+        let bytes = sample_txn_list(response::BLOCK_TXNS).encode();
         for cut in [1, 3, 6, 20, bytes.len() - 1] {
-            assert!(TxnBundle::decode(&bytes[..cut], response::BLOCK_TXNS).is_err(), "at {cut}");
+            assert!(TxnList::decode(&bytes[..cut], response::BLOCK_TXNS).is_err(), "at {cut}");
         }
         let mut oversize = bytes.clone();
         oversize[6] = 0xff;
         oversize[7] = 0xff;
         oversize[8] = 0xff;
-        assert_eq!(TxnBundle::decode(&oversize, response::BLOCK_TXNS), Err(Error::BadTxnSize));
+        assert_eq!(TxnList::decode(&oversize, response::BLOCK_TXNS), Err(Error::BadTxnSize));
         let mut miscount = bytes.clone();
         miscount[4] = 9;
-        assert!(TxnBundle::decode(&miscount, response::BLOCK_TXNS).is_err());
+        assert!(TxnList::decode(&miscount, response::BLOCK_TXNS).is_err());
     }
 }

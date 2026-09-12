@@ -1,6 +1,6 @@
 use super::config::{
-    Config, Datum, FEE_RAMP_WINDOW_SECONDS_RANGE, GLOBAL_TIMEOUT_MARGIN_SECS, MAX_CONFIGURED_TAG,
-    MAX_CONFIGURED_TAGS_TOTAL, WORK_UPDATE_SECONDS_RANGE,
+    Config, DatumConfig, FEE_RAMP_WINDOW_SECONDS_RANGE, GLOBAL_TIMEOUT_MARGIN_SECS,
+    MAX_CONFIGURED_TAG_LEN, MAX_CONFIGURED_TAGS_TOTAL_LEN, WORK_UPDATE_SECONDS_RANGE,
 };
 use serde_json::{Value, json};
 
@@ -198,7 +198,7 @@ fn shown_pool_host(cfg: &Config, doc: &Value) -> String {
     if !cfg.datum.pool_host.is_empty() {
         return cfg.datum.pool_host.clone();
     }
-    old_pool_host(doc).unwrap_or_else(|| Datum::default().pool_host)
+    old_pool_host(doc).unwrap_or_else(|| DatumConfig::default().pool_host)
 }
 
 fn old_pool_host(doc: &Value) -> Option<String> {
@@ -206,9 +206,9 @@ fn old_pool_host(doc: &Value) -> Option<String> {
 }
 
 fn secondary_tag_max(cfg: &Config) -> usize {
-    MAX_CONFIGURED_TAGS_TOTAL
+    MAX_CONFIGURED_TAGS_TOTAL_LEN
         .saturating_sub(cfg.mining.coinbase_tag_primary.len())
-        .min(MAX_CONFIGURED_TAG)
+        .min(MAX_CONFIGURED_TAG_LEN)
 }
 
 fn username_behaviour(cfg: &Config) -> &'static str {
@@ -317,7 +317,7 @@ fn submitted<'a>(form: &'a [(String, String)], name: &str) -> Option<&'a str> {
 
 fn apply_reward_sharing(edit: &mut Edit<'_>, cfg: &Config, form: &[(String, String)]) {
     let mut pool_host = cfg.datum.pool_host.clone();
-    let default_host = Datum::default().pool_host;
+    let default_host = DatumConfig::default().pool_host;
     match submitted(form, "reward_sharing") {
         None => {}
         Some(choice @ ("require" | "prefer")) => {
@@ -556,7 +556,7 @@ mod tests {
         assert_eq!(doc["datum"]["pool_host"], "");
         assert_eq!(doc["datum"]["pool_host(old)"], "pool.example");
         assert_eq!(form_values(&c, &doc)["datum_pool_host"], "pool.example");
-        let default = Datum::default().pool_host;
+        let default = DatumConfig::default().pool_host;
         assert_eq!(apply(&c, FILE, &form(&[("datum_pool_host", default.as_str())])).unwrap(), None);
 
         let key = "f21f2f0ef0aa1970468f22bad9bb7f4535146f8e4a8f646bebc93da3d89b1406f40d032f09a417d94dc068055df654937922d2c89522e3e8f6f0e649de473003";

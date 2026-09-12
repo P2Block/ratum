@@ -1,10 +1,9 @@
 use crate::config::Config;
 use log::{debug, error, info, warn};
+use ratum::datum::validation::MAX_SHORT_LIST_TXNS;
 use ratum::rpc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
-
-pub const MAX_TXNS: usize = 16383;
 
 const HASH_HEX_CHARS: std::ops::RangeInclusive<usize> = 64..=64;
 const BITS_HEX_CHARS: std::ops::RangeInclusive<usize> = 8..=8;
@@ -39,7 +38,7 @@ pub struct Template {
     pub prev_hash_hex: String,
     pub prev_hash: [u8; 32],
     pub witness_commitment: Vec<u8>,
-    pub v2: bool,
+    pub blake2b_rule: bool,
     pub reduced_data: bool,
     pub txns: Vec<Txn>,
     pub totals: TxnTotals,
@@ -57,7 +56,10 @@ pub enum TemplateError {
     Missing(&'static str),
     #[error("{0}")]
     Refused(String),
-    #[error("DATUM Gateway does not support blocks with more than {MAX_TXNS} transactions")]
+    #[error(
+        "DATUM Gateway does not support blocks with more than {} transactions",
+        MAX_SHORT_LIST_TXNS
+    )]
     TooManyTxns,
 }
 
@@ -80,7 +82,7 @@ fn str_field<'a>(
 }
 
 fn hash_field(v: &serde_json::Value, key: &'static str) -> Result<[u8; 32], TemplateError> {
-    ratum::header::u256_from_display_hex(str_field(v, key, HASH_HEX_CHARS)?)
+    ratum::header::hash_from_display_hex(str_field(v, key, HASH_HEX_CHARS)?)
         .ok_or(TemplateError::Missing(key))
 }
 
@@ -89,29 +91,29 @@ fn rule_present(v: &serde_json::Value, rule: &str) -> bool {
 }
 
 #[derive(Default)]
-pub struct Announced {
-    payout: Option<u32>,
+pub struct RefusalLog {
+    payout_script_height: Option<u32>,
 }
 
 pub fn parse(
     v: &serde_json::Value,
     payout_script: &[u8],
-    announced: &mut Announced,
+    refusals: &mut RefusalLog,
 ) -> Result<Template, TemplateError> {
-    let reduced_data = check_rules(v, payout_script, announced)?;
+    let reduced_data = check_rules(v, payout_script, refusals)?;
     decode(v, reduced_data)
 }
 
 fn check_rules(
     v: &serde_json::Value,
     payout_script: &[u8],
-    announced: &mut Announced,
+    refusals: &mut RefusalLog,
 ) -> Result<bool, TemplateError> {
     let height = u64_field(v, "height")? as u32;
     let reduced_data = rule_present(v, "reduced_data");
     if reduced_data && !ratum::bitcoin::output_script_size_is_valid(payout_script) {
-        if announced.payout != Some(height) {
-            announced.payout = Some(height);
+        if refusals.payout_script_height != Some(height) {
+            refusals.payout_script_height = Some(height);
             error!(
                 "Pool payout output script is {} bytes, but the node enforces the reduced_data rule for block {height}, which limits a non-OP_RETURN coinbase output script to {} bytes. Serving no work for this block.",
                 payout_script.len(),
@@ -139,10 +141,10 @@ fn decode(v: &serde_json::Value, reduced_data: bool) -> Result<Template, Templat
         hex::decode(wc_hex).map_err(|_| TemplateError::Missing("default_witness_commitment"))?;
     let nbits = u32::from_str_radix(bits, 16).map_err(|_| TemplateError::Missing("bits"))?;
     let prev_hash = hash_field(v, "previousblockhash")?;
-    let v2 = rule_present(v, "!blake2b");
+    let blake2b_rule = rule_present(v, "!blake2b");
 
     let list = v["transactions"].as_array().ok_or(TemplateError::Missing("transactions"))?;
-    if list.len() > MAX_TXNS {
+    if list.len() > usize::from(MAX_SHORT_LIST_TXNS) {
         return Err(TemplateError::TooManyTxns);
     }
     let mut txns = Vec::with_capacity(list.len());
@@ -179,7 +181,7 @@ fn decode(v: &serde_json::Value, reduced_data: bool) -> Result<Template, Templat
         prev_hash_hex,
         prev_hash,
         witness_commitment,
-        v2,
+        blake2b_rule,
         reduced_data,
         txns,
         totals: TxnTotals { fee, weight: weight as u32, size: size as u32, sigops: sigops as u32 },
@@ -187,15 +189,15 @@ fn decode(v: &serde_json::Value, reduced_data: bool) -> Result<Template, Templat
 }
 
 #[derive(Default)]
-pub struct Notify {
-    pending: Mutex<Pending>,
+pub struct TemplateWaker {
+    pending: Mutex<PendingWakes>,
     signal: Condvar,
 }
 
 #[derive(Default)]
-struct Pending {
+struct PendingWakes {
     block: Option<PendingBlock>,
-    rebuild: bool,
+    rebuild_requested: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -220,7 +222,7 @@ pub enum Wake {
     Timeout,
 }
 
-impl Notify {
+impl TemplateWaker {
     pub fn raise(&self) {
         self.raise_block(None);
     }
@@ -240,7 +242,7 @@ impl Notify {
     }
 
     pub fn rebuild(&self) {
-        ratum::lock(&self.pending).rebuild = true;
+        ratum::lock(&self.pending).rebuild_requested = true;
         self.signal.notify_all();
     }
 
@@ -248,13 +250,13 @@ impl Notify {
         let g = ratum::lock(&self.pending);
         let (mut g, _) = self
             .signal
-            .wait_timeout_while(g, d, |p| p.block.is_none() && !p.rebuild)
+            .wait_timeout_while(g, d, |p| p.block.is_none() && !p.rebuild_requested)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(pending) = g.block.take() {
-            g.rebuild = false;
+            g.rebuild_requested = false;
             Wake::Block(pending.hash())
-        } else if g.rebuild {
-            g.rebuild = false;
+        } else if g.rebuild_requested {
+            g.rebuild_requested = false;
             Wake::Rebuild
         } else {
             Wake::Timeout
@@ -264,7 +266,7 @@ impl Notify {
 
 const FALLBACK_NOTIFY_INTERVAL: Duration = Duration::from_secs(1);
 
-pub fn fallback_notifier(node: rpc::Client, notify: Arc<Notify>) {
+pub fn fallback_notifier(node: rpc::Client, template_waker: Arc<TemplateWaker>) {
     let mut last: Option<String> = None;
     loop {
         match node.call("getbestblockhash", serde_json::json!([])) {
@@ -272,7 +274,7 @@ pub fn fallback_notifier(node: rpc::Client, notify: Arc<Notify>) {
                 if let Some(h) = v.as_str() {
                     if last.as_deref().is_some_and(|l| l != h) {
                         debug!("getbestblockhash changed to {h}");
-                        notify.raise_for(h);
+                        template_waker.raise_for(h);
                     }
                     last = Some(h.to_string());
                 }
@@ -300,9 +302,9 @@ pub type LastError = Mutex<Option<String>>;
 struct Poller {
     config: Arc<Config>,
     last_error: Arc<LastError>,
-    announced: Announced,
-    last_prev: Option<String>,
-    no_v2_rule_reported: Option<u32>,
+    refusals: RefusalLog,
+    last_prev_hash_hex: Option<String>,
+    no_blake2b_rule_reported: Option<u32>,
     was_notified: bool,
     notified_at: Instant,
     last_block_change: Option<Instant>,
@@ -315,9 +317,9 @@ impl Poller {
         Self {
             config,
             last_error,
-            announced: Announced::default(),
-            last_prev: None,
-            no_v2_rule_reported: None,
+            refusals: RefusalLog::default(),
+            last_prev_hash_hex: None,
+            no_blake2b_rule_reported: None,
             was_notified: false,
             notified_at: Instant::now(),
             last_block_change: None,
@@ -335,7 +337,7 @@ impl Poller {
                 return None;
             }
         };
-        match parse(&raw, payout_script, &mut self.announced) {
+        match parse(&raw, payout_script, &mut self.refusals) {
             Ok(t) => {
                 *ratum::lock(&self.last_error) = None;
                 self.last_refusal = None;
@@ -360,24 +362,25 @@ impl Poller {
     }
 
     fn classify(&mut self, template: &Template) -> Action {
-        let tip_changed = self.last_prev.as_deref() != Some(template.prev_hash_hex.as_str());
+        let tip_changed =
+            self.last_prev_hash_hex.as_deref() != Some(template.prev_hash_hex.as_str());
         let new_block = tip_changed || self.force_clean;
         self.force_clean = false;
-        if !template.v2 {
-            if self.no_v2_rule_reported != Some(template.height) {
-                self.no_v2_rule_reported = Some(template.height);
+        if !template.blake2b_rule {
+            if self.no_blake2b_rule_reported != Some(template.height) {
+                self.no_blake2b_rule_reported = Some(template.height);
                 warn!(
                     "Node does not list the !blake2b rule for block {}; this gateway builds only version 2 (BLAKE2b) headers, so no work will be served until the rule is active.",
                     template.height
                 );
             }
-            self.last_prev = Some(template.prev_hash_hex.clone());
+            self.last_prev_hash_hex = Some(template.prev_hash_hex.clone());
             self.was_notified = false;
             return Action::Skip;
         }
         if tip_changed {
             info!("NEW NETWORK BLOCK: {} ({})", template.prev_hash_hex, template.height);
-            self.last_prev = Some(template.prev_hash_hex.clone());
+            self.last_prev_hash_hex = Some(template.prev_hash_hex.clone());
             self.last_block_change = Some(Instant::now());
             self.was_notified = false;
         } else if new_block {
@@ -397,7 +400,9 @@ impl Poller {
 
     fn on_wake(&mut self, wake: Wake) {
         match wake {
-            Wake::Block(Some(hash)) if self.last_prev.as_deref() == Some(hash.as_str()) => {
+            Wake::Block(Some(hash))
+                if self.last_prev_hash_hex.as_deref() == Some(hash.as_str()) =>
+            {
                 debug!("block notification for the tip already served ({hash}); ignored");
             }
             Wake::Block(_)
@@ -425,7 +430,7 @@ impl Poller {
 pub fn run(
     node: rpc::Client,
     config: Arc<Config>,
-    notify: Arc<Notify>,
+    template_waker: Arc<TemplateWaker>,
     last_error: Arc<LastError>,
     payout_script: impl Fn() -> Vec<u8>,
     mut on_template: impl FnMut(Arc<Template>, bool),
@@ -456,7 +461,7 @@ pub fn run(
                 on_template(t, new_block);
             }
         }
-        p.on_wake(notify.wait(interval));
+        p.on_wake(template_waker.wait(interval));
     }
 }
 
@@ -491,7 +496,7 @@ pub(crate) mod tests {
             prev_hash_hex: "00".repeat(32),
             prev_hash: [0u8; 32],
             witness_commitment: wc,
-            v2: true,
+            blake2b_rule: true,
             reduced_data: false,
             txns: vec![],
             totals: TxnTotals::default(),
@@ -499,7 +504,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn job_with_id(job_id: &str) -> crate::job::Job {
-        let mut b = crate::job::Builder::new(Arc::new(config()));
+        let mut b = crate::job::JobBuilder::new(Arc::new(config()));
         let mut job = b.build(Arc::new(template()), false, None, None, None).unwrap();
         job.job_id = job_id.to_string();
         job
@@ -526,7 +531,7 @@ pub(crate) mod tests {
 
     #[test]
     fn notifications_carry_their_tip_and_an_unknown_tip_outranks_a_known_one() {
-        let n = Notify::default();
+        let n = TemplateWaker::default();
         assert_eq!(n.wait(Duration::from_millis(1)), Wake::Timeout);
         n.raise_for("aa");
         assert_eq!(n.wait(Duration::from_millis(1)), Wake::Block(Some("aa".into())));
@@ -541,15 +546,15 @@ pub(crate) mod tests {
 
     #[test]
     fn parses_a_template() {
-        let mut a = Announced::default();
+        let mut a = RefusalLog::default();
         let t = parse(&gbt(20, &["segwit", "!blake2b"]), &[0; 22], &mut a).unwrap();
         assert_eq!(t.height, 20);
         assert_eq!(t.nbits, 0x207fffff);
         assert_eq!(t.nbits.to_le_bytes(), [0xff, 0xff, 0x7f, 0x20]);
         assert_eq!(t.prev_hash[31], 0x0f);
         assert_eq!(t.witness_commitment.len(), 38);
-        assert!(t.v2);
-        assert!(!parse(&gbt(20, &["segwit"]), &[0; 22], &mut a).unwrap().v2);
+        assert!(t.blake2b_rule);
+        assert!(!parse(&gbt(20, &["segwit"]), &[0; 22], &mut a).unwrap().blake2b_rule);
     }
 
     #[test]
@@ -572,7 +577,7 @@ pub(crate) mod tests {
 
     #[test]
     fn reduced_data_refuses_an_oversized_payout_script() {
-        let mut a = Announced::default();
+        let mut a = RefusalLog::default();
         let v = gbt(21, &["segwit", "!blake2b", "reduced_data"]);
         assert!(parse(&v, &[0; 35], &mut a).is_err());
         assert!(parse(&v, &[0; 34], &mut a).is_ok());
@@ -582,9 +587,9 @@ pub(crate) mod tests {
         Poller {
             config: Arc::new(config()),
             last_error: Arc::new(Mutex::new(None)),
-            announced: Announced::default(),
-            last_prev: None,
-            no_v2_rule_reported: None,
+            refusals: RefusalLog::default(),
+            last_prev_hash_hex: None,
+            no_blake2b_rule_reported: None,
             was_notified: false,
             notified_at: Instant::now(),
             last_block_change: None,
@@ -602,7 +607,7 @@ pub(crate) mod tests {
         p.on_wake(Wake::Rebuild);
         assert_eq!(p.classify(&t), Action::Build { new_block: true }, "a rebuild is clean");
         let mut no_rule = template();
-        no_rule.v2 = false;
+        no_rule.blake2b_rule = false;
         assert_eq!(p.classify(&no_rule), Action::Skip);
     }
 

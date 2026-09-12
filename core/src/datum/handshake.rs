@@ -1,30 +1,25 @@
-use super::framing::{self, Header, HeaderKeys, KeyRatchet, STRUCT_END, SessionNonces};
+use super::channel::{Channel, Error, Signature};
+use super::framing::{self, FrameHeader, HeaderKeyRatchet, HeaderKeys, STRUCT_END, SessionNonces};
 use dryoc::classic::crypto_box::{
-    PublicKey as BoxPublicKey, SecretKey as BoxSecretKey, crypto_box_beforenm,
-    crypto_box_easy_afternm, crypto_box_keypair, crypto_box_open_easy_afternm, crypto_box_seal,
-    crypto_box_seal_open,
+    PublicKey as BoxPublicKey, SecretKey as BoxSecretKey, crypto_box_beforenm, crypto_box_keypair,
+    crypto_box_seal, crypto_box_seal_open,
 };
 use dryoc::classic::crypto_sign::{
     PublicKey as SignPublicKey, SecretKey as SignSecretKey, crypto_sign_detached,
     crypto_sign_keypair, crypto_sign_verify_detached,
 };
-use dryoc::constants::{
-    CRYPTO_BOX_BEFORENMBYTES, CRYPTO_BOX_MACBYTES, CRYPTO_BOX_SEALBYTES, CRYPTO_SIGN_BYTES,
-};
-
-pub(crate) type PrecompKey = [u8; CRYPTO_BOX_BEFORENMBYTES];
-pub(crate) type Signature = [u8; CRYPTO_SIGN_BYTES];
+use dryoc::constants::{CRYPTO_BOX_SEALBYTES, CRYPTO_SIGN_BYTES};
 
 pub const PUBKEY_LEN: usize = 32;
-pub(crate) const HELLO_KEYS: usize = 4;
-pub(crate) const KEYS_LEN: usize = HELLO_KEYS * PUBKEY_LEN;
-pub(crate) const POOL_SIGN_KEY_INDEX: usize = HELLO_KEYS;
-pub(crate) const POOL_BOX_KEY_INDEX: usize = HELLO_KEYS + 1;
-pub(crate) const RESPONSE_KEYS_LEN: usize = (POOL_BOX_KEY_INDEX + 1) * PUBKEY_LEN;
+pub(crate) const HELLO_PUBKEY_COUNT: usize = 4;
+pub(crate) const HELLO_PUBKEYS_LEN: usize = HELLO_PUBKEY_COUNT * PUBKEY_LEN;
+pub(crate) const POOL_SIGN_KEY_INDEX: usize = HELLO_PUBKEY_COUNT;
+pub(crate) const POOL_BOX_KEY_INDEX: usize = HELLO_PUBKEY_COUNT + 1;
+pub(crate) const RESPONSE_PUBKEYS_LEN: usize = (POOL_BOX_KEY_INDEX + 1) * PUBKEY_LEN;
 
-const MAX_USER_AGENT: usize = 256;
+const MAX_USER_AGENT_LEN: usize = 256;
 const AFTER_UA_LEN: usize = 1 + size_of::<u32>();
-pub const MAX_MOTD: usize = 511;
+pub const MAX_MOTD_LEN: usize = 511;
 
 pub(crate) fn key_at(block: &[u8], n: usize) -> Option<&[u8]> {
     block.get(n * PUBKEY_LEN..(n + 1) * PUBKEY_LEN)
@@ -32,34 +27,6 @@ pub(crate) fn key_at(block: &[u8], n: usize) -> Option<&[u8]> {
 
 pub(crate) fn pubkey_at(block: &[u8], n: usize) -> [u8; PUBKEY_LEN] {
     key_at(block, n).expect("the caller checked the length").try_into().expect("PUBKEY_LEN bytes")
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("unexpected handshake frame header: {0:?}")]
-    BadHeader(Header),
-    #[error("input truncated")]
-    Truncated,
-    #[error("could not unseal payload")]
-    Unseal,
-    #[error("could not seal payload")]
-    Seal,
-    #[error("signature verification failed")]
-    BadSignature,
-    #[error("could not sign payload")]
-    Sign,
-    #[error("malformed payload: {0}")]
-    Malformed(&'static str),
-    #[error("could not decrypt channel message")]
-    Decrypt,
-    #[error("could not encrypt channel message")]
-    Encrypt,
-    #[error("channel not established")]
-    NoChannel,
-    #[error("no session signing key for the peer")]
-    NoVerifyKey,
-    #[error("frame too large: {0} bytes")]
-    TooLarge(usize),
 }
 
 #[derive(Clone)]
@@ -120,7 +87,7 @@ pub const DRS_FLAG_AT: usize = DRS_MARKER.len();
 pub const DRS_TOKEN_AT: usize = DRS_FLAG_AT + 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Generation {
+pub enum ProtocolVersion {
     V1,
     V3 { resume: Option<super::messages::ResumeToken> },
 }
@@ -133,10 +100,10 @@ pub struct Hello {
     pub session_box_pk: BoxPublicKey,
     pub user_agent: String,
     pub nk: u32,
-    pub generation: Generation,
+    pub protocol_version: ProtocolVersion,
 }
 
-pub fn open_hello(header: Header, payload: &[u8], pool: &KeyPairs) -> Result<Hello, Error> {
+pub fn open_hello(header: FrameHeader, payload: &[u8], pool: &KeyPairs) -> Result<Hello, Error> {
     if header.proto_cmd != framing::cmd::HELLO_OR_PING
         || !header.is_signed
         || !header.is_encrypted_pubkey
@@ -151,7 +118,7 @@ pub fn open_hello(header: Header, payload: &[u8], pool: &KeyPairs) -> Result<Hel
     crypto_box_seal_open(&mut plain, payload, &pool.box_pk, &pool.box_sk)
         .map_err(|_| Error::Unseal)?;
 
-    if plain.len() < KEYS_LEN + CRYPTO_SIGN_BYTES {
+    if plain.len() < HELLO_PUBKEYS_LEN + CRYPTO_SIGN_BYTES {
         return Err(Error::Truncated);
     }
     let (signed, sig) = plain.split_at(plain.len() - CRYPTO_SIGN_BYTES);
@@ -163,9 +130,9 @@ pub fn open_hello(header: Header, payload: &[u8], pool: &KeyPairs) -> Result<Hel
     let session_sign_pk: SignPublicKey = pubkey_at(signed, 2);
     let session_box_pk: BoxPublicKey = pubkey_at(signed, 3);
 
-    let rest = &signed[KEYS_LEN..];
+    let rest = &signed[HELLO_PUBKEYS_LEN..];
     let nul = rest.iter().position(|&b| b == 0).ok_or(Error::Malformed("no UA terminator"))?;
-    let user_agent = String::from_utf8_lossy(&rest[..nul.min(MAX_USER_AGENT)]).into_owned();
+    let user_agent = String::from_utf8_lossy(&rest[..nul.min(MAX_USER_AGENT_LEN)]).into_owned();
     let after = &rest[nul + 1..];
     if after.len() < AFTER_UA_LEN {
         return Err(Error::Truncated);
@@ -176,7 +143,7 @@ pub fn open_hello(header: Header, payload: &[u8], pool: &KeyPairs) -> Result<Hel
     let nk = u32::from_le_bytes(after[1..AFTER_UA_LEN].try_into().expect("AFTER_UA_LEN - 1 bytes"));
 
     let tail = &after[AFTER_UA_LEN..];
-    let generation = if tail.len() > DRS_FLAG_AT && tail[..DRS_FLAG_AT] == DRS_MARKER {
+    let protocol_version = if tail.len() > DRS_FLAG_AT && tail[..DRS_FLAG_AT] == DRS_MARKER {
         let resume = if tail[DRS_FLAG_AT] != 0 {
             let token: super::messages::ResumeToken = tail
                 .get(DRS_TOKEN_AT..DRS_TOKEN_AT + super::messages::RESUME_TOKEN_LEN)
@@ -187,9 +154,9 @@ pub fn open_hello(header: Header, payload: &[u8], pool: &KeyPairs) -> Result<Hel
         } else {
             None
         };
-        Generation::V3 { resume }
+        ProtocolVersion::V3 { resume }
     } else {
-        Generation::V1
+        ProtocolVersion::V1
     };
 
     Ok(Hello {
@@ -199,144 +166,26 @@ pub fn open_hello(header: Header, payload: &[u8], pool: &KeyPairs) -> Result<Hel
         session_box_pk,
         user_agent,
         nk,
-        generation,
+        protocol_version,
     })
 }
 
-pub struct Channel {
-    precomp: Option<PrecompKey>,
-    tx_nonce: [u8; framing::NONCE_LEN],
-    rx_nonce: [u8; framing::NONCE_LEN],
-    tx_headers: KeyRatchet,
-    rx_headers: KeyRatchet,
-}
-
-impl Channel {
-    pub fn before_handshake() -> Self {
-        Self {
-            precomp: None,
-            tx_nonce: [0; framing::NONCE_LEN],
-            rx_nonce: [0; framing::NONCE_LEN],
-            tx_headers: KeyRatchet::hello(),
-            rx_headers: KeyRatchet::hello(),
-        }
-    }
-
-    pub fn new(
-        tx_headers: KeyRatchet,
-        rx_headers: KeyRatchet,
-        tx_nonce: [u8; framing::NONCE_LEN],
-        rx_nonce: [u8; framing::NONCE_LEN],
-        precomp: Option<PrecompKey>,
-    ) -> Self {
-        Self { precomp, tx_nonce, rx_nonce, tx_headers, rx_headers }
-    }
-
-    pub fn set_precomp(&mut self, precomp: PrecompKey) {
-        self.precomp = Some(precomp);
-    }
-
-    pub fn mask_header(&mut self, header: Header) -> [u8; framing::HEADER_LEN] {
-        self.tx_headers.mask(header)
-    }
-
-    pub fn unmask_header(&mut self, bytes: [u8; framing::HEADER_LEN]) -> Header {
-        self.rx_headers.unmask(bytes)
-    }
-
-    pub fn encrypt(
-        &mut self,
-        proto_cmd: u8,
-        payload: &[u8],
-        sign_with: Option<&SignSecretKey>,
-    ) -> Result<Vec<u8>, Error> {
-        let precomp = self.precomp.as_ref().ok_or(Error::NoChannel)?;
-        let signed_body;
-        let plain: &[u8] = match sign_with {
-            Some(sk) => {
-                let mut sig: Signature = [0u8; CRYPTO_SIGN_BYTES];
-                crypto_sign_detached(&mut sig, payload, sk).map_err(|_| Error::Sign)?;
-                let mut body = Vec::with_capacity(payload.len() + CRYPTO_SIGN_BYTES);
-                body.extend_from_slice(payload);
-                body.extend_from_slice(&sig);
-                signed_body = body;
-                &signed_body
-            }
-            None => payload,
-        };
-        let ct_len = plain.len() + CRYPTO_BOX_MACBYTES;
-        if ct_len as u64 > u64::from(framing::MAX_CMD_LEN) {
-            return Err(Error::TooLarge(ct_len));
-        }
-        let mut ct = vec![0u8; ct_len];
-        crypto_box_easy_afternm(&mut ct, plain, &self.tx_nonce, precomp)
-            .map_err(|_| Error::Encrypt)?;
-        framing::increment_nonce(&mut self.tx_nonce);
-        let header = Header {
-            cmd_len: ct.len() as u32,
-            is_signed: sign_with.is_some(),
-            is_encrypted_channel: true,
-            proto_cmd,
-            ..Default::default()
-        };
-        let mut out = Vec::with_capacity(framing::HEADER_LEN + ct.len());
-        out.extend_from_slice(&self.tx_headers.mask(header));
-        out.extend_from_slice(&ct);
-        Ok(out)
-    }
-
-    pub fn decrypt(
-        &mut self,
-        header: Header,
-        ciphertext: &[u8],
-        verify_with: Option<&SignPublicKey>,
-    ) -> Result<Vec<u8>, Error> {
-        let precomp = self.precomp.as_ref().ok_or(Error::NoChannel)?;
-        if ciphertext.len() < CRYPTO_BOX_MACBYTES {
-            return Err(Error::Truncated);
-        }
-        let mut plain = vec![0u8; ciphertext.len() - CRYPTO_BOX_MACBYTES];
-        crypto_box_open_easy_afternm(&mut plain, ciphertext, &self.rx_nonce, precomp)
-            .map_err(|_| Error::Decrypt)?;
-        framing::increment_nonce(&mut self.rx_nonce);
-        strip_signature(plain, header, verify_with)
-    }
-}
-
-pub fn strip_signature(
-    mut plain: Vec<u8>,
-    header: Header,
-    verify_with: Option<&SignPublicKey>,
-) -> Result<Vec<u8>, Error> {
-    if header.is_signed {
-        if plain.len() < CRYPTO_SIGN_BYTES {
-            return Err(Error::Truncated);
-        }
-        let pk = verify_with.ok_or(Error::NoVerifyKey)?;
-        let (signed, sig) = plain.split_at(plain.len() - CRYPTO_SIGN_BYTES);
-        let sig: Signature = sig.try_into().map_err(|_| Error::Truncated)?;
-        crypto_sign_verify_detached(&sig, signed, pk).map_err(|_| Error::BadSignature)?;
-        plain.truncate(plain.len() - CRYPTO_SIGN_BYTES);
-    }
-    Ok(plain)
-}
-
-pub struct Session {
+pub struct ServerChannel {
     channel: Channel,
     session_sign_sk: SignSecretKey,
     hello: Hello,
 }
 
-impl Session {
+impl ServerChannel {
     pub fn encrypt(&mut self, proto_cmd: u8, payload: &[u8], sign: bool) -> Result<Vec<u8>, Error> {
         self.channel.encrypt(proto_cmd, payload, sign.then_some(&self.session_sign_sk))
     }
 
-    pub fn unmask_header(&mut self, bytes: [u8; framing::HEADER_LEN]) -> Header {
+    pub fn unmask_header(&mut self, bytes: [u8; framing::HEADER_LEN]) -> FrameHeader {
         self.channel.unmask_header(bytes)
     }
 
-    pub fn decrypt(&mut self, header: Header, ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
+    pub fn decrypt(&mut self, header: FrameHeader, ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
         if !header.is_encrypted_channel || header.is_encrypted_pubkey {
             return Err(Error::Malformed(
                 "client message is not a channel-encrypted frame (sealed or plain)",
@@ -346,11 +195,15 @@ impl Session {
     }
 }
 
-pub fn accept(hello: Hello, pool: &KeyPairs, motd: &str) -> Result<(Vec<u8>, Session), Error> {
+pub fn accept(
+    hello: Hello,
+    pool: &KeyPairs,
+    motd: &str,
+) -> Result<(Vec<u8>, ServerChannel), Error> {
     let (session_sign_pk, session_sign_sk) = crypto_sign_keypair();
     let (session_box_pk, session_box_sk) = crypto_box_keypair();
 
-    let mut body = Vec::with_capacity(RESPONSE_KEYS_LEN + motd.len() + 1);
+    let mut body = Vec::with_capacity(RESPONSE_PUBKEYS_LEN + motd.len() + 1);
     body.extend_from_slice(&hello.client_sign_pk);
     body.extend_from_slice(&hello.client_box_pk);
     body.extend_from_slice(&hello.session_sign_pk);
@@ -358,7 +211,7 @@ pub fn accept(hello: Hello, pool: &KeyPairs, motd: &str) -> Result<(Vec<u8>, Ses
     body.extend_from_slice(&session_sign_pk);
     body.extend_from_slice(&session_box_pk);
     let motd_bytes = motd.as_bytes();
-    let motd_bytes = &motd_bytes[..motd_bytes.len().min(MAX_MOTD)];
+    let motd_bytes = &motd_bytes[..motd_bytes.len().min(MAX_MOTD_LEN)];
     body.extend_from_slice(motd_bytes);
     body.push(0);
 
@@ -373,8 +226,8 @@ pub fn accept(hello: Hello, pool: &KeyPairs, motd: &str) -> Result<(Vec<u8>, Ses
     }
 
     let keys = HeaderKeys::from_nk(hello.nk);
-    let mut tx_headers = KeyRatchet::new(keys.server_to_client);
-    let header = Header {
+    let mut tx_header_key = HeaderKeyRatchet::new(keys.server_to_client);
+    let header = FrameHeader {
         cmd_len: sealed.len() as u32,
         is_signed: true,
         is_encrypted_pubkey: true,
@@ -382,7 +235,7 @@ pub fn accept(hello: Hello, pool: &KeyPairs, motd: &str) -> Result<(Vec<u8>, Ses
         ..Default::default()
     };
     let mut out = Vec::with_capacity(framing::HEADER_LEN + sealed.len());
-    out.extend_from_slice(&tx_headers.mask(header));
+    out.extend_from_slice(&tx_header_key.mask(header));
     out.extend_from_slice(&sealed);
 
     let precomp = crypto_box_beforenm(&hello.session_box_pk, &session_box_sk)
@@ -391,10 +244,10 @@ pub fn accept(hello: Hello, pool: &KeyPairs, motd: &str) -> Result<(Vec<u8>, Ses
 
     Ok((
         out,
-        Session {
+        ServerChannel {
             channel: Channel::new(
-                tx_headers,
-                KeyRatchet::new(keys.client_to_server),
+                tx_header_key,
+                HeaderKeyRatchet::new(keys.client_to_server),
                 nonces.client_receiver,
                 nonces.client_sender,
                 Some(precomp),
@@ -406,16 +259,16 @@ pub fn accept(hello: Hello, pool: &KeyPairs, motd: &str) -> Result<(Vec<u8>, Ses
 }
 
 #[cfg(test)]
-mod tests {
-
-    fn client_with_generated_keys(nk: u32) -> Client {
-        Client::with_key_pairs(KeyPairs::generate(), KeyPairs::generate(), nk)
-    }
+pub(crate) mod tests {
     use super::*;
-    use crate::datum::client::Client;
+    use crate::datum::client::ClientChannel;
 
-    fn server_read_hello(wire: &[u8], pool: &KeyPairs) -> Result<Hello, Error> {
-        let mut rx = KeyRatchet::hello();
+    pub(crate) fn client_with_generated_keys(nk: u32) -> ClientChannel {
+        ClientChannel::with_key_pairs(KeyPairs::generate(), KeyPairs::generate(), nk)
+    }
+
+    pub(crate) fn server_read_hello(wire: &[u8], pool: &KeyPairs) -> Result<Hello, Error> {
+        let mut rx = HeaderKeyRatchet::initial();
         let header = rx.unmask(wire[..4].try_into().unwrap());
         open_hello(header, &wire[4..4 + header.cmd_len as usize], pool)
     }
@@ -443,7 +296,7 @@ mod tests {
         let mut sealed = vec![0u8; body.len() + CRYPTO_BOX_SEALBYTES];
         crypto_box_seal(&mut sealed, &body, &pool.box_pk).unwrap();
 
-        let header = Header {
+        let header = FrameHeader {
             cmd_len: sealed.len() as u32,
             is_signed: true,
             is_encrypted_pubkey: true,
@@ -478,7 +331,7 @@ mod tests {
     #[test]
     fn rejects_wrong_command() {
         let pool = KeyPairs::generate();
-        let header = Header {
+        let header = FrameHeader {
             cmd_len: 100,
             is_signed: true,
             is_encrypted_pubkey: true,

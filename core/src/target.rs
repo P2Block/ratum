@@ -3,30 +3,30 @@ pub type Target = [u8; 32];
 const TARGET_BYTES: usize = 32;
 pub const DIFF1_EXPONENT: u32 = 224;
 
-const COMPACT_SIZE_SHIFT: u32 = 24;
-const COMPACT_MANTISSA_MASK: u32 = 0x007f_ffff;
-const COMPACT_SIGN_BIT: u32 = 0x0080_0000;
-const COMPACT_MANTISSA_SIGN: u32 = 0x80;
-const MAX_COMPACT_SIZE: usize = 34;
+const COMPACT_TARGET_SIZE_SHIFT: u32 = 24;
+const COMPACT_TARGET_MANTISSA_MASK: u32 = 0x007f_ffff;
+const COMPACT_TARGET_SIGN_BIT: u32 = 0x0080_0000;
+const COMPACT_TARGET_MANTISSA_SIGN_BIT: u32 = 0x80;
+const MAX_COMPACT_TARGET_SIZE: usize = 34;
 
 const QUOTIENT_BITS: i32 = 64;
 const QUOTIENT_BYTES: usize = 12;
 
-pub const MAX_TARGET_POT: u8 = (u64::BITS - 1) as u8;
+pub const MAX_TARGET_EXPONENT: u8 = (u64::BITS - 1) as u8;
 
-pub const DIFF1_TARGET: Target = target_for_pot(0);
+pub const DIFF1_TARGET: Target = target_for_exponent(0);
 
 pub fn bits_to_target(bits: u32) -> Option<Target> {
-    if bits & COMPACT_SIGN_BIT != 0 {
+    if bits & COMPACT_TARGET_SIGN_BIT != 0 {
         return None;
     }
-    let exp = (bits >> COMPACT_SIZE_SHIFT) as isize;
-    if exp > MAX_COMPACT_SIZE as isize {
+    let size = (bits >> COMPACT_TARGET_SIZE_SHIFT) as isize;
+    if size > MAX_COMPACT_TARGET_SIZE as isize {
         return None;
     }
     let mut t = [0u8; TARGET_BYTES];
-    for (i, b) in (bits & COMPACT_MANTISSA_MASK).to_be_bytes()[1..].iter().enumerate() {
-        match TARGET_BYTES as isize - exp + i as isize {
+    for (i, b) in (bits & COMPACT_TARGET_MANTISSA_MASK).to_be_bytes()[1..].iter().enumerate() {
+        match TARGET_BYTES as isize - size + i as isize {
             at if at >= TARGET_BYTES as isize => {}
             at if at >= 0 => t[at as usize] = *b,
             _ if *b == 0 => {}
@@ -40,7 +40,7 @@ pub fn meets_target(hash: &[u8; 32], target: &Target) -> bool {
     hash <= target
 }
 
-pub const fn target_for_pot(exponent: u8) -> Target {
+pub const fn target_for_exponent(exponent: u8) -> Target {
     let mut t = [0u8; TARGET_BYTES];
     let bit = DIFF1_EXPONENT.saturating_sub(exponent as u32);
     t[TARGET_BYTES - 1 - (bit / 8) as usize] = 1 << (bit % 8);
@@ -91,10 +91,10 @@ fn target_to_bits(target: &Target) -> u32 {
     let size = (TARGET_BYTES - first) as u32;
     let at = |i: usize| u32::from(target.get(i).copied().unwrap_or(0));
     let (m0, m1, m2) = (at(first), at(first + 1), at(first + 2));
-    if m0 & COMPACT_MANTISSA_SIGN != 0 {
-        ((size + 1) << COMPACT_SIZE_SHIFT) | (m0 << 8) | m1
+    if m0 & COMPACT_TARGET_MANTISSA_SIGN_BIT != 0 {
+        ((size + 1) << COMPACT_TARGET_SIZE_SHIFT) | (m0 << 8) | m1
     } else {
-        (size << COMPACT_SIZE_SHIFT) | (m0 << 16) | (m1 << 8) | m2
+        (size << COMPACT_TARGET_SIZE_SHIFT) | (m0 << 16) | (m1 << 8) | m2
     }
 }
 
@@ -102,16 +102,16 @@ pub fn share_nbits(exponent: u8) -> u32 {
     target_to_bits(&share_target(exponent))
 }
 
-pub fn floor_pot(diff: u64) -> u8 {
+pub fn floor_log2(diff: u64) -> u8 {
     if diff == 0 { 0 } else { diff.ilog2() as u8 }
 }
 
-pub fn diff_for_pot(exponent: u8) -> u64 {
+pub fn difficulty_for_exponent(exponent: u8) -> u64 {
     1u64 << (u32::from(exponent) & (u64::BITS - 1))
 }
 
 pub fn pow2_floor(v: u64) -> u64 {
-    if v == 0 { 0 } else { 1u64 << floor_pot(v) }
+    if v == 0 { 0 } else { 1u64 << floor_log2(v) }
 }
 
 pub fn pow2_ceil(v: u64) -> u64 {
@@ -213,15 +213,15 @@ mod tests {
             (40, "0000000000000000010000000000000000000000000000000000000000000000"),
         ];
         for (exponent, want) in vectors {
-            assert_eq!(hex::encode(target_for_pot(*exponent)), *want, "2^{exponent}");
+            assert_eq!(hex::encode(target_for_exponent(*exponent)), *want, "2^{exponent}");
             assert_eq!(
                 target_for_difficulty(2f64.powi(i32::from(*exponent))),
-                target_for_pot(*exponent),
+                target_for_exponent(*exponent),
                 "2^{exponent}"
             );
         }
-        assert_eq!(target_for_pot(224)[31], 1);
-        assert_eq!(target_for_pot(255)[31], 1);
+        assert_eq!(target_for_exponent(224)[31], 1);
+        assert_eq!(target_for_exponent(255)[31], 1);
     }
 
     #[test]
@@ -258,24 +258,24 @@ mod tests {
         assert_eq!(share_nbits(8), 0x1c00ffff);
         assert_eq!(share_nbits(224), 0);
         assert_eq!(share_nbits(255), 0);
-        for pot in 0..224u8 {
-            let advertised = bits_to_target(share_nbits(pot)).expect("compact decodes");
+        for exponent in 0..224u8 {
+            let advertised = bits_to_target(share_nbits(exponent)).expect("compact decodes");
             assert!(
-                meets_target(&advertised, &target_for_pot(pot)),
-                "pot {pot}: advertised target is easier than the share target"
+                meets_target(&advertised, &target_for_exponent(exponent)),
+                "exponent {exponent}: advertised target is easier than the share target"
             );
         }
     }
 
     #[test]
-    fn pot() {
-        assert_eq!(floor_pot(1), 0);
-        assert_eq!(floor_pot(4096), 12);
-        assert_eq!(floor_pot(4097), 12);
-        assert_eq!(floor_pot(u64::MAX), 63);
-        assert_eq!(diff_for_pot(14), 16384);
-        assert_eq!(diff_for_pot(0), 1);
-        assert_eq!(diff_for_pot(64), 1, "masked");
+    fn exponents() {
+        assert_eq!(floor_log2(1), 0);
+        assert_eq!(floor_log2(4096), 12);
+        assert_eq!(floor_log2(4097), 12);
+        assert_eq!(floor_log2(u64::MAX), 63);
+        assert_eq!(difficulty_for_exponent(14), 16384);
+        assert_eq!(difficulty_for_exponent(0), 1);
+        assert_eq!(difficulty_for_exponent(64), 1, "masked");
     }
 
     #[test]

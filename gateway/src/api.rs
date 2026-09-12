@@ -26,12 +26,12 @@ pub struct Context {
     pub started: std::time::Instant,
     pub csrf: String,
     pub config_path: String,
-    pub history: Mutex<ratum::hashrate::History>,
+    pub hashrate_history: Mutex<ratum::hashrate::HashrateHistory>,
 }
 
 fn sample_hashrate(ctx: &Context) {
     let hs = ctx.server.summary().hashrate_ths * ratum::HASHES_PER_TERAHASH;
-    ratum::hashrate::push_sample(&mut ratum::lock(&ctx.history), ratum::unix_now(), hs);
+    ratum::hashrate::push_sample(&mut ratum::lock(&ctx.hashrate_history), ratum::unix_now(), hs);
 }
 
 const CSRF_TOKEN_BYTES: usize = 16;
@@ -197,7 +197,7 @@ fn serve_admin(ctx: &Context, mut req: Request) {
             http::json(snapshot::status_json(ctx, authorized(ctx, &req)))
         }
         (Method::Get | Method::Post, "/NOTIFY") => {
-            ctx.server.notify.raise();
+            ctx.server.template_waker.raise();
             http::html("OK".to_string())
         }
         (Method::Get, "/login") => {

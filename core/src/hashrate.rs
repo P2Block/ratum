@@ -1,13 +1,13 @@
 use std::collections::VecDeque;
 
 pub const INTERVAL_SECS: u64 = crate::SECS_PER_MINUTE;
-const CAP: usize = (crate::SECS_PER_DAY / INTERVAL_SECS) as usize;
+const HISTORY_CAP: usize = (crate::SECS_PER_DAY / INTERVAL_SECS) as usize;
 
-pub type History = VecDeque<(u64, f64)>;
+pub type HashrateHistory = VecDeque<(u64, f64)>;
 
-pub fn push_sample(history: &mut History, at: u64, hashes_per_second: f64) {
+pub fn push_sample(history: &mut HashrateHistory, at: u64, hashes_per_second: f64) {
     history.push_back((at, hashes_per_second));
-    while history.len() > CAP {
+    while history.len() > HISTORY_CAP {
         history.pop_front();
     }
 }
@@ -28,11 +28,11 @@ mod tests {
 
     #[test]
     fn history_keeps_the_newest_cap_samples() {
-        let mut h = History::new();
-        for i in 0..(CAP as u64 + 5) {
+        let mut h = HashrateHistory::new();
+        for i in 0..(HISTORY_CAP as u64 + 5) {
             push_sample(&mut h, i, 1.0);
         }
-        assert_eq!(h.len(), CAP);
+        assert_eq!(h.len(), HISTORY_CAP);
         assert_eq!(h.front().copied(), Some((5, 1.0)), "the oldest five were discarded");
     }
 }

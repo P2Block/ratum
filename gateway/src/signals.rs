@@ -1,4 +1,4 @@
-use crate::template::Notify;
+use crate::template::TemplateWaker;
 use log::{info, warn};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -12,7 +12,7 @@ extern "C" fn on_usr1(_: libc::c_int) {
     }
 }
 
-pub fn install(notify: Arc<Notify>) {
+pub fn install(template_waker: Arc<TemplateWaker>) {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         warn!("could not create the SIGUSR1 pipe; SIGUSR1 is not handled");
@@ -32,7 +32,7 @@ pub fn install(notify: Arc<Notify>) {
         loop {
             let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
-                notify.raise();
+                template_waker.raise();
             } else if n == 0 {
                 return;
             }

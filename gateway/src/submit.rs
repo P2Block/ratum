@@ -1,6 +1,7 @@
-use crate::job::{COINBASE_SUBSIDY_ONLY, Job};
+use crate::job::Job;
 use crate::stratum::Server;
 use log::{debug, error, info, warn};
+use ratum::datum::share::COINBASE_ID_SUBSIDY_ONLY;
 use ratum::rpc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,11 +12,11 @@ pub fn found_block(
     server: &Server,
     job: &Job,
     coinbase_id: u8,
-    pot: u8,
+    target_byte: u8,
     header: &[u8; ratum::header::HEADER_V2_SIZE],
     hash_hex: &str,
 ) {
-    let Some(block) = assemble(job, coinbase_id, pot, header) else {
+    let Some(block) = assemble(job, coinbase_id, target_byte, header) else {
         error!("could not assemble the block for {hash_hex}");
         return;
     };
@@ -27,7 +28,7 @@ pub fn found_block(
         save_to_dir(dir, hash_hex, &block);
     }
     if submit_to(&server.node, "upstream node", &block, hash_hex) {
-        server.notify.raise_for(hash_hex);
+        server.template_waker.raise_for(hash_hex);
         spawn_confirmation(server.node.clone(), hash_hex);
     }
 }
@@ -60,11 +61,11 @@ fn spawn_confirmation(node: rpc::Client, hash_hex: &str) {
 fn assemble(
     job: &Job,
     coinbase_id: u8,
-    pot: u8,
+    target_byte: u8,
     header: &[u8; ratum::header::HEADER_V2_SIZE],
 ) -> Option<Vec<u8>> {
-    let coinbase = job.full_coinbase(coinbase_id, pot)?;
-    let empty = coinbase_id == COINBASE_SUBSIDY_ONLY;
+    let coinbase = job.full_coinbase(coinbase_id, target_byte)?;
+    let empty = coinbase_id == COINBASE_ID_SUBSIDY_ONLY;
     let others: Vec<Vec<u8>> =
         if empty { Vec::new() } else { job.template.txns.iter().map(|t| t.raw.clone()).collect() };
     Some(ratum::bitcoin::serialize_block(header, &coinbase, &others))
@@ -98,10 +99,10 @@ fn submit_to(node: &rpc::Client, what: &str, block: &[u8], hash_hex: &str) -> bo
 
 fn spawn_redundant(server: &Server, block: Arc<Vec<u8>>, hash_hex: &str) {
     let (node, extras) = (server.node.clone(), server.extra_nodes.clone());
-    let (notify, hash_hex) = (Arc::clone(&server.notify), hash_hex.to_string());
+    let (template_waker, hash_hex) = (Arc::clone(&server.template_waker), hash_hex.to_string());
     let spawned = ratum::thread::try_spawn("submitblock", move || {
         if submit_to(&node, "upstream node (redundant)", &block, &hash_hex) {
-            notify.raise_for(&hash_hex);
+            template_waker.raise_for(&hash_hex);
         }
         for (i, extra) in extras.iter().enumerate() {
             submit_to(extra, &format!("extra node {i}"), &block, &hash_hex);

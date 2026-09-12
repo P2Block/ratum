@@ -1,9 +1,8 @@
-use crate::cursor::{Cursor, Truncated};
+use crate::reader::{ByteReader, Truncated};
 use bytes::BufMut as _;
 
-pub use super::messages::DBF_MARKER;
-
 pub const ACK_MARKER: [u8; 4] = *b"DBA\x01";
+pub const DBF_MARKER: [u8; 4] = *b"DBF\x01";
 pub const FRAGMENT_DATA_SIZE: usize = 16 * 1024;
 pub const MAX_TRANSFER_SIZE: usize = super::framing::MAX_CMD_DATA_SIZE as usize;
 
@@ -45,7 +44,7 @@ pub struct Fragment<'a> {
 
 impl<'a> Fragment<'a> {
     pub fn decode(data: &'a [u8]) -> Result<Self, Error> {
-        let mut c = Cursor::new(data);
+        let mut c = ByteReader::new(data);
         if c.arr::<{ DBF_MARKER.len() }>("marker")? != DBF_MARKER {
             return Err(Error::BadMarker);
         }
