@@ -557,7 +557,7 @@ impl Connection {
         hash: &[u8; 32],
         accepted: bool,
     ) -> String {
-        if accepted && self.fee_charged(req.job_diff, &req.miner_username) {
+        if accepted && self.fee_charged(req.job_diff) {
             return self.server.config.fee_address().to_string();
         }
         let cfg = &self.server.config;
@@ -596,9 +596,8 @@ impl Connection {
         Ok(())
     }
 
-    fn fee_charged(&mut self, diff: u64, username: &str) -> bool {
-        let address = crate::username::address_of(username);
-        let bps = u64::from(self.server.record_and_fee_bps(address));
+    fn fee_charged(&mut self, diff: u64) -> bool {
+        let bps = u64::from(self.server.config.datum.gateway_fee_bps);
         let charged = self.fee_meter.charge(diff, bps);
         if charged {
             self.with_stats(|st| st.fee_shares.add(diff));

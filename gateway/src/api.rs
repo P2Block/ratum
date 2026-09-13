@@ -226,7 +226,6 @@ fn serve_admin(ctx: &Context, mut req: Request) {
     };
     let _ = req.respond(response);
     if restart {
-        ctx.server.fee_ramp.save(ratum::unix_now());
         crate::settings::restart();
     }
 }

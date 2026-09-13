@@ -124,29 +124,6 @@
       instead of the miner. Requires usernames sent as the payout address.</div>
   </div>
   <div class="field">
-    <label for="datum_gateway_fee_ramp_max_bps">Ramp maximum (basis points)</label>
-    <input name="datum_gateway_fee_ramp_max_bps" id="datum_gateway_fee_ramp_max_bps" maxlength="5">
-    <div class="tip">0 leaves every address at the fee above. Otherwise an address starts at that
-      fee and rises toward this one the longer it mines here, reaching this fee once it has mined
-      throughout the window below. Hashrate does not change the rate it rises at. Must be above
-      the fee above.</div>
-  </div>
-  <div class="field">
-    <label for="datum_gateway_fee_ramp_window_seconds">Ramp window (seconds)</label>
-    <input name="datum_gateway_fee_ramp_window_seconds" id="datum_gateway_fee_ramp_window_seconds" maxlength="7">
-    <div class="tip">The period an address mines through to reach the maximum. Only time inside
-      this trailing window counts, so the fee falls again once an address stops, reaching the
-      base fee after a whole window away. Reconnecting does not reset it: the window is kept per
-      payout address, not per connection. 3600 to 604800; 86400 is a day.</div>
-  </div>
-  <div class="field">
-    <label for="datum_gateway_fee_ramp_state_file">Ramp state file</label>
-    <input name="datum_gateway_fee_ramp_state_file" id="datum_gateway_fee_ramp_state_file" maxlength="200">
-    <div class="tip">Where each address's position in the window is kept, so a restart does not
-      put every address back at the base fee. Empty: <code>gateway.feeramp</code> in the
-      working directory. Nothing is written while the ramp maximum is 0.</div>
-  </div>
-  <div class="field">
     <label for="datum_gateway_fee_address">Fee address</label>
     <input name="datum_gateway_fee_address" id="datum_gateway_fee_address" maxlength="100">
     <div class="tip">Empty: the Bitcoin address above.</div>

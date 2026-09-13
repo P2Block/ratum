@@ -3,7 +3,6 @@ mod api;
 mod coinbase;
 mod config;
 mod datum;
-mod feeramp;
 mod job;
 mod logger;
 mod publish;
@@ -331,9 +330,6 @@ fn main() {
         Arc::clone(&handles.template_waker),
     );
     let template_error: Arc<template::LastError> = Arc::default();
-
-    server.fee_ramp.restore(ratum::unix_now());
-    feeramp::save_periodically(Arc::clone(&server));
 
     start_node_info_thread(handles.node.clone(), Arc::clone(&server));
 

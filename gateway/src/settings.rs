@@ -1,6 +1,6 @@
 use super::config::{
-    Config, DatumConfig, FEE_RAMP_WINDOW_SECONDS_RANGE, GLOBAL_TIMEOUT_MARGIN_SECS,
-    MAX_CONFIGURED_TAG_LEN, MAX_CONFIGURED_TAGS_TOTAL_LEN, WORK_UPDATE_SECONDS_RANGE,
+    Config, DatumConfig, GLOBAL_TIMEOUT_MARGIN_SECS, MAX_CONFIGURED_TAG_LEN,
+    MAX_CONFIGURED_TAGS_TOTAL_LEN, WORK_UPDATE_SECONDS_RANGE,
 };
 use serde_json::{Value, json};
 
@@ -87,33 +87,6 @@ const FIELDS: &[Field] = &[
         key: "gateway_fee_bps",
         kind: FieldKind::Int(0, ratum::BASIS_POINTS_PER_UNIT as i64),
         current: |c| json!(c.datum.gateway_fee_bps),
-    },
-    Field {
-        name: "datum_gateway_fee_ramp_max_bps",
-        label: "Fee ramp maximum",
-        section: "datum",
-        key: "gateway_fee_ramp_max_bps",
-        kind: FieldKind::Int(0, ratum::BASIS_POINTS_PER_UNIT as i64),
-        current: |c| json!(c.datum.gateway_fee_ramp_max_bps),
-    },
-    Field {
-        name: "datum_gateway_fee_ramp_window_seconds",
-        label: "Fee ramp window",
-        section: "datum",
-        key: "gateway_fee_ramp_window_seconds",
-        kind: FieldKind::Int(
-            *FEE_RAMP_WINDOW_SECONDS_RANGE.start() as i64,
-            *FEE_RAMP_WINDOW_SECONDS_RANGE.end() as i64,
-        ),
-        current: |c| json!(c.datum.gateway_fee_ramp_window_seconds),
-    },
-    Field {
-        name: "datum_gateway_fee_ramp_state_file",
-        label: "Fee ramp state file",
-        section: "datum",
-        key: "gateway_fee_ramp_state_file",
-        kind: FieldKind::Text,
-        current: |c| json!(c.datum.gateway_fee_ramp_state_file),
     },
     Field {
         name: "datum_gateway_fee_address",
@@ -463,9 +436,9 @@ pub fn apply(
     Ok(Some(text))
 }
 
-pub fn write_file(path: &str, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+pub fn write_file(path: &str, text: &str) -> std::io::Result<()> {
     let tmp = format!("{path}.new");
-    std::fs::write(&tmp, contents)?;
+    std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, path)
 }
 
