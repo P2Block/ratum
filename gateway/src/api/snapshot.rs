@@ -43,8 +43,6 @@ fn client_json(c: &ClientStats) -> Value {
         "accepted_count": c.accepted.count,
         "rejected_diff": c.rejected.diff,
         "rejected_count": c.rejected.count,
-        "fee_diff": c.fee_shares.diff,
-        "fee_count": c.fee_shares.count,
         "hashrate_ths": c.hashrate_ths(),
     })
 }
@@ -158,9 +156,6 @@ pub(super) fn status_json(ctx: &Context, with_clients: bool) -> Value {
         "secondary_tag": cfg.mining.coinbase_tag_secondary,
         "pool_min_diff": pool.as_ref().map(|p| p.min_difficulty),
         "pool_motd": ratum::lock(&server.pool.motd).clone(),
-        "gateway_fee_bps": cfg.datum.gateway_fee_bps,
-        "gateway_fee_address": if cfg.datum.gateway_fee_bps > 0 { json!(cfg.fee_address()) } else { Value::Null },
-        "gateway_fee_collected": ratum::lock(&server.fee_tally).json(),
         "stratum": {
             "listening": server.listening.load(Ordering::Relaxed),
             "connections": summary.connections,
@@ -182,7 +177,6 @@ pub(super) fn status_json(ctx: &Context, with_clients: bool) -> Value {
 struct MinerTotals {
     accepted: Tally,
     rejected: Tally,
-    fee_shares: Tally,
     hashrate_ths: f64,
 }
 
@@ -190,7 +184,6 @@ impl MinerTotals {
     fn add(&mut self, c: &ClientStats) {
         self.accepted.merge(&c.accepted);
         self.rejected.merge(&c.rejected);
-        self.fee_shares.merge(&c.fee_shares);
         self.hashrate_ths += c.hashrate_ths().unwrap_or(0.0);
     }
 }
@@ -211,17 +204,12 @@ pub(super) fn miner_lookup_json(ctx: &Context, addr: Option<&str>) -> Value {
         .collect();
     json!({
         "address": valid,
-        "fee_bps": cfg.datum.gateway_fee_bps,
-        "fee_address": if cfg.datum.gateway_fee_bps > 0 { cfg.fee_address() } else { "" },
         "connection_count": connections.len(),
         "connections": connections,
         "accepted_diff": totals.accepted.diff,
         "accepted_count": totals.accepted.count,
         "rejected_diff": totals.rejected.diff,
         "rejected_count": totals.rejected.count,
-        "fee_diff": totals.fee_shares.diff,
-        "fee_count": totals.fee_shares.count,
-        "accepted_under_address_diff": totals.accepted.diff.saturating_sub(totals.fee_shares.diff),
         "hashrate_ths": totals.hashrate_ths,
         "stratum_port": cfg.stratum.listen_port,
         "require_address_username": cfg.stratum.require_address_username,

@@ -81,22 +81,6 @@ const FIELDS: &[Field] = &[
         current: |c| json!(c.datum.protocol_v3),
     },
     Field {
-        name: "datum_gateway_fee_bps",
-        label: "Gateway fee",
-        section: "datum",
-        key: "gateway_fee_bps",
-        kind: FieldKind::Int(0, ratum::BASIS_POINTS_PER_UNIT as i64),
-        current: |c| json!(c.datum.gateway_fee_bps),
-    },
-    Field {
-        name: "datum_gateway_fee_address",
-        label: "Gateway fee address",
-        section: "datum",
-        key: "gateway_fee_address",
-        kind: FieldKind::Text,
-        current: |c| json!(c.datum.gateway_fee_address),
-    },
-    Field {
         name: "stratum_listen_port",
         label: "Stratum port",
         section: "stratum",

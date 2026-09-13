@@ -168,6 +168,16 @@ fn accept_connections(listener: TcpListener, server: &Arc<Server>) {
 }
 
 fn report_settings(s: &Settings) {
+    if s.public_gateway_fee_bps > 0 {
+        info!(
+            "public gateway fee: {} bps of the work of shares carrying the secondary coinbase \
+             tag {:?}, of which {} bps is reassigned at each split to miners whose shares do \
+             not carry it",
+            s.public_gateway_fee_bps,
+            s.public_gateway_tag.as_deref().unwrap_or(""),
+            s.public_gateway_fee_subsidy_bps
+        );
+    }
     if !s.require_split {
         info!(
             "--require-split=false: a coinbase paying only the pool script is accepted from any job"
@@ -212,18 +222,18 @@ fn main() -> io::Result<()> {
     let node_view = Arc::new(NodeView::default());
     watch_node_in_background(&node, &node_view, &s, chain);
 
-    let ledger = admin::open_share_ledger(
+    let mut ledger = admin::open_share_ledger(
         ledger_location.file_for(chain).as_ref(),
         startup_window,
         s.ledger_keep,
         chain.map(rpc::Chain::name),
     )?;
+    ledger.set_public_gateway_tag(s.public_gateway_tag.clone());
     info!(
         "payouts: window {}x network difficulty (floor {}, {startup_window} at startup), \
          minimum {} sats, operator fee {} bps",
         s.window_multiple, s.window_floor, s.min_payout, s.fee_bps
     );
-
     report_settings(&s);
     let config = ClientConfig {
         payout_script,
@@ -255,6 +265,8 @@ fn main() -> io::Result<()> {
             window_multiple: s.window_multiple,
             window_floor: s.window_floor,
             fee_bps: s.fee_bps,
+            public_gateway_fee_bps: s.public_gateway_fee_bps,
+            public_gateway_fee_subsidy_bps: s.public_gateway_fee_subsidy_bps,
         },
         share_policy,
         config_payload,

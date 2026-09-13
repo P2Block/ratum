@@ -62,10 +62,30 @@ pub struct FoundBlock {
     pub cumulative_work: u128,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicGatewayFee {
+    pub fee_bps: u16,
+    pub subsidy_bps: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicGatewayFeeWork {
+    pub public_gateway_work: u128,
+    pub fee_work: u128,
+    pub reassigned_work: u128,
+    pub own_gateway_work: u128,
+}
+
+fn basis_points_of(work: u128, bps: u16) -> u128 {
+    work.saturating_mul(u128::from(bps)) / u128::from(ratum::BASIS_POINTS_PER_UNIT)
+}
+
 pub struct Ledger {
     removed: usize,
     shares: VecDeque<Share>,
     work_per_identity: HashMap<String, u128>,
+    own_gateway_work_per_identity: HashMap<String, u128>,
+    public_gateway_tag: Option<String>,
     tag_per_identity: HashMap<String, String>,
     total_work: u128,
     window: u128,
@@ -83,6 +103,8 @@ impl Ledger {
             removed: 0,
             shares: VecDeque::new(),
             work_per_identity: HashMap::new(),
+            own_gateway_work_per_identity: HashMap::new(),
+            public_gateway_tag: None,
             tag_per_identity: HashMap::new(),
             total_work: 0,
             window: window.max(1),
@@ -148,12 +170,32 @@ impl Ledger {
     fn fill(&mut self, shares: Vec<Share>) {
         self.shares.clear();
         self.work_per_identity.clear();
+        self.own_gateway_work_per_identity.clear();
         self.tag_per_identity.clear();
         self.total_work = 0;
         for share in shares {
             self.push(share);
             self.trim();
         }
+    }
+
+    pub fn set_public_gateway_tag(&mut self, tag: Option<String>) {
+        self.public_gateway_tag = tag.filter(|t| !t.is_empty());
+        let mut own: HashMap<String, u128> = HashMap::new();
+        for share in &self.shares {
+            if self.is_own_gateway_share(share) {
+                *own.entry(share.identity.clone()).or_insert(0) += u128::from(share.difficulty);
+            }
+        }
+        self.own_gateway_work_per_identity = own;
+    }
+
+    pub fn public_gateway_tag(&self) -> Option<&str> {
+        self.public_gateway_tag.as_deref()
+    }
+
+    fn is_own_gateway_share(&self, share: &Share) -> bool {
+        self.public_gateway_tag.as_deref().is_some_and(|public| share.tag != public)
     }
 
     pub fn dump(&self) -> io::Result<Vec<Share>> {
@@ -320,13 +362,64 @@ impl Ledger {
         self.tag_per_identity.clone()
     }
 
-    pub fn split(&self, value: u64, min_payout: u64, max_outputs: usize) -> Vec<(String, u64)> {
+    pub fn own_gateway_work_by_identity(&self) -> HashMap<String, u128> {
+        self.own_gateway_work_per_identity.clone()
+    }
+
+    fn own_gateway_work_of(&self, identity: &str) -> u128 {
+        self.own_gateway_work_per_identity.get(identity).copied().unwrap_or(0)
+    }
+
+    pub fn public_gateway_fee_work(&self, fee: PublicGatewayFee) -> PublicGatewayFeeWork {
+        let mut public_gateway_work = 0u128;
+        let mut fee_work = 0u128;
+        for (identity, work) in &self.work_per_identity {
+            let public = work - self.own_gateway_work_of(identity);
+            public_gateway_work += public;
+            fee_work += basis_points_of(public, fee.fee_bps);
+        }
+        let own_gateway_work: u128 = self.own_gateway_work_per_identity.values().sum();
+        let reassigned_work =
+            if own_gateway_work == 0 { 0 } else { basis_points_of(fee_work, fee.subsidy_bps) };
+        PublicGatewayFeeWork { public_gateway_work, fee_work, reassigned_work, own_gateway_work }
+    }
+
+    fn weights_with_public_gateway_fee(
+        &self,
+        fee: PublicGatewayFee,
+    ) -> (Vec<(String, u128)>, u128) {
+        let PublicGatewayFeeWork { fee_work, reassigned_work, own_gateway_work, .. } =
+            self.public_gateway_fee_work(fee);
+        let mut given = 0u128;
+        let mut weights = Vec::with_capacity(self.work_per_identity.len());
+        for (identity, work) in &self.work_per_identity {
+            let own = self.own_gateway_work_of(identity);
+            let charged = basis_points_of(work - own, fee.fee_bps);
+            let extra =
+                reassigned_work.saturating_mul(own).checked_div(own_gateway_work).unwrap_or(0);
+            given += extra;
+            weights.push((identity.clone(), work - charged + extra));
+        }
+        weights.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        (weights, fee_work.saturating_sub(given))
+    }
+
+    pub fn split(
+        &self,
+        value: u64,
+        min_payout: u64,
+        max_outputs: usize,
+        fee: Option<PublicGatewayFee>,
+    ) -> Vec<(String, u64)> {
         if self.total_work == 0 || value == 0 || max_outputs == 0 {
             return Vec::new();
         }
-        let mut kept = self.work_by_identity();
+        let (mut kept, retained_by_pool) = match fee {
+            Some(f) if f.fee_bps > 0 => self.weights_with_public_gateway_fee(f),
+            _ => (self.work_by_identity(), 0),
+        };
         kept.truncate(max_outputs);
-        let mut work: u128 = kept.iter().map(|(_, w)| *w).sum();
+        let mut work: u128 = kept.iter().map(|(_, w)| *w).sum::<u128>() + retained_by_pool;
 
         while let Some(w) = kept.last().map(|(_, w)| *w) {
             if work == 0 {
@@ -360,6 +453,10 @@ impl Ledger {
         self.total_work += u128::from(share.difficulty);
         *self.work_per_identity.entry(share.identity.clone()).or_insert(0) +=
             u128::from(share.difficulty);
+        if self.is_own_gateway_share(&share) {
+            *self.own_gateway_work_per_identity.entry(share.identity.clone()).or_insert(0) +=
+                u128::from(share.difficulty);
+        }
         self.tag_per_identity.insert(share.identity.clone(), share.tag.clone());
         self.shares.push_back(share);
     }
@@ -392,6 +489,14 @@ impl Ledger {
     fn drop_oldest(&mut self) {
         let Some(oldest) = self.shares.pop_front() else { return };
         self.total_work -= u128::from(oldest.difficulty);
+        if self.is_own_gateway_share(&oldest)
+            && let Some(d) = self.own_gateway_work_per_identity.get_mut(&oldest.identity)
+        {
+            *d -= u128::from(oldest.difficulty);
+            if *d == 0 {
+                self.own_gateway_work_per_identity.remove(&oldest.identity);
+            }
+        }
         if let Some(d) = self.work_per_identity.get_mut(&oldest.identity) {
             *d -= u128::from(oldest.difficulty);
             if *d == 0 {
@@ -463,7 +568,7 @@ mod tests {
     #[test]
     fn splits_value_in_proportion_to_work() {
         let l = ledger_with(1_000_000, &[("alice", 75), ("bob", 25)]);
-        let split = l.split(1_000_000, 0, 512);
+        let split = l.split(1_000_000, 0, 512, None);
         assert_eq!(split, vec![("alice".into(), 750_000), ("bob".into(), 250_000)]);
         assert_eq!(split.iter().map(|(_, v)| v).sum::<u64>(), 1_000_000);
     }
@@ -471,7 +576,7 @@ mod tests {
     #[test]
     fn no_remainder_is_left_for_the_pool() {
         let l = ledger_with(1_000_000, &[("a", 1), ("b", 1), ("c", 1)]);
-        let split = l.split(100, 0, 512);
+        let split = l.split(100, 0, 512, None);
         assert_eq!(split.len(), 3);
         assert_eq!(split.iter().map(|(_, v)| v).sum::<u64>(), 100);
     }
@@ -486,7 +591,7 @@ mod tests {
                 &[("a", 1), ("b", 1), ("c", 1), ("d", 1), ("e", 1), ("f", 1), ("g", 1)][..],
             ] {
                 let l = ledger_with(u128::MAX, works);
-                let split = l.split(value, 0, 512);
+                let split = l.split(value, 0, 512, None);
                 let paid: u64 = split.iter().map(|(_, v)| v).sum();
                 assert_eq!(paid, value, "value {value} over {} miners", works.len());
             }
@@ -496,17 +601,17 @@ mod tests {
     #[test]
     fn amounts_below_the_minimum_are_not_paid() {
         let l = ledger_with(1_000_000, &[("large", 999), ("small", 1)]);
-        assert_eq!(l.split(1_000_000, 0, 512).len(), 2);
+        assert_eq!(l.split(1_000_000, 0, 512, None).len(), 2);
 
-        let split = l.split(1_000_000, 10_000, 512);
+        let split = l.split(1_000_000, 10_000, 512, None);
         assert_eq!(split, vec![("large".into(), 1_000_000)]);
     }
 
     #[test]
     fn dropping_the_smallest_can_raise_the_rest_over_the_minimum() {
         let l = ledger_with(1_000_000, &[("a", 1), ("b", 1), ("c", 1), ("d", 1)]);
-        assert_eq!(l.split(40_000, 10_000, 512).len(), 4);
-        let split = l.split(40_000, 10_001, 512);
+        assert_eq!(l.split(40_000, 10_000, 512, None).len(), 4);
+        let split = l.split(40_000, 10_001, 512, None);
         assert_eq!(split.len(), 3);
         assert_eq!(split.iter().map(|(_, v)| v).sum::<u64>(), 40_000);
         assert!(split.iter().all(|(_, v)| *v >= 10_001));
@@ -515,20 +620,20 @@ mod tests {
     #[test]
     fn a_value_under_the_minimum_pays_nobody() {
         let l = ledger_with(1_000_000, &[("a", 1), ("b", 1)]);
-        assert!(l.split(9_999, 10_000, 512).is_empty());
+        assert!(l.split(9_999, 10_000, 512, None).is_empty());
     }
 
     #[test]
     fn output_count_is_capped_largest_first() {
         let l = ledger_with(1_000_000, &[("a", 4), ("b", 3), ("c", 2), ("d", 1)]);
-        let split = l.split(1_000_000, 0, 2);
+        let split = l.split(1_000_000, 0, 2, None);
         assert_eq!(split.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
     }
 
     #[test]
     fn an_empty_window_pays_nobody() {
         let l = Ledger::new(1_000);
-        assert!(l.split(5_000_000_000, 0, 512).is_empty());
+        assert!(l.split(5_000_000_000, 0, 512, None).is_empty());
         assert_eq!(l.total_work(), 0);
         assert!(l.is_empty());
     }
@@ -536,8 +641,8 @@ mod tests {
     #[test]
     fn zero_value_or_no_outputs_pays_nobody() {
         let l = ledger_with(1_000, &[("a", 8)]);
-        assert!(l.split(0, 0, 512).is_empty());
-        assert!(l.split(1_000_000, 0, 0).is_empty());
+        assert!(l.split(0, 0, 512, None).is_empty());
+        assert!(l.split(1_000_000, 0, 0, None).is_empty());
     }
 
     #[test]
@@ -557,11 +662,11 @@ mod tests {
         for i in 0..4 {
             l.record(0, "leaver", 16, &hash(i), "").unwrap();
         }
-        assert_eq!(l.split(1_000, 0, 512), vec![("leaver".into(), 1_000)]);
+        assert_eq!(l.split(1_000, 0, 512, None), vec![("leaver".into(), 1_000)]);
         for i in 0..4 {
             l.record(1, "joiner", 16, &hash(100 + i), "").unwrap();
         }
-        let split = l.split(1_000, 0, 512);
+        let split = l.split(1_000, 0, 512, None);
         assert_eq!(split, vec![("joiner".into(), 1_000)]);
         assert!(!l.work_by_identity().iter().any(|(k, _)| k == "leaver"));
     }
@@ -572,7 +677,7 @@ mod tests {
         l.record(0, "a", 16384, &hash(0), "").unwrap();
         l.record(1, "b", 16384, &hash(1), "").unwrap();
         assert_eq!(l.len(), 1);
-        assert_eq!(l.split(1_000, 0, 512), vec![("b".into(), 1_000)]);
+        assert_eq!(l.split(1_000, 0, 512, None), vec![("b".into(), 1_000)]);
     }
 
     #[test]
@@ -580,7 +685,7 @@ mod tests {
         let mut l = Ledger::new(u128::MAX);
         l.record(0, "a", u64::MAX / 2, &hash(0), "").unwrap();
         l.record(1, "b", u64::MAX / 2, &hash(1), "").unwrap();
-        let split = l.split(2_100_000_000_000_000, 0, 512);
+        let split = l.split(2_100_000_000_000_000, 0, 512, None);
         assert_eq!(split.len(), 2);
         assert_eq!(split[0].1, 2_100_000_000_000_000 / 2);
     }
@@ -667,6 +772,166 @@ mod tests {
         drop(l);
         assert!(Ledger::open(&path, 1, None, Some("main")).is_err());
         assert!(!Ledger::open(&path, 1, None, Some("testnet4")).unwrap().1.stamped);
+    }
+
+    fn tagged_ledger(public_tag: &str, shares: &[(&str, u64, &str)]) -> Ledger {
+        let mut l = Ledger::new(1_000_000);
+        l.set_public_gateway_tag(Some(public_tag.to_string()));
+        for (i, (identity, difficulty, tag)) in shares.iter().enumerate() {
+            l.record(1_000 + i as u64, identity, *difficulty, &hash(i as u64), tag).unwrap();
+        }
+        l
+    }
+
+    const FEE: PublicGatewayFee = PublicGatewayFee { fee_bps: 5_000, subsidy_bps: 10_000 };
+
+    #[test]
+    fn the_fee_is_charged_on_public_gateway_work_and_reassigned_to_own_gateway_miners() {
+        let l = tagged_ledger("public", &[("alice", 100, "public"), ("bob", 100, "own")]);
+        assert_eq!(
+            l.public_gateway_fee_work(FEE),
+            PublicGatewayFeeWork {
+                public_gateway_work: 100,
+                fee_work: 50,
+                reassigned_work: 50,
+                own_gateway_work: 100,
+            }
+        );
+        assert_eq!(
+            l.split(200, 0, 512, Some(FEE)),
+            vec![("bob".into(), 150), ("alice".into(), 50)]
+        );
+
+        let half = PublicGatewayFee { subsidy_bps: 5_000, ..FEE };
+        assert_eq!(l.public_gateway_fee_work(half).reassigned_work, 25);
+        let split = l.split(200, 0, 512, Some(half));
+        assert_eq!(split, vec![("bob".into(), 125), ("alice".into(), 50)]);
+        assert_eq!(
+            split.iter().map(|(_, v)| v).sum::<u64>(),
+            175,
+            "the fee work not reassigned is left out of the split and reaches the pool as the \
+             remainder"
+        );
+
+        let none = PublicGatewayFee { subsidy_bps: 0, ..FEE };
+        assert_eq!(
+            l.split(200, 0, 512, Some(none)),
+            vec![("bob".into(), 100), ("alice".into(), 50)],
+            "with no subsidy the whole fee stays with the pool"
+        );
+
+        let free = PublicGatewayFee { fee_bps: 0, ..FEE };
+        assert_eq!(l.split(200, 0, 512, Some(free)), l.split(200, 0, 512, None));
+        assert_eq!(l.split(200, 0, 512, None), vec![("alice".into(), 100), ("bob".into(), 100)]);
+    }
+
+    #[test]
+    fn the_subsidy_is_divided_by_own_gateway_work_not_by_all_work() {
+        let l = tagged_ledger(
+            "public",
+            &[
+                ("alice", 900, "public"),
+                ("bob", 300, "own"),
+                ("bob", 100, "public"),
+                ("carol", 100, "own"),
+            ],
+        );
+        let fee = PublicGatewayFee { fee_bps: 1_000, subsidy_bps: 10_000 };
+        assert_eq!(
+            l.public_gateway_fee_work(fee),
+            PublicGatewayFeeWork {
+                public_gateway_work: 1_000,
+                fee_work: 100,
+                reassigned_work: 100,
+                own_gateway_work: 400,
+            },
+            "bob's public-gateway share is charged and is not own work"
+        );
+        assert_eq!(
+            l.split(1_400, 0, 512, Some(fee)),
+            vec![("alice".into(), 810), ("bob".into(), 465), ("carol".into(), 125)],
+            "the 100 of fee work is divided 75:25 over bob's and carol's own work"
+        );
+    }
+
+    #[test]
+    fn with_no_own_gateway_work_the_fee_stays_with_the_pool() {
+        let l = tagged_ledger("public", &[("alice", 100, "public")]);
+        assert_eq!(
+            l.public_gateway_fee_work(FEE),
+            PublicGatewayFeeWork {
+                public_gateway_work: 100,
+                fee_work: 50,
+                reassigned_work: 0,
+                own_gateway_work: 0,
+            }
+        );
+        assert_eq!(
+            l.split(100, 0, 512, Some(FEE)),
+            vec![("alice".into(), 50)],
+            "alice is paid her charged work and the 50 reach the pool as the remainder"
+        );
+    }
+
+    #[test]
+    fn own_gateway_work_is_not_charged() {
+        let l = tagged_ledger("public", &[("bob", 100, "own"), ("carol", 100, "")]);
+        let work = l.public_gateway_fee_work(FEE);
+        assert_eq!((work.public_gateway_work, work.fee_work), (0, 0));
+        assert_eq!(
+            l.split(200, 0, 512, Some(FEE)),
+            vec![("bob".into(), 100), ("carol".into(), 100)]
+        );
+    }
+
+    #[test]
+    fn own_gateway_work_follows_the_window_and_the_tag_setting() {
+        let mut l = Ledger::new(64);
+        l.record(1, "alice", 16, &hash(1), "public").unwrap();
+        l.record(2, "bob", 16, &hash(2), "own").unwrap();
+        assert!(l.own_gateway_work_by_identity().is_empty(), "no public tag, no own work");
+
+        l.set_public_gateway_tag(Some("public".into()));
+        assert_eq!(l.own_gateway_work_by_identity(), HashMap::from([("bob".to_string(), 16)]));
+        assert_eq!(l.public_gateway_tag(), Some("public"));
+
+        l.record(3, "bob", 16, &hash(3), "").unwrap();
+        assert_eq!(l.own_gateway_work_by_identity(), HashMap::from([("bob".to_string(), 32)]));
+        for i in 4..8 {
+            l.record(i, "carol", 16, &hash(i), "own").unwrap();
+        }
+        assert_eq!(l.total_work(), 64);
+        assert_eq!(
+            l.own_gateway_work_by_identity(),
+            HashMap::from([("carol".to_string(), 64)]),
+            "bob's own work left the window with his shares"
+        );
+
+        l.set_public_gateway_tag(Some(String::new()));
+        assert_eq!(l.public_gateway_tag(), None, "an empty tag is no tag");
+        assert!(l.own_gateway_work_by_identity().is_empty());
+    }
+
+    #[test]
+    fn the_fee_is_applied_before_the_output_cap_and_the_minimum() {
+        let l = tagged_ledger(
+            "public",
+            &[("alice", 100, "public"), ("bob", 30, "own"), ("carol", 20, "own")],
+        );
+        assert_eq!(
+            l.split(150, 0, 512, Some(FEE)),
+            vec![("bob".into(), 60), ("alice".into(), 50), ("carol".into(), 40)]
+        );
+        assert_eq!(
+            l.split(150, 0, 2, Some(FEE)),
+            vec![("bob".into(), 81), ("alice".into(), 69)],
+            "with the subsidy bob outweighs alice for the two outputs and carol is left out"
+        );
+        assert_eq!(
+            l.split(150, 45, 512, Some(FEE)),
+            vec![("bob".into(), 81), ("alice".into(), 69)],
+            "carol's 40 is under the minimum once the fee is in the weights"
+        );
     }
 
     #[test]

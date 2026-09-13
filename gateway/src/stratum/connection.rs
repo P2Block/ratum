@@ -2,7 +2,6 @@ use super::{ClientEntry, ClientStats, Server};
 use crate::coinbase::COINBASE_ID_POOLED;
 use crate::datum::QueuedShare;
 use crate::job::{JOB_ID_TIME_CHARS, Job, NotifyId, parse_sia_field};
-use crate::tally::FeeMeter;
 use crate::username;
 use crate::vardiff::{self, Vardiff};
 use log::{debug, info, warn};
@@ -79,7 +78,6 @@ pub(super) struct Connection {
     last_accepted: Option<Instant>,
     diff_since_window_start: u64,
     window_started: Instant,
-    fee_meter: FeeMeter,
     next_idle_check: Instant,
 }
 
@@ -127,7 +125,6 @@ impl Connection {
             last_accepted: None,
             diff_since_window_start: 0,
             window_started: now,
-            fee_meter: FeeMeter::default(),
             next_idle_check: now + FIRST_IDLE_CHECK_DELAY,
             server: Arc::clone(&server),
         };
@@ -536,7 +533,7 @@ impl Connection {
 
         let checked = self.check_share(job, &hash, target_byte, &req.miner_username);
         if job.is_datum_job && (is_block || checked.is_ok()) {
-            let wire_username = self.credited_username(req, &hash, checked.is_ok());
+            let wire_username = self.credited_username(req, &hash);
             self.server.pool.submit(QueuedShare {
                 job: Arc::clone(job),
                 coinbase_id: r.coinbase_id,
@@ -551,15 +548,7 @@ impl Connection {
         checked
     }
 
-    fn credited_username(
-        &mut self,
-        req: &SubmitRequest,
-        hash: &[u8; 32],
-        accepted: bool,
-    ) -> String {
-        if accepted && self.fee_charged(req.job_diff) {
-            return self.server.config.fee_address().to_string();
-        }
+    fn credited_username(&self, req: &SubmitRequest, hash: &[u8; 32]) -> String {
         let cfg = &self.server.config;
         username::apply_modifier(
             &cfg.stratum.username_modifiers,
@@ -594,16 +583,6 @@ impl Connection {
             return Err(UNAUTHORIZED_WORKER);
         }
         Ok(())
-    }
-
-    fn fee_charged(&mut self, diff: u64) -> bool {
-        let bps = u64::from(self.server.config.datum.gateway_fee_bps);
-        let charged = self.fee_meter.charge(diff, bps);
-        if charged {
-            self.with_stats(|st| st.fee_shares.add(diff));
-            ratum::lock(&self.server.fee_tally).add(diff);
-        }
-        charged
     }
 }
 

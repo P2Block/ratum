@@ -41,6 +41,9 @@ pub(crate) struct Settings {
     pub(crate) window_floor: u128,
     pub(crate) min_payout: u64,
     pub(crate) fee_bps: u16,
+    pub(crate) public_gateway_fee_bps: u16,
+    pub(crate) public_gateway_fee_subsidy_bps: u16,
+    pub(crate) public_gateway_tag: Option<String>,
     pub(crate) poll: Duration,
     pub(crate) require_split: bool,
     node: NodeCredential,
@@ -58,6 +61,36 @@ impl Settings {
     pub(crate) fn resolve(c: &Config, f: Config) -> Self {
         let payout = payout_choice(c, &f);
         let data_dir = c.data_dir.clone().or(f.data_dir).map(PathBuf::from);
+        let public_gateway_fee_bps = cli::resolve(
+            c.public_gateway_fee_bps,
+            f.public_gateway_fee_bps,
+            0,
+            "--public-gateway-fee-bps",
+            &format!(
+                "basis points from 0 to {}: the fee on the work of shares carrying \
+                 --public-gateway-tag",
+                ratum::BASIS_POINTS_PER_UNIT
+            ),
+            |n| u64::from(*n) <= ratum::BASIS_POINTS_PER_UNIT,
+        );
+        let public_gateway_fee_subsidy_bps = cli::resolve(
+            c.public_gateway_fee_subsidy_bps,
+            f.public_gateway_fee_subsidy_bps,
+            0,
+            "--public-gateway-fee-subsidy-bps",
+            &format!(
+                "basis points from 0 to {}: the portion of the public gateway fee's work \
+                 reassigned to miners on their own gateways",
+                ratum::BASIS_POINTS_PER_UNIT
+            ),
+            |n| u64::from(*n) <= ratum::BASIS_POINTS_PER_UNIT,
+        );
+        if public_gateway_fee_subsidy_bps > 0 && public_gateway_fee_bps == 0 {
+            fatal!(
+                "--public-gateway-fee-subsidy-bps needs --public-gateway-fee-bps above 0: the \
+                 subsidy is a portion of that fee's work"
+            );
+        }
         Self {
             listen: cli::resolve_str(c.listen.clone(), f.listen, DEFAULT_LISTEN),
             stats_listen: c.stats_listen.clone().or(f.stats_listen),
@@ -132,6 +165,12 @@ impl Settings {
                 ),
                 |n| *n <= MAX_FEE_BPS,
             ),
+            public_gateway_fee_bps,
+            public_gateway_fee_subsidy_bps,
+            public_gateway_tag: public_gateway_tag(
+                c.public_gateway_tag.clone().or(f.public_gateway_tag),
+                public_gateway_fee_bps,
+            ),
             poll: poll_interval(c.poll, f.poll),
             require_split: c.require_split.or(f.require_split).unwrap_or(true),
             node: NodeCredential {
@@ -156,6 +195,28 @@ fn coinbase_tag(tag: String) -> String {
              every pooled coinbase's scriptSig ahead of the miner's secondary tag",
             tag.len()
         );
+    }
+    tag
+}
+
+fn public_gateway_tag(tag: Option<String>, fee_bps: u16) -> Option<String> {
+    let tag = tag.filter(|t| !t.is_empty());
+    match (&tag, fee_bps) {
+        (None, 0) => {}
+        (None, _) => fatal!(
+            "--public-gateway-fee-bps needs --public-gateway-tag, the secondary coinbase tag \
+             (mining.coinbase_tag_secondary) of the public gateway; without it no share can be \
+             told apart from the public gateway's"
+        ),
+        (Some(t), _) if t.len() > MAX_COINBASE_TAG_LEN => fatal!(
+            "--public-gateway-tag must be at most {MAX_COINBASE_TAG_LEN} bytes, not {}",
+            t.len()
+        ),
+        (Some(_), 0) => warn!(
+            "--public-gateway-tag is set but --public-gateway-fee-bps is 0, so no fee is \
+             charged and the tag only separates own-gateway work in /stats.json"
+        ),
+        (Some(_), _) => {}
     }
     tag
 }

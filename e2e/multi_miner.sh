@@ -128,7 +128,7 @@ work, total = {}, 0
 for prefix in range(0, max_prefix + 1):
     if prefix:
         parts = shares[prefix - 1]
-        if len(parts) == 4:
+        if len(parts) >= 4:
             identity = parts[2].split('.')[0]
             work[identity] = work.get(identity, 0) + int(parts[1])
             total += int(parts[1])
@@ -287,7 +287,8 @@ done
     || fail "only $recorded shares in ${TIMEOUT}s, wanted $SHARE_COUNT; see $WORK/pool.log"
 
 # Stop the miners, then the pool, so no share is credited after the last block on the chain
-# and the pool releases the ledger's lock; then dump the ledger to a text file.
+# and the pool releases the ledger's lock; then dump the ledger to a text file: one share per
+# line as "at difficulty identity hash tag", the tag empty for a share without one.
 for pid in "${MINERS[@]}"; do kill "$pid" 2>/dev/null || true; done
 sleep 2
 kill "$POOL_PID" 2>/dev/null || true
@@ -357,7 +358,7 @@ for h in $(seq "$((ACTIVATION_HEIGHT + 1))" "$(cli getblockcount)"); do
 
     # The split itself, against the ledger as it stood when the template was built. That is
     # the shares before this block's own, allowing for a template built one share earlier.
-    k=$(grep -n " $hash\$" "$LEDGER" | cut -d: -f1)
+    k=$(grep -n " $hash\( \|$\)" "$LEDGER" | cut -d: -f1)
     [ -n "$k" ] || fail "height $h: no ledger line records the share that solved $hash"
     value=$(jq -r '[.tx[0].vout[].value] | add | . * 100000000 | round' <<<"$block")
     matched=$(printf '%s\n' "$paid" \

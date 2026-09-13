@@ -209,8 +209,6 @@ pub struct DatumConfig {
     pub pool_pass_workers: bool,
     pub protocol_job_slots: usize,
     pub pool_pass_full_users: bool,
-    pub gateway_fee_bps: u32,
-    pub gateway_fee_address: String,
     pub always_pay_self: Option<bool>,
     pub pooled_mining_only: bool,
     pub protocol_global_timeout: u64,
@@ -227,8 +225,6 @@ impl Default for DatumConfig {
             pool_pass_workers: true,
             protocol_job_slots: 256,
             pool_pass_full_users: true,
-            gateway_fee_bps: 0,
-            gateway_fee_address: String::new(),
             always_pay_self: None,
             pooled_mining_only: true,
             protocol_global_timeout: 60,
@@ -429,30 +425,9 @@ impl Config {
         if d.pooled_mining_only && d.pool_host.is_empty() {
             return Err("datum.pooled_mining_only requires datum.pool_host".into());
         }
-        if u64::from(d.gateway_fee_bps) > ratum::BASIS_POINTS_PER_UNIT {
-            return Err(format!(
-                "datum.gateway_fee_bps must be 0..{}",
-                ratum::BASIS_POINTS_PER_UNIT
-            ));
-        }
-        if d.gateway_fee_bps > 0 {
-            if !d.pool_pass_full_users {
-                return Err("datum.gateway_fee_bps requires datum.pool_pass_full_users, since a fee share is credited to the fee address in place of the miner's own username".into());
-            }
-            if !d.gateway_fee_address.is_empty()
-                && !crate::address::is_valid(&d.gateway_fee_address)
-            {
-                return Err(
-                    "datum.gateway_fee_address is not an address a coinbase output can pay".into(),
-                );
-            }
-        }
         if !d.pool_host.is_empty() {
             crate::datum::parse_pool_pubkey(&d.pool_pubkey)
                 .map_err(|e| format!("datum.pool_pubkey: {e}"))?;
-        }
-        if d.gateway_fee_bps > 0 && d.pool_host.is_empty() {
-            self.warn("datum.gateway_fee_bps is set but datum.pool_host is empty; a fee applies only to pooled shares");
         }
         if self.stratum.require_address_username && !self.datum.pool_pass_full_users {
             self.warn("stratum.require_address_username is set but datum.pool_pass_full_users is not, so the pool never receives the address the username was checked for");
@@ -518,14 +493,6 @@ impl Config {
             bps => Some(f64::from(bps) / ratum::BASIS_POINTS_PER_UNIT as f64),
         }
     }
-
-    pub fn fee_address(&self) -> &str {
-        if self.datum.gateway_fee_address.is_empty() {
-            &self.mining.pool_address
-        } else {
-            &self.datum.gateway_fee_address
-        }
-    }
 }
 
 #[cfg(test)]
@@ -548,7 +515,6 @@ mod tests {
         assert_eq!(c.api.miner_listen_port, 8000);
         assert_eq!(c.bitcoind.work_update_seconds, 40);
         assert!(!c.datum.pooled_mining_only);
-        assert_eq!(c.fee_address(), "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080");
     }
 
     #[test]
@@ -590,16 +556,6 @@ mod tests {
             "\"pooled_mining_only\": false, \"pool_url\": \"https://pool.example\"",
         );
         assert_eq!(Config::parse(&text).unwrap().datum.pool_url, "https://pool.example");
-    }
-
-    #[test]
-    fn a_fee_requires_full_users() {
-        let text = minimal().replace(
-            "\"pooled_mining_only\": false",
-            "\"pooled_mining_only\": false, \"gateway_fee_bps\": 100, \"pool_pass_full_users\": false",
-        );
-        let e = Config::parse(&text).unwrap_err();
-        assert!(e.contains("pool_pass_full_users"), "{e}");
     }
 
     #[test]

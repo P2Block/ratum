@@ -152,19 +152,12 @@ fn owed_json(
     (unsettled, by_identity, blocks)
 }
 
-fn miners_json(
-    server: &Server,
-    work_by_identity: &[(String, u128)],
-    total_work: u128,
-    payout_sats: &HashMap<String, u64>,
-    recent_by_identity: &HashMap<String, u128>,
-    tags: &HashMap<String, String>,
-) -> Vec<Value> {
-    work_by_identity
+fn miners_json(server: &Server, l: &LedgerView) -> Vec<Value> {
+    l.work_by_identity
         .iter()
         .map(|(identity, work)| {
             let share_percent =
-                if total_work > 0 { *work as f64 / total_work as f64 * 100.0 } else { 0.0 };
+                if l.total_work > 0 { *work as f64 / l.total_work as f64 * 100.0 } else { 0.0 };
             let (payable, unpayable_reason) =
                 match AddressResolver::cached(&server.resolver, identity) {
                     Some(Ok(_)) => (Some(true), None),
@@ -176,16 +169,45 @@ fn miners_json(
                 "work": work.to_string(),
                 "share_percent": share_percent,
                 "hashrate_hs": hashes_per_second(
-                    recent_by_identity.get(identity).copied().unwrap_or(0),
+                    l.recent_by_identity.get(identity).copied().unwrap_or(0),
                     HASHRATE_SPAN_SECS,
                 ),
-                "payout_sats": payout_sats.get(identity).copied().unwrap_or(0),
+                "payout_sats": l.payout_sats.get(identity).copied().unwrap_or(0),
                 "payable": payable,
                 "unpayable_reason": unpayable_reason,
-                "tag": tags.get(identity).map_or("", String::as_str),
+                "tag": l.tags.get(identity).map_or("", String::as_str),
+                "own_gateway_work": l
+                    .own_gateway_work_by_identity
+                    .get(identity)
+                    .copied()
+                    .unwrap_or(0)
+                    .to_string(),
             })
         })
         .collect()
+}
+
+fn public_gateway_fee_json(server: &Server, l: &LedgerView, coinbase_value: Option<u64>) -> Value {
+    let (Some(fee), Some(work)) =
+        (server.payout_policy.public_gateway_fee(), l.public_gateway_fee_work)
+    else {
+        return Value::Null;
+    };
+    let miners_value = coinbase_value.map_or(0, |v| server.payout_policy.miners_share(v));
+    let sats_for = |work: u128| {
+        u128::from(miners_value).saturating_mul(work).checked_div(l.total_work).unwrap_or(0) as u64
+    };
+    json!({
+        "fee_bps": fee.fee_bps,
+        "subsidy_bps": fee.subsidy_bps,
+        "public_gateway_tag": l.public_gateway_tag,
+        "public_gateway_work": work.public_gateway_work.to_string(),
+        "fee_work": work.fee_work.to_string(),
+        "fee_sats": sats_for(work.fee_work),
+        "reassigned_work": work.reassigned_work.to_string(),
+        "reassigned_sats": sats_for(work.reassigned_work),
+        "own_gateway_work": work.own_gateway_work.to_string(),
+    })
 }
 
 struct LedgerView {
@@ -200,6 +222,9 @@ struct LedgerView {
     confirmations: HashMap<[u8; 32], ConfirmationReading>,
     recent_work: u128,
     recent_by_identity: HashMap<String, u128>,
+    own_gateway_work_by_identity: HashMap<String, u128>,
+    public_gateway_fee_work: Option<ledger::PublicGatewayFeeWork>,
+    public_gateway_tag: Option<String>,
 }
 
 impl LedgerView {
@@ -216,6 +241,12 @@ impl LedgerView {
             payout_sats: split_after_fee(&l, &server.payout_policy, coinbase_value.unwrap_or(0))
                 .into_iter()
                 .collect(),
+            own_gateway_work_by_identity: l.own_gateway_work_by_identity(),
+            public_gateway_fee_work: server
+                .payout_policy
+                .public_gateway_fee()
+                .map(|fee| l.public_gateway_fee_work(fee)),
+            public_gateway_tag: l.public_gateway_tag().map(str::to_string),
             owed: l.owed().to_vec(),
             blocks: l.blocks().to_vec(),
             confirmations: l
@@ -272,14 +303,8 @@ fn snapshot(server: &Server, history: &Mutex<HashrateHistory>) -> Value {
 
     let (luck, luck_blocks) = luck_percent(&l.blocks);
     let (owed_unsettled, owed_by_identity, owed_blocks) = owed_json(&l.owed, &l.confirmations);
-    let miners = miners_json(
-        server,
-        &l.work_by_identity,
-        l.total_work,
-        &l.payout_sats,
-        &l.recent_by_identity,
-        &l.tags,
-    );
+    let miners = miners_json(server, &l);
+    let public_gateway_fee = public_gateway_fee_json(server, &l, coinbase_value);
     let network = network_json(tip, coinbase_value, observed_block_seconds(server));
     let pool_hs = hashes_per_second(l.recent_work, HASHRATE_SPAN_SECS);
     let network_hashps = *lock(&server.node_view.network_hashps);
@@ -292,6 +317,8 @@ fn snapshot(server: &Server, history: &Mutex<HashrateHistory>) -> Value {
             "prime_id": server.share_policy.prime_id,
             "payout_script": hex::encode(&server.share_policy.payout_script),
             "fee_bps": server.payout_policy.fee_bps,
+            "public_gateway_fee_bps": server.payout_policy.public_gateway_fee_bps,
+            "public_gateway_fee_subsidy_bps": server.payout_policy.public_gateway_fee_subsidy_bps,
             "min_payout": server.payout_policy.min_payout,
             "window_multiple": server.payout_policy.window_multiple,
             "min_difficulty": server.share_policy.min_difficulty,
@@ -325,6 +352,7 @@ fn snapshot(server: &Server, history: &Mutex<HashrateHistory>) -> Value {
             "operator_fee_sats": operator_fee,
             "miners": miners,
         },
+        "public_gateway_fee": public_gateway_fee,
         "owed": {
             "unsettled_sats": owed_unsettled,
             "by_identity": owed_by_identity,

@@ -51,12 +51,13 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
   keys and the key order are kept), validates it as at startup, and restarts the gateway on
   the same command line to apply it: every change restarts, where the C gateway applies some
   without one. The field names and the `pool_host(old)` convention are the C gateway's;
-  `datum.pool_url`, the gateway fee, the stratum port, `stratum.vardiff_min`,
+  `datum.pool_url`, the stratum port, `stratum.vardiff_min`,
   `stratum.max_network_share_bps` and `stratum.require_address_username` are editable in
   addition to the C page's fields.
-- A block share is charged the gateway fee like any other share when it passes the share
-  checks (the C gateway exempts it); a block a check refuses is still sent under the miner's
-  name.
+- A block a share check refuses is still sent to the pool. A gateway the pool operator runs
+  for miners without a node of their own sets `mining.coinbase_tag_secondary` to the pool's
+  `--public-gateway-tag`, and the pool charges its shares `--public-gateway-fee-bps` (see
+  "Public gateway fee" under Prime).
 - One thread per stratum connection; `stratum.max_clients` limits the total and the
   per-thread settings size the duplicate-share table and share queue. `empty_thread`
   disconnects every client; `/threads` is not served.
@@ -151,7 +152,7 @@ cargo test --workspace
 cargo test --workspace --release -- --ignored  # searches ~2^32 hashes for the test nonces
 e2e/full_stack.sh                        # the activation block
 e2e/multi_miner.sh                       # three miners, two gateways: credit and payout split
-e2e/gateway_fee.sh                       # a gateway charging a fee beside one charging none
+e2e/public_gateway_fee.sh                # a tagged gateway's shares charged, the fee paid to the other's miner
 ```
 
 `core/tests/header_vectors.rs` reproduces the five version 2 header vectors in
@@ -255,6 +256,36 @@ the split is built is left out and its amount goes to the pool's payout script.
 `--fee-bps` (0 to 100, default 0) is deducted from the coinbase before the split and paid to
 the pool's payout script as the remainder.
 
+### Public gateway fee
+
+A public gateway is one the pool operator runs for miners without a node of their own.
+`--public-gateway-tag` names its `mining.coinbase_tag_secondary`, which the pool reads from
+every share's coinbase and which a miner cannot alter (under the version 2 header the mining
+machine never receives the coinbase); it must not be empty, since an empty secondary tag is
+the gateway's default. A share carrying that tag is public-gateway work; a share carrying any
+other tag, or none, is own-gateway work.
+
+`--public-gateway-fee-bps` (0 to 10000, default 0) is charged on public-gateway work at each
+split: an identity's weight is its work less that fraction of its public-gateway work, and
+`--public-gateway-fee-subsidy-bps` (0 to 10000, default 0) is the portion of the work so
+charged that is added to the own-gateway miners' weights in proportion to their own-gateway
+work. The rest stays in the coinbase value that reaches the pool's payout script as the
+remainder, so with no own-gateway work in the window the whole fee stays with the pool. The
+fee requires the tag, and the subsidy requires the fee. The fee is charged on the work the
+pool credits, so a share it rejects is not charged and a block share is charged like any
+other. The reassignment is applied before the 512-output limit and `--min-payout`, and the
+owed-block records and `/stats.json` payouts follow it, since all of them are one split. No
+sats are held or paid by hand: the fee and the subsidy are share work, settled in the
+coinbase of the next block found and ageing out of the window with the shares that produced
+them.
+
+Own-gateway miners' extra pay over their own work is `subsidy * fee * p / (1 - p)`, where
+`p` is the public gateway's share of the window's work: at a 2% fee, a full subsidy and 80%
+of the work on the public gateway, 8%. It is not capped; it can never exceed the fee charged
+and falls as miners move to their own gateways. What the tag does not establish: a gateway's
+node is not verified to be the miner's own, and a gateway run by someone else without the
+tag counts as an own gateway.
+
 ### Owed blocks
 
 Whatever a block's coinbase pays to the pool's payout script beyond the operator fee is owed
@@ -293,9 +324,13 @@ that.
 every other path is a 404. It carries the tip, the coinbase value, the fee, the connected gateways, the build (`--version` prints the
 same string), an approximate hashrate (accepted-share difficulty over the last 10 minutes,
 at 2^32 hashes per difficulty unit, for the pool and per miner) and each miner's share of the
-window with `payable`, `unpayable_reason` and `tag` (the secondary coinbase tag of the
-miner's newest share in the window, the gateway's `mining.coinbase_tag_secondary`). Every
-accepted block is recorded in the ledger's `blocks` table and listed with its coinbase
+window with `payable`, `unpayable_reason`, `tag` (the secondary coinbase tag of the
+miner's newest share in the window, the gateway's `mining.coinbase_tag_secondary`),
+and `own_gateway_work`; `public_gateway_fee` (null unless `--public-gateway-fee-bps` is set)
+carries the rates, the tag, the public-gateway work, the fee work, the work reassigned, the
+own-gateway work it is divided over, and what the fee work and the reassigned work are worth
+in sats at the current split. Every accepted block is recorded in the ledger's `blocks` table
+and listed with its coinbase
 amounts, finder, the secondary coinbase tag its coinbase carried, and the confirmation count
 the node last answered for it (see "Owed blocks"); from the record and
 a cumulative work counter it derives a luck figure (blocks found over blocks

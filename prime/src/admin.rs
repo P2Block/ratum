@@ -143,11 +143,12 @@ fn dump_ledger(location: &LedgerLocation) -> io::Result<()> {
     for share in ledger.dump()? {
         let _ = writeln!(
             out,
-            "{} {} {} {}",
+            "{} {} {} {} {}",
             share.at,
             share.difficulty,
             share.identity,
-            hex::encode(share.block_hash)
+            hex::encode(share.block_hash),
+            share.tag
         );
     }
     print!("{out}");

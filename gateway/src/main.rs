@@ -298,15 +298,6 @@ fn main() {
     install_panic_exit();
     let node = connect_node(&config);
 
-    if config.datum.gateway_fee_bps > 0 {
-        info!(
-            "Gateway fee: {} basis points ({:.2}%) of submitted share work, credited to {}",
-            config.datum.gateway_fee_bps,
-            f64::from(config.datum.gateway_fee_bps) * 100.0 / ratum::BASIS_POINTS_PER_UNIT as f64,
-            config.fee_address()
-        );
-    }
-
     let template_waker = Arc::new(template::TemplateWaker::default());
     let pool = Arc::new(datum::PoolConnectionState::new(
         config.datum.protocol_job_slots,

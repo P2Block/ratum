@@ -67,7 +67,6 @@
         <th class="num">Difficulty</th>
         <th class="num">Accepted</th>
         <th class="num">Rejected</th>
-        <th class="num" id="fee-head">Fee</th>
         <th class="num">Last share</th>
         <th class="num">Connected</th>
         <th>User agent</th>
@@ -88,7 +87,7 @@
   </div>
 </section>
 
-<footer><span id="fee"></span> Refreshes every 5 s.
+<footer>Refreshes every 5 s.
   <div style="margin-top:.5rem">For the Bitcoin Knots BLAKE2b hardfork chain.
     <a href="https://github.com/iohzrd/ratum" target="_blank" rel="noopener">iohzrd/ratum</a>
   </div>
@@ -142,12 +141,6 @@ poll(() => "stats.json", s => {
   banner.style.display = notes.length ? "" : "none";
   banner.innerHTML = notes.join("<br>");
 
-  const fee = s.gateway_fee_bps || 0;
-  document.getElementById("fee").textContent = fee
-    ? `Gateway fee ${fee} bps (${(fee / 100).toFixed(2)}%) of share work, credited to ${s.gateway_fee_address}: ${num(s.gateway_fee_collected.count)} shares so far.`
-    : "No gateway fee.";
-  document.getElementById("fee-head").style.display = fee ? "" : "none";
-
   const j = s.job || {};
   const acc = s.shares_accepted, rej = s.shares_rejected;
   const rate = s.stratum.hashrate_ths;
@@ -199,7 +192,6 @@ poll(() => "stats.json", s => {
       <td class="num">${num(c.vardiff)}</td>
       <td class="num">${tally(c.accepted_count, c.accepted_diff)}</td>
       <td class="num">${tally(c.rejected_count, c.rejected_diff)}</td>
-      <td class="num" ${fee ? "" : 'style="display:none"'}>${tally(c.fee_count, c.fee_diff)}</td>
       <td class="num">${ago(c.last_accepted_seconds)}</td>
       <td class="num">${c.subscribed_seconds < 0 ? "-" : duration(Math.max(c.subscribed_seconds, 1))}</td>
       <td class="mono">${esc(c.useragent)}</td>

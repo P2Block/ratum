@@ -58,6 +58,12 @@ pub struct Config {
     #[arg(long)]
     pub fee_bps: Option<u16>,
     #[arg(long)]
+    pub public_gateway_fee_bps: Option<u16>,
+    #[arg(long)]
+    pub public_gateway_fee_subsidy_bps: Option<u16>,
+    #[arg(long)]
+    pub public_gateway_tag: Option<String>,
+    #[arg(long)]
     pub rpc: Option<String>,
     #[arg(long)]
     pub rpc_user: Option<String>,
@@ -100,10 +106,18 @@ mod tests {
 
     #[test]
     fn settings_parse_into_their_typed_fields() {
-        let c = parse_toml("rpc-user = \"ratum\"\nmin-diff = 16384\nwindow = 8.5\n").unwrap();
+        let c = parse_toml(
+            "rpc-user = \"ratum\"\nmin-diff = 16384\nwindow = 8.5\n\
+             public-gateway-fee-bps = 200\npublic-gateway-fee-subsidy-bps = 7500\n\
+             public-gateway-tag = \"public\"\n",
+        )
+        .unwrap();
         assert_eq!(c.min_diff, Some(16384));
         assert_eq!(c.window, Some(8.5));
         assert_eq!(c.rpc_user, Some("ratum".to_string()));
+        assert_eq!(c.public_gateway_fee_bps, Some(200));
+        assert_eq!(c.public_gateway_fee_subsidy_bps, Some(7500));
+        assert_eq!(c.public_gateway_tag, Some("public".to_string()));
         assert_eq!(c.listen, None, "a setting not written stays unset");
     }
 

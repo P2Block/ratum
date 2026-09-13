@@ -6,7 +6,7 @@ use ratum::datum::handshake::KeyPairs;
 use ratum::datum::messages;
 use ratum::{lock, rpc};
 use ratum_prime::bounded::BoundedMap;
-use ratum_prime::ledger::{Ledger, OwedBlock};
+use ratum_prime::ledger::{Ledger, OwedBlock, PublicGatewayFee};
 use ratum_prime::verify::{AcceptedShareHashes, SharePolicy, Splits};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -311,9 +311,18 @@ pub(crate) struct PayoutPolicy {
     pub(crate) window_multiple: f64,
     pub(crate) window_floor: u128,
     pub(crate) fee_bps: u16,
+    pub(crate) public_gateway_fee_bps: u16,
+    pub(crate) public_gateway_fee_subsidy_bps: u16,
 }
 
 impl PayoutPolicy {
+    pub(crate) fn public_gateway_fee(&self) -> Option<PublicGatewayFee> {
+        (self.public_gateway_fee_bps > 0).then_some(PublicGatewayFee {
+            fee_bps: self.public_gateway_fee_bps,
+            subsidy_bps: self.public_gateway_fee_subsidy_bps,
+        })
+    }
+
     pub(crate) fn fee_on(&self, value: u64) -> u64 {
         (u128::from(value) * u128::from(self.fee_bps) / u128::from(ratum::BASIS_POINTS_PER_UNIT))
             as u64
@@ -325,7 +334,12 @@ impl PayoutPolicy {
 }
 
 pub(crate) fn split_after_fee(l: &Ledger, payout: &PayoutPolicy, value: u64) -> Vec<(String, u64)> {
-    l.split(payout.miners_share(value), payout.min_payout, messages::MAX_COINBASER_OUTPUTS)
+    l.split(
+        payout.miners_share(value),
+        payout.min_payout,
+        messages::MAX_COINBASER_OUTPUTS,
+        payout.public_gateway_fee(),
+    )
 }
 
 pub(crate) struct AddressResolver {
@@ -534,6 +548,8 @@ mod tests {
                 window_multiple: 8.0,
                 window_floor: 1,
                 fee_bps,
+                public_gateway_fee_bps: 0,
+                public_gateway_fee_subsidy_bps: 0,
             },
             config_payload: config.encode().unwrap(),
             share_policy: SharePolicy::from_config(&config),
@@ -740,6 +756,8 @@ mod tests {
             window_multiple: 8.0,
             window_floor: 1,
             fee_bps: bps,
+            public_gateway_fee_bps: 0,
+            public_gateway_fee_subsidy_bps: 0,
         };
         assert_eq!(with_bps(0).fee_on(1_000_000), 0, "no fee by default");
         assert_eq!(with_bps(50).fee_on(1_000_000), 5_000, "0.5%");
@@ -793,6 +811,38 @@ mod tests {
             payable_script(vec![ratum::bitcoin::opcode::OP_RETURN; 84]),
             Err(Unpayable::ScriptTooLong(84))
         );
+    }
+
+    fn server_with_public_gateway_fee() -> Server {
+        let mut server =
+            server_with(&[], &[("alice", Ok(p2wpkh(0xa1))), ("bob", Ok(p2wpkh(0xb2)))], 0);
+        server.payout_policy.public_gateway_fee_bps = 5_000;
+        server.payout_policy.public_gateway_fee_subsidy_bps = 10_000;
+        let mut l = lock(&server.ledger);
+        l.set_public_gateway_tag(Some("public".into()));
+        for (i, (identity, tag)) in [("alice", "public"), ("bob", "own")].iter().enumerate() {
+            l.record(1_000 + i as u64, identity, 100, &[i as u8 + 0x10; 32], tag).unwrap();
+        }
+        drop(l);
+        server
+    }
+
+    #[test]
+    fn the_dictated_split_charges_the_public_gateway_fee_and_reassigns_it() {
+        let server = server_with_public_gateway_fee();
+        let (outputs, _, _) = coinbaser_outputs(&server, 200);
+        assert_eq!(
+            outputs.iter().map(|o| (o.value, o.script_pubkey.clone())).collect::<Vec<_>>(),
+            vec![(150, p2wpkh(0xb2)), (50, p2wpkh(0xa1))]
+        );
+        let owed = owed_for_block(&server, 961_866, [0xbb; 32], 200, 42).unwrap();
+        assert_eq!(owed.entries, vec![("bob".into(), 150), ("alice".into(), 50)]);
+
+        let mut off = server_with_public_gateway_fee();
+        off.payout_policy.public_gateway_fee_bps = 0;
+        assert!(off.payout_policy.public_gateway_fee().is_none());
+        let (outputs, _, _) = coinbaser_outputs(&off, 200);
+        assert_eq!(outputs.iter().map(|o| o.value).collect::<Vec<_>>(), vec![100, 100]);
     }
 
     #[test]

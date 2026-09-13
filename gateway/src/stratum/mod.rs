@@ -38,7 +38,6 @@ pub struct ClientStats {
     pub current_diff: u64,
     pub accepted: Tally,
     pub rejected: Tally,
-    pub fee_shares: Tally,
     pub last_accepted: Option<Instant>,
     pub window_diff: u64,
     pub window: Duration,
@@ -94,7 +93,6 @@ pub struct Server {
     pub refuse_while_pool_unreachable: AtomicBool,
     network_hashps: Mutex<Option<f64>>,
     node_warnings: Mutex<Vec<String>>,
-    pub fee_tally: Mutex<Tally>,
     pub extra_nodes: Vec<ratum::rpc::Client>,
     pub listening: AtomicBool,
 }
@@ -133,7 +131,6 @@ impl Server {
             refuse_while_pool_unreachable: AtomicBool::new(false),
             network_hashps: Mutex::new(None),
             node_warnings: Mutex::new(Vec::new()),
-            fee_tally: Mutex::new(Tally::default()),
             extra_nodes,
             listening: AtomicBool::new(false),
         })
