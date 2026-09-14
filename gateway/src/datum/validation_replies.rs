@@ -1,8 +1,8 @@
-use super::{PoolConnectionSettings, PoolConnectionState};
+use super::{PoolConnectionSettings, PoolConnectionState, SlotLookupFailure};
 use crate::job::Job;
 use log::{info, warn};
-use ratum::datum::handshake::KeyPairs;
-use ratum::datum::validation::{
+use ratum::datum::keys::KeyPairs;
+use ratum::datum::messages::validation::{
     self, ParentFetchReply, ParentFetchStatus, ShortTxnList, TxnList, TxnListStatus,
 };
 use std::sync::Arc;
@@ -16,14 +16,17 @@ pub(super) fn response_to(
     let sub = *plain.get(validation::SELECTOR_AT)?;
     let job_index = plain.get(validation::JOB_INDEX_AT).copied();
     let lookup = job_index
-        .ok_or((validation::JOB_INDEX_INVALID, TxnListStatus::BadRequest))
+        .ok_or(SlotLookupFailure {
+            job_index: validation::JOB_INDEX_INVALID,
+            status: TxnListStatus::BadRequest,
+        })
         .and_then(|i| pool.job_slot(i));
     let response = match sub {
         validation::request::SHORT_TXN_LIST => {
             info!("pool requested the short transaction list of job {job_index:?}");
             match lookup {
                 Ok(job) => short_txn_list(settings, identity, &job),
-                Err((idx, status)) => ShortTxnList::empty(idx, status),
+                Err(failure) => ShortTxnList::empty(failure.job_index, failure.status),
             }
             .encode()
         }
@@ -66,8 +69,7 @@ pub(super) fn response_to(
 }
 
 fn fetch_parent(pool: &PoolConnectionState, hash_hex: &str) -> (ParentFetchStatus, Vec<u8>) {
-    let Some(node) = &pool.node else { return (ParentFetchStatus::Unavailable, Vec::new()) };
-    match node.call("getblock", serde_json::json!([hash_hex, 0])) {
+    match pool.node.call("getblock", serde_json::json!([hash_hex, 0])) {
         Ok(serde_json::Value::String(hex)) => match hex::decode(&hex) {
             Ok(block)
                 if !block.is_empty() && block.len() <= validation::MAX_PARENT_FETCH_BLOCK_LEN =>
@@ -103,11 +105,11 @@ fn short_txn_list(
     }
 }
 
-fn txn_list(lookup: Result<Arc<Job>, (u8, TxnListStatus)>, plain: &[u8], all: bool) -> TxnList {
+fn txn_list(lookup: Result<Arc<Job>, SlotLookupFailure>, plain: &[u8], all: bool) -> TxnList {
     let selector = if all { validation::response::BLOCK_TXNS } else { validation::response::TXNS };
     let job = match lookup {
         Ok(job) => job,
-        Err((idx, status)) => return TxnList::empty(selector, idx, status),
+        Err(failure) => return TxnList::empty(selector, failure.job_index, failure.status),
     };
     let txns = &job.template.txns;
     let ids = if all { Some((0..txns.len()).collect()) } else { requested_ids(plain, txns.len()) };

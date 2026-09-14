@@ -1,5 +1,5 @@
 use bech32::Hrp;
-use ratum::bitcoin::opcode::{
+use ratum::bitcoin::script::opcode::{
     OP_0, OP_1, OP_16, OP_CHECKSIG, OP_DUP, OP_EQUAL, OP_EQUALVERIFY, OP_HASH160, OP_N_BASE,
     OP_RETURN,
 };

@@ -29,32 +29,6 @@ macro_rules! wire_codes {
             }
         }
     };
-
-    (
-        $(#[$meta:meta])*
-        $vis:vis enum $name:ident: $repr:ty {
-            $($(#[$vmeta:meta])* $variant:ident = $code:literal),* $(,)?
-        }
-    ) => {
-        $(#[$meta])*
-        #[repr($repr)]
-        $vis enum $name {
-            $($(#[$vmeta])* $variant = $code,)*
-        }
-
-        impl $name {
-            pub fn code(self) -> $repr {
-                self as $repr
-            }
-
-            pub fn from_code(code: $repr) -> Option<Self> {
-                Some(match code {
-                    $($code => $name::$variant,)*
-                    _ => return None,
-                })
-            }
-        }
-    };
 }
 
 pub(crate) use wire_codes;

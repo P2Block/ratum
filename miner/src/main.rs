@@ -1,4 +1,4 @@
-use ratum::datum::share::{self, HEADER_EXTRANONCE_SIZE, SIA_FIELD_SIZE};
+use ratum::datum::messages::share::{self, HEADER_EXTRANONCE_SIZE, SIA_FIELD_SIZE};
 use ratum::header::blake2b_256;
 use ratum::target;
 use std::io::{BufRead, BufReader, Write};

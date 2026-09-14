@@ -24,6 +24,8 @@ const WORK_ROOT_EXTRANONCE_OFFSET: usize = 36;
 
 const PREVBLOCK_HIDDEN_CLEARED_BYTES: usize = 6;
 
+pub type XorKey = [u8; 16];
+
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct BlockHeaderV2 {
     pub version: i32,
@@ -39,7 +41,7 @@ pub struct BlockHeaderV2 {
     pub txcount: u16,
     pub flags: u8,
     pub xor_key_mask_clear_bits: u8,
-    pub xor_key: [u8; 16],
+    pub xor_key: XorKey,
     pub height: i32,
     pub mm_rhs: [u8; 32],
 }
@@ -203,15 +205,21 @@ impl BlockHeaderV2 {
         }
     }
 
-    pub fn raw_pow_and_block_hash(&self) -> ([u8; 32], [u8; 32]) {
+    pub fn pow_hashes(&self) -> PowHashes {
         let stages = self.hash_stages();
-        let pow = blake2b_256(&self.asic_input_with(&stages.work_root, &stages.h2));
-        let mut block = pow;
-        for (b, m) in block.iter_mut().zip(stages.xor_key_mask) {
+        let raw_pow_hash = blake2b_256(&self.asic_input_with(&stages.work_root, &stages.h2));
+        let mut block_hash = raw_pow_hash;
+        for (b, m) in block_hash.iter_mut().zip(stages.xor_key_mask) {
             *b ^= m;
         }
-        (pow, block)
+        PowHashes { raw_pow_hash, block_hash }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PowHashes {
+    pub raw_pow_hash: [u8; 32],
+    pub block_hash: [u8; 32],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -222,7 +230,7 @@ pub struct HashStages {
     pub xor_key_mask: [u8; 32],
 }
 
-pub fn xor_key_hash(xor_key: &[u8; 16]) -> [u8; 32] {
+pub fn xor_key_hash(xor_key: &XorKey) -> [u8; 32] {
     tagged_sha256("Bitcoin block hash PoW XOR key", xor_key)
 }
 
@@ -233,7 +241,7 @@ pub fn prevblock_hidden(prev_block: &[u8; 32]) -> [u8; 32] {
     out
 }
 
-pub fn xor_key_mask(xor_key: &[u8; 16], clear_bits: u8) -> [u8; 32] {
+pub fn xor_key_mask(xor_key: &XorKey, clear_bits: u8) -> [u8; 32] {
     if xor_key.iter().all(|&b| b == 0) {
         return [0u8; 32];
     }
@@ -247,13 +255,4 @@ pub fn xor_key_mask(xor_key: &[u8; 16], clear_bits: u8) -> [u8; 32] {
         *b &= u8::MAX >> (clear_bits % bits_per_byte);
     }
     m
-}
-
-pub fn hash_from_display_hex(s: &str) -> Option<[u8; 32]> {
-    let v: [u8; 32] = hex::decode(s).ok()?.try_into().ok()?;
-    Some(crate::bitcoin::reversed(&v))
-}
-
-pub fn hash_to_display_hex(v: &[u8; 32]) -> String {
-    hex::encode(crate::bitcoin::reversed(v))
 }

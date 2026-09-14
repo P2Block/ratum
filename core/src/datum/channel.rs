@@ -9,6 +9,8 @@ use dryoc::constants::{CRYPTO_BOX_BEFORENMBYTES, CRYPTO_BOX_MACBYTES, CRYPTO_SIG
 pub(crate) type PrecompKey = [u8; CRYPTO_BOX_BEFORENMBYTES];
 pub(crate) type Signature = [u8; CRYPTO_SIGN_BYTES];
 
+pub const MAX_PLAINTEXT_LEN: usize = framing::MAX_CMD_LEN - CRYPTO_BOX_MACBYTES;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("unexpected handshake frame header: {0:?}")]
@@ -37,6 +39,14 @@ pub enum Error {
     TooLarge(usize),
 }
 
+pub struct ChannelKeys {
+    pub tx_header_key: HeaderKeyRatchet,
+    pub rx_header_key: HeaderKeyRatchet,
+    pub tx_nonce: [u8; framing::NONCE_LEN],
+    pub rx_nonce: [u8; framing::NONCE_LEN],
+    pub precomp: Option<PrecompKey>,
+}
+
 pub struct Channel {
     precomp: Option<PrecompKey>,
     tx_nonce: [u8; framing::NONCE_LEN],
@@ -56,13 +66,8 @@ impl Channel {
         }
     }
 
-    pub fn new(
-        tx_header_key: HeaderKeyRatchet,
-        rx_header_key: HeaderKeyRatchet,
-        tx_nonce: [u8; framing::NONCE_LEN],
-        rx_nonce: [u8; framing::NONCE_LEN],
-        precomp: Option<PrecompKey>,
-    ) -> Self {
+    pub fn new(keys: ChannelKeys) -> Self {
+        let ChannelKeys { tx_header_key, rx_header_key, tx_nonce, rx_nonce, precomp } = keys;
         Self { precomp, tx_nonce, rx_nonce, tx_header_key, rx_header_key }
     }
 
@@ -98,10 +103,10 @@ impl Channel {
             }
             None => payload,
         };
-        let ct_len = plain.len() + CRYPTO_BOX_MACBYTES;
-        if ct_len as u64 > u64::from(framing::MAX_CMD_LEN) {
-            return Err(Error::TooLarge(ct_len));
+        if plain.len() > MAX_PLAINTEXT_LEN {
+            return Err(Error::TooLarge(plain.len() + CRYPTO_BOX_MACBYTES));
         }
+        let ct_len = plain.len() + CRYPTO_BOX_MACBYTES;
         let mut ct = vec![0u8; ct_len];
         crypto_box_easy_afternm(&mut ct, plain, &self.tx_nonce, precomp)
             .map_err(|_| Error::Encrypt)?;

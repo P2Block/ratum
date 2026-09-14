@@ -1,14 +1,14 @@
-use ratum::datum::abw::{
-    self, AbwShareRef, AssignmentNotice, Reveal, SlotKeys, raw_pow_hash_le, subcmd,
+use crate::verify::AbwKeys;
+use ratum::datum::messages::abw::{
+    self, AssignmentNotice, Reveal, ShareRef, SlotKeys, raw_pow_hash_le, subcmd,
 };
 use ratum::header::xor_key_hash;
-use ratum_prime::verify::AbwKeys;
 use std::time::{Duration, Instant};
 
-pub(crate) const ROTATE_AFTER_SHARES: u64 = 16384;
-pub(crate) const ROTATE_AFTER: Duration = Duration::from_secs(600);
-pub(crate) const DEFAULT_REVEAL_AFTER: Duration = Duration::from_secs(300);
-pub(crate) const REVEAL_AFTER_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=600;
+pub const ROTATE_AFTER_SHARES: u64 = 16384;
+pub const ROTATE_AFTER: Duration = Duration::from_secs(600);
+pub const DEFAULT_REVEAL_AFTER: Duration = Duration::from_secs(300);
+pub const REVEAL_AFTER_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=600;
 const MAX_TIP_ROTATIONS_PER_REVEAL: u32 = 4;
 
 #[derive(Clone, Copy, Debug)]
@@ -18,13 +18,18 @@ struct Retired {
     reveal_sent: bool,
 }
 
-pub(crate) struct PendingReveal {
-    pub(crate) slot: u8,
-    pub(crate) resend: bool,
-    pub(crate) payload: Vec<u8>,
+pub struct PendingReveal {
+    pub slot: u8,
+    pub resend: bool,
+    pub payload: Vec<u8>,
 }
 
-pub(crate) struct AbwSlotState {
+pub struct Rotation {
+    pub reveals: Vec<PendingReveal>,
+    pub notice: Vec<u8>,
+}
+
+pub struct AbwSlotState {
     seeded: SlotKeys,
     revealed: SlotKeys,
     active: u8,
@@ -35,7 +40,7 @@ pub(crate) struct AbwSlotState {
 }
 
 impl AbwSlotState {
-    pub(crate) fn start(now: Instant, reveal_after: Duration) -> Self {
+    pub fn start(now: Instant, reveal_after: Duration) -> Self {
         let mut abw = Self {
             seeded: [None; abw::ASSIGNMENT_SLOTS as usize],
             revealed: [None; abw::ASSIGNMENT_SLOTS as usize],
@@ -49,7 +54,7 @@ impl AbwSlotState {
         abw
     }
 
-    pub(crate) fn keys(&self) -> AbwKeys {
+    pub fn keys(&self) -> AbwKeys {
         AbwKeys { seeded: self.seeded, revealed: self.revealed }
     }
 
@@ -64,7 +69,7 @@ impl AbwSlotState {
         AssignmentNotice { active, slot, key_hash: xor_key_hash(&key) }.encode()
     }
 
-    pub(crate) fn notices(&self) -> Vec<Vec<u8>> {
+    pub fn notices(&self) -> Vec<Vec<u8>> {
         let mut out = Vec::with_capacity(self.retired.len() + 1);
         for r in self.retired.iter().filter(|r| !r.reveal_sent) {
             out.push(self.notice(r.slot, false));
@@ -73,7 +78,7 @@ impl AbwSlotState {
         out
     }
 
-    pub(crate) fn resumed(&mut self, now: Instant) {
+    pub fn resumed(&mut self, now: Instant) {
         for r in &mut self.retired {
             r.retired_at = now;
         }
@@ -102,7 +107,7 @@ impl AbwSlotState {
         }
     }
 
-    pub(crate) fn next_due(&self) -> Instant {
+    pub fn next_due(&self) -> Instant {
         let rotation = self.activated_at + ROTATE_AFTER;
         self.retired
             .iter()
@@ -111,11 +116,11 @@ impl AbwSlotState {
             .map_or(rotation, |reveal| rotation.min(reveal))
     }
 
-    pub(crate) fn reveal_due(&self, now: Instant) -> bool {
+    pub fn reveal_due(&self, now: Instant) -> bool {
         self.retired.iter().any(|r| now.duration_since(r.retired_at) >= self.reveal_after)
     }
 
-    pub(crate) fn reveals_due(&mut self, now: Instant) -> Vec<PendingReveal> {
+    pub fn reveals_due(&mut self, now: Instant) -> Vec<PendingReveal> {
         let reveal_after = self.reveal_after;
         let due: Vec<Retired> = self
             .retired
@@ -124,7 +129,7 @@ impl AbwSlotState {
         due.into_iter().map(|r| self.reveal(r)).collect()
     }
 
-    pub(crate) fn rotate(&mut self, now: Instant) -> (Vec<PendingReveal>, Vec<u8>) {
+    pub fn rotate(&mut self, now: Instant) -> Rotation {
         let old = self.active;
         let next = (old + 1) % abw::ASSIGNMENT_SLOTS;
         let mut reveals = Vec::new();
@@ -136,14 +141,14 @@ impl AbwSlotState {
         self.seed(next);
         self.shares_since_activation = 0;
         self.activated_at = now;
-        (reveals, self.notice(next, true))
+        Rotation { reveals, notice: self.notice(next, true) }
     }
 
-    pub(crate) fn note_share(&mut self) {
+    pub fn note_share(&mut self) {
         self.shares_since_activation = self.shares_since_activation.saturating_add(1);
     }
 
-    pub(crate) fn rotation_due(&self, now: Instant) -> Option<&'static str> {
+    pub fn rotation_due(&self, now: Instant) -> Option<&'static str> {
         if self.shares_since_activation >= ROTATE_AFTER_SHARES {
             Some("share count")
         } else if now.duration_since(self.activated_at) >= ROTATE_AFTER {
@@ -153,12 +158,12 @@ impl AbwSlotState {
         }
     }
 
-    pub(crate) fn tip_rotation_allowed(&self, now: Instant) -> bool {
+    pub fn tip_rotation_allowed(&self, now: Instant) -> bool {
         now.duration_since(self.activated_at) >= self.reveal_after / MAX_TIP_ROTATIONS_PER_REVEAL
     }
 
-    pub(crate) fn receipt(slot: u8, raw_pow_hash: [u8; 32]) -> Vec<u8> {
-        AbwShareRef { slot, raw_pow_hash_le: raw_pow_hash_le(&raw_pow_hash) }
+    pub fn receipt(slot: u8, raw_pow_hash: [u8; 32]) -> Vec<u8> {
+        ShareRef { slot, raw_pow_hash_le: raw_pow_hash_le(&raw_pow_hash) }
             .encode_candidate(subcmd::CANDIDATE_RECEIPT)
     }
 }
@@ -166,7 +171,7 @@ impl AbwSlotState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratum::datum::abw::AssignmentNotice as Notice;
+    use ratum::datum::messages::abw::AssignmentNotice as Notice;
 
     const AFTER: Duration = Duration::from_secs(180);
 
@@ -210,7 +215,7 @@ mod tests {
         let mut abw = AbwSlotState::start(now, AFTER);
         let key0 = abw.keys().seeded[0].unwrap();
 
-        let (reveals, notice) = abw.rotate(now);
+        let Rotation { reveals, notice } = abw.rotate(now);
         assert!(reveals.is_empty(), "slot 1 awaits no reveal");
         let n = Notice::decode(&notice).unwrap();
         assert!(n.active);
@@ -266,7 +271,7 @@ mod tests {
             abw.retired.iter().map(|r| r.slot).collect::<Vec<u8>>(),
             (0..15).collect::<Vec<u8>>()
         );
-        let (reveals, notice) = abw.rotate(now);
+        let Rotation { reveals, notice } = abw.rotate(now);
         assert_eq!(decoded_reveals(&reveals), [(0, key0)]);
         assert!(!reveals[0].resend);
         assert_eq!(Notice::decode(&notice).unwrap().slot, 0);
@@ -342,7 +347,7 @@ mod tests {
     #[test]
     fn a_receipt_names_the_slot_and_the_reversed_hash() {
         let raw_pow_hash: [u8; 32] = std::array::from_fn(|i| i as u8);
-        let c = AbwShareRef::decode_candidate(
+        let c = ShareRef::decode_candidate(
             &AbwSlotState::receipt(3, raw_pow_hash),
             subcmd::CANDIDATE_RECEIPT,
         )

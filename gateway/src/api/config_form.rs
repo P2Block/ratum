@@ -1,4 +1,4 @@
-use super::config::{
+use crate::config::{
     Config, DatumConfig, GLOBAL_TIMEOUT_MARGIN_SECS, MAX_CONFIGURED_TAG_LEN,
     MAX_CONFIGURED_TAGS_TOTAL_LEN, WORK_UPDATE_SECONDS_RANGE,
 };
@@ -18,7 +18,7 @@ struct Field {
 
 enum FieldKind {
     Text,
-    Int(i64, i64),
+    Int { min: i64, max: i64 },
     Bool,
     Password,
 }
@@ -45,7 +45,7 @@ const FIELDS: &[Field] = &[
         label: "Unique gateway ID",
         section: "mining",
         key: "coinbase_unique_id",
-        kind: FieldKind::Int(0, MAX_COINBASE_UNIQUE_ID),
+        kind: FieldKind::Int { min: 0, max: MAX_COINBASE_UNIQUE_ID },
         current: |c| json!(c.mining.coinbase_unique_id),
     },
     Field {
@@ -53,7 +53,7 @@ const FIELDS: &[Field] = &[
         label: "Pool port",
         section: "datum",
         key: "pool_port",
-        kind: FieldKind::Int(1, MAX_PORT),
+        kind: FieldKind::Int { min: 1, max: MAX_PORT },
         current: |c| json!(c.datum.pool_port),
     },
     Field {
@@ -85,7 +85,7 @@ const FIELDS: &[Field] = &[
         label: "Stratum port",
         section: "stratum",
         key: "listen_port",
-        kind: FieldKind::Int(1, MAX_PORT),
+        kind: FieldKind::Int { min: 1, max: MAX_PORT },
         current: |c| json!(c.stratum.listen_port),
     },
     Field {
@@ -93,7 +93,7 @@ const FIELDS: &[Field] = &[
         label: "Minimum difficulty",
         section: "stratum",
         key: "vardiff_min",
-        kind: FieldKind::Int(1, i64::MAX),
+        kind: FieldKind::Int { min: 1, max: i64::MAX },
         current: |c| json!(c.stratum.vardiff_min),
     },
     Field {
@@ -101,7 +101,7 @@ const FIELDS: &[Field] = &[
         label: "Network hashrate limit",
         section: "stratum",
         key: "max_network_share_bps",
-        kind: FieldKind::Int(0, ratum::BASIS_POINTS_PER_UNIT as i64),
+        kind: FieldKind::Int { min: 0, max: ratum::BASIS_POINTS_PER_UNIT as i64 },
         current: |c| json!(c.stratum.max_network_share_bps),
     },
     Field {
@@ -125,10 +125,10 @@ const FIELDS: &[Field] = &[
         label: "Job update interval",
         section: "bitcoind",
         key: "work_update_seconds",
-        kind: FieldKind::Int(
-            *WORK_UPDATE_SECONDS_RANGE.start() as i64,
-            *WORK_UPDATE_SECONDS_RANGE.end() as i64,
-        ),
+        kind: FieldKind::Int {
+            min: *WORK_UPDATE_SECONDS_RANGE.start() as i64,
+            max: *WORK_UPDATE_SECONDS_RANGE.end() as i64,
+        },
         current: |c| json!(c.bitcoind.work_update_seconds),
     },
     Field {
@@ -385,7 +385,7 @@ pub fn apply(
         let current = (f.current)(cfg);
         match f.kind {
             FieldKind::Text => edit.set_if_changed(f.section, f.key, json!(text.trim()), current),
-            FieldKind::Int(min, max) => match parse_int(f.label, text, min, max) {
+            FieldKind::Int { min, max } => match parse_int(f.label, text, min, max) {
                 Ok(v) => edit.set_if_changed(f.section, f.key, json!(v), current),
                 Err(e) => edit.errors.push(e),
             },
@@ -424,35 +424,6 @@ pub fn write_file(path: &str, text: &str) -> std::io::Result<()> {
     let tmp = format!("{path}.new");
     std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, path)
-}
-
-pub fn restart() -> ! {
-    log::info!("Restarting to apply the new configuration");
-    log::logger().flush();
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    let exe = std::env::current_exe()
-        .unwrap_or_else(|_| std::env::args_os().next().map(Into::into).unwrap_or_default());
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args(std::env::args_os().skip(1));
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        let e = cmd.exec();
-        log::error!("Could not restart: {e}");
-        log::logger().flush();
-        std::process::exit(1);
-    }
-    #[cfg(not(unix))]
-    {
-        match cmd.spawn() {
-            Ok(_) => std::process::exit(0),
-            Err(e) => {
-                log::error!("Could not restart: {e}");
-                log::logger().flush();
-                std::process::exit(1);
-            }
-        }
-    }
 }
 
 #[cfg(test)]

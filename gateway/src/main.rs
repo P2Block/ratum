@@ -3,36 +3,31 @@ mod api;
 mod coinbase;
 mod config;
 mod datum;
+#[cfg(test)]
+mod fixtures;
 mod job;
 mod logger;
+mod node;
 mod publish;
 mod seen_shares;
-mod settings;
 #[cfg(unix)]
 mod signals;
 mod stratum;
-mod submit;
+mod submit_block;
 mod tally;
 mod template;
 mod username;
 mod vardiff;
+mod watch;
 
 use clap::Parser;
 use config::Config;
-use log::{error, info, warn};
-use std::sync::atomic::Ordering;
+use log::{error, info};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const WATCH_TICK: Duration = Duration::from_millis(20);
-const STATS_INTERVAL: Duration = Duration::from_secs(300);
-const FIRST_JOB_PATIENCE: Duration = Duration::from_secs(25);
-const NO_JOB_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const POOL_CONNECT_WAIT: Duration = Duration::from_secs(15);
 const POOL_CONNECT_POLL: Duration = Duration::from_millis(250);
-const FAILURES_BEFORE_SHUTDOWN: u32 = 2;
-const NODE_INFO_INTERVAL: Duration = Duration::from_secs(ratum::SECS_PER_MINUTE);
-const NODE_INFO_RETRY: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
 #[command(name = "ratum-gateway", version = ratum::VERSION, about = "DATUM Gateway for the Bitcoin Knots BLAKE2b hardfork")]
@@ -45,8 +40,18 @@ struct Cli {
 struct SharedHandles {
     config: Arc<Config>,
     node: ratum::rpc::Client,
-    template_waker: Arc<template::TemplateWaker>,
+    template_waker: Arc<template::waker::TemplateWaker>,
     pool: Arc<datum::PoolConnectionState>,
+}
+
+fn fatal(message: impl std::fmt::Display) -> ! {
+    if log::max_level() == log::LevelFilter::Off {
+        eprintln!("{message}");
+    } else {
+        error!("{message}");
+        log::logger().flush();
+    }
+    std::process::exit(1);
 }
 
 fn install_panic_exit() {
@@ -60,20 +65,9 @@ fn install_panic_exit() {
 }
 
 fn load_config(path: &str) -> Config {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Error reading config file {path}: {e}. Check --help");
-            std::process::exit(1);
-        }
-    };
-    match Config::parse(&text) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Error reading config file: {e}");
-            std::process::exit(1);
-        }
-    }
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| fatal(format!("Error reading config file {path}: {e}. Check --help")));
+    Config::parse(&text).unwrap_or_else(|e| fatal(format!("Error reading config file: {e}")))
 }
 
 fn connect_node(config: &Config) -> ratum::rpc::Client {
@@ -83,14 +77,11 @@ fn connect_node(config: &Config) -> ratum::rpc::Client {
     } else {
         ratum::rpc::Client::new(&b.rpcurl, &b.rpcuser, &b.rpcpassword)
     };
-    node.unwrap_or_else(|e| {
-        error!("bitcoind.rpcurl: {e}");
-        std::process::exit(1);
-    })
+    node.unwrap_or_else(|e| fatal(format!("bitcoind.rpcurl: {e}")))
 }
 
 fn start_datum(handles: &SharedHandles) {
-    let identity = ratum::datum::handshake::KeyPairs::generate();
+    let identity = ratum::datum::keys::KeyPairs::generate();
     info!(
         "DATUM gateway identity: {}{}",
         hex::encode(identity.sign_pk),
@@ -117,67 +108,10 @@ fn start_datum(handles: &SharedHandles) {
     }
 }
 
-fn start_node_info_thread(node: ratum::rpc::Client, server: Arc<stratum::Server>) {
-    ratum::thread::spawn("node-info", move || {
-        let limit = server.config.max_network_share();
-        let mut announced = false;
-        let mut reported = false;
-        loop {
-            match node.mining_info() {
-                Ok(info) => {
-                    reported = false;
-                    server.set_node_warnings(info.warnings);
-                    if info.chain == ratum::rpc::Chain::Main {
-                        server.set_network_hashps(info.network_hashps);
-                    }
-                    if !announced {
-                        announced = true;
-                        announce_network_share_limit(limit, info.chain);
-                    }
-                }
-                Err(e) if e.is_method_not_found() => {
-                    error!(
-                        "the node does not serve getmininginfo ({e}), so the network share limit \
-                         on new stratum connections is not enforced and the node's warnings are \
-                         not shown"
-                    );
-                    return;
-                }
-                Err(e) if !reported => {
-                    reported = true;
-                    warn!(
-                        "could not read getmininginfo from the node ({e}); the network share \
-                         limit on new stratum connections keeps whatever estimate it has and the \
-                         node's warnings are not refreshed"
-                    );
-                }
-                Err(_) => {}
-            }
-            std::thread::sleep(if announced { NODE_INFO_INTERVAL } else { NODE_INFO_RETRY });
-        }
-    });
-}
-
-fn announce_network_share_limit(limit: Option<f64>, chain: ratum::rpc::Chain) {
-    let Some(limit) = limit else { return };
-    if chain == ratum::rpc::Chain::Main {
-        info!(
-            "Refusing new stratum connections while this gateway's miners are above {:.2}% of the network hashrate",
-            limit * 100.0
-        );
-    } else {
-        info!(
-            "The node is on chain {}, not main: new stratum connections are accepted whatever share of that chain's hashrate this gateway holds",
-            chain.name()
-        );
-    }
-}
-
 fn spawn_stratum_listener(server: Arc<stratum::Server>) {
     ratum::thread::spawn("stratum-listener", move || {
         if let Err(e) = stratum::listen(server) {
-            error!("stratum listener: {e}");
-            std::process::exit(1);
+            fatal(format!("stratum listener: {e}"));
         }
     });
 }
@@ -185,12 +119,12 @@ fn spawn_stratum_listener(server: Arc<stratum::Server>) {
 fn start_template_thread(
     handles: &SharedHandles,
     server: Arc<stratum::Server>,
-    last_error: Arc<template::LastError>,
+    last_error: Arc<template::poller::LastError>,
 ) {
     let handles = handles.clone();
     ratum::thread::spawn("template", move || {
         let publisher = publish::Publisher::new(
-            job::JobBuilder::new(Arc::clone(&handles.config)),
+            job::builder::JobBuilder::new(Arc::clone(&handles.config)),
             Arc::clone(&server),
             Arc::clone(&handles.pool),
         );
@@ -198,7 +132,7 @@ fn start_template_thread(
         let (pool, config) = (Arc::clone(&handles.pool), Arc::clone(&handles.config));
         let payout_script =
             move || pool.payout_script().unwrap_or_else(|| config.pool_output_script.clone());
-        template::run(
+        template::poller::run(
             handles.node.clone(),
             Arc::clone(&handles.config),
             Arc::clone(&handles.template_waker),
@@ -215,95 +149,23 @@ fn start_template_thread(
     });
 }
 
-fn due(last: &mut Instant, interval: Duration) -> bool {
-    if last.elapsed() < interval {
-        return false;
-    }
-    *last = Instant::now();
-    true
-}
-
-fn report_missing_job(server: &stratum::Server, started: Instant, last_report: &mut Instant) {
-    if server.current_job().is_some() || started.elapsed() <= FIRST_JOB_PATIENCE {
-        return;
-    }
-    if due(last_report, NO_JOB_REPORT_INTERVAL) {
-        error!(
-            "Did not see an initial stratum job after ~{} seconds. Is your node properly setup?",
-            started.elapsed().as_secs()
-        );
-    }
-}
-
-fn report_stats(server: &stratum::Server, last: &mut Instant) {
-    if !due(last, STATS_INTERVAL) {
-        return;
-    }
-    let s = server.summary();
-    info!(
-        "Server stats: {} client{} / {:.2} Th/s",
-        s.subscribed,
-        if s.subscribed == 1 { "" } else { "s" },
-        s.hashrate_ths
-    );
-}
-
-fn enforce_pooled_only(handles: &SharedHandles, server: &stratum::Server, warned: &mut bool) {
-    let active = handles.pool.is_active();
-    if active {
-        handles.pool.connect_failures.store(0, Ordering::Relaxed);
-    }
-    let reject = handles.config.datum.pooled_mining_only && !active;
-    if !reject {
-        *warned = false;
-    } else if !*warned
-        && handles.pool.connect_failures.load(Ordering::Relaxed) >= FAILURES_BEFORE_SHUTDOWN
-    {
-        warn!(
-            "The DATUM pool is unreachable and datum.pooled_mining_only is set: disconnecting stratum clients until it is reached again"
-        );
-        server.shutdown_all();
-        *warned = true;
-    }
-    server.refuse_while_pool_unreachable.store(reject, Ordering::Relaxed);
-}
-
-fn watch_loop(handles: &SharedHandles, server: &stratum::Server) -> ! {
-    let pooled = !handles.config.datum.pool_host.is_empty();
-    let started = Instant::now();
-    let mut warned = false;
-    let mut last_stats = Instant::now();
-    let mut last_no_job_report = Instant::now();
-    loop {
-        std::thread::sleep(WATCH_TICK);
-        report_missing_job(server, started, &mut last_no_job_report);
-        report_stats(server, &mut last_stats);
-        if pooled {
-            enforce_pooled_only(handles, server, &mut warned);
-        }
-    }
-}
-
 fn main() {
     let cli = Cli::parse();
     let config = Arc::new(load_config(&cli.config));
-    let notes = logger::init(&config.logger).unwrap_or_else(|e| {
-        eprintln!("{e}");
-        std::process::exit(1);
-    });
+    let notes = logger::init(&config.logger).unwrap_or_else(|e| fatal(e));
     info!("ratum-gateway {} starting", ratum::VERSION);
-    for (level, message) in notes.iter().chain(&config.startup_notes) {
-        log::log!(*level, "{message}");
+    for note in notes.iter().chain(&config.startup_notes) {
+        log::log!(note.level, "{}", note.message);
     }
     install_panic_exit();
     let node = connect_node(&config);
 
-    let template_waker = Arc::new(template::TemplateWaker::default());
+    let template_waker = Arc::new(template::waker::TemplateWaker::default());
     let pool = Arc::new(datum::PoolConnectionState::new(
         config.datum.protocol_job_slots,
         config.share_queue_capacity(),
         Arc::clone(&template_waker),
-        Some(node.clone()),
+        node.clone(),
     ));
     #[cfg(unix)]
     signals::install(Arc::clone(&template_waker));
@@ -314,31 +176,33 @@ fn main() {
         start_datum(&handles);
     }
 
+    let node_view = Arc::new(node::NodeView::default());
     let server = stratum::Server::new(
         Arc::clone(&handles.config),
         Arc::clone(&handles.pool),
         handles.node.clone(),
+        Arc::clone(&node_view),
         Arc::clone(&handles.template_waker),
     );
-    let template_error: Arc<template::LastError> = Arc::default();
+    let template_error: Arc<template::poller::LastError> = Arc::default();
 
-    start_node_info_thread(handles.node.clone(), Arc::clone(&server));
+    node::start_info_thread(handles.node.clone(), node_view, handles.config.max_network_share());
 
     if handles.config.bitcoind.notify_fallback {
         let (node, template_waker) = (handles.node.clone(), Arc::clone(&handles.template_waker));
         ratum::thread::spawn("notify-fallback", move || {
-            template::fallback_notifier(node, template_waker)
+            template::poller::fallback_notifier(node, template_waker)
         });
     }
 
     api::start(Arc::new(api::Context {
         server: Arc::clone(&server),
         template_error: Arc::clone(&template_error),
-        started: Instant::now(),
-        csrf: api::csrf_token(),
+        started_at: Instant::now(),
+        csrf_token: api::csrf_token(),
         config_path: cli.config,
         hashrate_history: Mutex::default(),
     }));
     start_template_thread(&handles, Arc::clone(&server), template_error);
-    watch_loop(&handles, &server)
+    watch::run(&handles, &server)
 }

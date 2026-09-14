@@ -1,3 +1,4 @@
+use ratum::bitcoin::{hash_from_display_hex, hash_to_display_hex};
 use ratum::header::*;
 use serde_json::Value;
 
@@ -116,7 +117,7 @@ fn all_vectors_reproduce() {
             v.name
         );
 
-        let (pow, block) = h.raw_pow_and_block_hash();
+        let PowHashes { raw_pow_hash: pow, block_hash: block } = h.pow_hashes();
         assert_eq!(hex::encode(pow), v.blake2b_2, "{}: blake2b_2", v.name);
         assert_eq!(hex::encode(block), v.block_hash, "{}: block_hash", v.name);
         assert_eq!(blake2b_256(&asic_input), pow, "{}: pow is blake2b of the asic input", v.name);

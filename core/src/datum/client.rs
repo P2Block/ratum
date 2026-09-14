@@ -1,9 +1,12 @@
-use super::channel::{Channel, Error, Signature, strip_signature};
-use super::framing::{self, FrameHeader, HeaderKeyRatchet, HeaderKeys, STRUCT_END, SessionNonces};
+use super::channel::{Channel, ChannelKeys, Error, Signature, strip_signature};
+use super::framing::{self, FrameHeader, HeaderKeyRatchet, HeaderKeys, SessionNonces};
 use super::handshake::{
-    HELLO_PUBKEYS_LEN, KeyPairs, POOL_BOX_KEY_INDEX, POOL_SIGN_KEY_INDEX, ProtocolVersion,
-    RESPONSE_PUBKEYS_LEN, key_at, pubkey_at,
+    DRS_MARKER, DRS_RESUME_PRESENT, DRS_TOKEN_AT, HELLO_PUBKEYS_LEN, POOL_BOX_KEY_INDEX,
+    POOL_SIGN_KEY_INDEX, ProtocolVersion, RESPONSE_PUBKEYS_LEN, RESUME_TOKEN_LEN, ResumeToken,
+    key_at, pubkey_at,
 };
+use super::keys::KeyPairs;
+use super::messages::STRUCT_END;
 use bytes::BufMut as _;
 use dryoc::classic::crypto_box::{
     PublicKey as BoxPublicKey, crypto_box_beforenm, crypto_box_seal, crypto_box_seal_open,
@@ -18,8 +21,8 @@ const MAX_HELLO_PAD_LEN: usize = 200;
 const MAX_HELLO_TAIL_LEN: usize = 1
     + 1
     + size_of::<u32>()
-    + super::handshake::DRS_TOKEN_AT
-    + super::messages::RESUME_TOKEN_LEN
+    + DRS_TOKEN_AT
+    + RESUME_TOKEN_LEN
     + MAX_HELLO_PAD_LEN
     + CRYPTO_SIGN_BYTES;
 
@@ -56,7 +59,7 @@ impl ClientChannel {
         &mut self,
         pool_box_pk: &BoxPublicKey,
         user_agent: &str,
-        token: Option<&super::messages::ResumeToken>,
+        token: Option<&ResumeToken>,
     ) -> Vec<u8> {
         self.hello_with(pool_box_pk, user_agent, ProtocolVersion::V3 { resume: token.copied() })
     }
@@ -78,10 +81,10 @@ impl ClientChannel {
         body.put_u8(STRUCT_END);
         body.put_u32_le(self.nk);
         if let ProtocolVersion::V3 { resume } = protocol_version {
-            body.put_slice(&super::handshake::DRS_MARKER);
+            body.put_slice(&DRS_MARKER);
             match resume {
                 Some(t) => {
-                    body.put_u8(super::handshake::DRS_RESUME_PRESENT);
+                    body.put_u8(DRS_RESUME_PRESENT);
                     body.put_slice(&t);
                 }
                 None => body.put_u8(0),
@@ -111,13 +114,13 @@ impl ClientChannel {
 
         let keys = HeaderKeys::from_nk(self.nk);
         let nonces = SessionNonces::derive(self.nk, &self.session_keys.sign_pk);
-        self.channel = Channel::new(
-            HeaderKeyRatchet::new(keys.client_to_server),
-            HeaderKeyRatchet::new(keys.server_to_client),
-            nonces.client_sender,
-            nonces.client_receiver,
-            None,
-        );
+        self.channel = Channel::new(ChannelKeys {
+            tx_header_key: HeaderKeyRatchet::new(keys.client_to_server),
+            rx_header_key: HeaderKeyRatchet::new(keys.server_to_client),
+            tx_nonce: nonces.client_sender,
+            rx_nonce: nonces.client_receiver,
+            precomp: None,
+        });
         out
     }
 
@@ -218,8 +221,8 @@ impl ClientChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datum::handshake::accept;
-    use crate::datum::handshake::tests::{client_with_generated_keys, server_read_hello};
+    use crate::datum::server::accept;
+    use crate::datum::server::tests::{client_with_generated_keys, server_read_hello};
 
     #[test]
     fn client_and_server_complete_a_handshake_and_exchange_messages_both_ways() {
@@ -262,7 +265,7 @@ mod tests {
         let mut client = client_with_generated_keys(9);
         let wire = client.hello(&pool.box_pk, "ua");
         let hello = server_read_hello(&wire, &pool).unwrap();
-        let motd = "m".repeat(crate::datum::handshake::MAX_MOTD_LEN);
+        let motd = "m".repeat(crate::datum::server::MAX_MOTD_LEN);
         let (response, _) = accept(hello, &pool, &motd).unwrap();
         client.read_handshake_response(&response, &pool.sign_pk).unwrap();
         assert_eq!(client.motd(), motd);

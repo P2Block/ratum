@@ -1,21 +1,21 @@
-use crate::server::{Server, dictated_outputs};
+use crate::payout::{DictatedOutput, dictated_outputs};
+use crate::server::Server;
 use log::{error, info, warn};
-use ratum::bitcoin::TxOut;
-use ratum::datum::messages::CoinbaserResponse;
-use ratum::lock;
+use ratum::bitcoin::transaction::TxOut;
+use ratum::datum::messages::coinbaser::CoinbaserResponse;
 use std::io;
 use std::net::SocketAddr;
 
 const COINBASE_VALUE_TOLERANCE: f64 = 2.0;
 
-pub(crate) struct DictatedSplitReply {
-    pub(crate) response: CoinbaserResponse,
-    pub(crate) identities: Vec<String>,
-    pub(crate) payload: Vec<u8>,
+pub struct DictatedSplitReply {
+    pub response: CoinbaserResponse,
+    pub dictated: Vec<DictatedOutput>,
+    pub payload: Vec<u8>,
 }
 
-pub(crate) fn value_is_plausible(server: &Server, peer: SocketAddr, value: u64) -> bool {
-    let Some(reference) = *lock(&server.node_view.coinbase_value) else { return true };
+pub fn value_is_plausible(server: &Server, peer: SocketAddr, value: u64) -> bool {
+    let Some(reference) = server.node_view.coinbase_value() else { return true };
     let low = (reference as f64 / COINBASE_VALUE_TOLERANCE) as u64;
     let high = (reference as f64 * COINBASE_VALUE_TOLERANCE) as u64;
     if (low..=high).contains(&value) {
@@ -28,26 +28,27 @@ pub(crate) fn value_is_plausible(server: &Server, peer: SocketAddr, value: u64) 
     false
 }
 
-pub(crate) fn next_id(current: u8) -> u8 {
+pub fn next_id(current: u8) -> u8 {
     match current.wrapping_add(1) {
         0 => 1,
         next => next,
     }
 }
 
-pub(crate) fn dictate(
+pub fn dictate(
     server: &Server,
     peer: SocketAddr,
     value: u64,
     coinbaser_id: u8,
 ) -> io::Result<DictatedSplitReply> {
-    let (dictated, shares, work) = dictated_outputs(server, value);
-    let paid: u64 = dictated.iter().map(|(_, o)| o.value).sum();
-    let outputs: Vec<TxOut> = dictated.iter().map(|(_, o)| o.clone()).collect();
+    let dictated = dictated_outputs(server, value);
+    let paid: u64 = dictated.outputs.iter().map(|o| o.output.value).sum();
+    let outputs: Vec<TxOut> = dictated.outputs.iter().map(|o| o.output.clone()).collect();
     info!(
-        "[{peer}]      paying {} miners {paid} of {value} sats from a window of {shares} \
-         shares ({work} work)",
-        outputs.len()
+        "[{peer}]      paying {} miners {paid} of {value} sats from a window of {} shares ({} work)",
+        outputs.len(),
+        dictated.window_shares,
+        dictated.window_work
     );
 
     let mut response = CoinbaserResponse { value, coinbaser_id, outputs };
@@ -56,8 +57,8 @@ pub(crate) fn dictate(
         warn!("[{peer}]      removed {removed} unpayable outputs from the split");
     }
     let payload = encode_shrinking(server, peer, &mut response)?;
-    let identities = identities_of(&response, &dictated);
-    Ok(DictatedSplitReply { response, identities, payload })
+    let dictated = dictated_for(&response, dictated.outputs);
+    Ok(DictatedSplitReply { response, dictated, payload })
 }
 
 fn encode_shrinking(
@@ -87,15 +88,18 @@ fn encode_shrinking(
     }
 }
 
-fn identities_of(response: &CoinbaserResponse, dictated: &[(String, TxOut)]) -> Vec<String> {
-    let mut rest = dictated.iter();
+fn dictated_for(
+    response: &CoinbaserResponse,
+    dictated: Vec<DictatedOutput>,
+) -> Vec<DictatedOutput> {
+    let mut rest = dictated.into_iter();
     response
         .outputs
         .iter()
         .map(|o| {
             rest.by_ref()
-                .find(|(_, d)| d.value == o.value && d.script_pubkey == o.script_pubkey)
-                .map_or_else(String::new, |(identity, _)| identity.clone())
+                .find(|d| d.output == *o)
+                .unwrap_or_else(|| DictatedOutput { identity: String::new(), output: o.clone() })
         })
         .collect()
 }

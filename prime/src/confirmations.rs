@@ -1,7 +1,8 @@
+use crate::ledger::Ledger;
+use crate::ledger::blocks::{ConfirmationReading, OwedBlock};
 use crate::server::Server;
 use log::{error, info, warn};
 use ratum::lock;
-use ratum_prime::ledger::{ConfirmationReading, Ledger};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -11,7 +12,7 @@ const CONFIRMED_DEPTH: i64 = 100;
 
 const MAX_PER_PASS: usize = 32;
 
-pub(crate) fn watch(server: Arc<Server>) {
+pub fn watch(server: Arc<Server>) {
     ratum::thread::spawn("confirmations", move || {
         loop {
             std::thread::sleep(INTERVAL);
@@ -76,7 +77,7 @@ fn report(
     display: &str,
     state: ConfirmationReading,
     previous: Option<ConfirmationReading>,
-    owed: Option<ratum_prime::ledger::OwedBlock>,
+    owed: Option<OwedBlock>,
 ) {
     let was_on_chain = previous.is_none_or(|p| p.on_best_chain());
     if state.on_best_chain() {
@@ -113,7 +114,7 @@ fn report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratum_prime::ledger::FoundBlock;
+    use crate::ledger::blocks::FoundBlock;
 
     fn hash(n: u8) -> [u8; 32] {
         [n; 32]
@@ -123,13 +124,13 @@ mod tests {
         let mut l = Ledger::new(u128::MAX);
         for (n, confirmations) in states {
             l.record_block(FoundBlock {
-                at: 1_000 + u64::from(*n),
+                found_at: 1_000 + u64::from(*n),
                 height: 100 + u32::from(*n),
                 block_hash: hash(*n),
                 paid_to_split: 1,
                 paid_to_pool: 1,
                 finder: "alice".into(),
-                tag: String::new(),
+                tag_secondary: String::new(),
                 network_difficulty: 1.0,
                 cumulative_work: 1,
             })

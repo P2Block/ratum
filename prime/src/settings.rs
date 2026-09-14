@@ -1,13 +1,13 @@
 use crate::abw;
 use crate::cli::{self, fatal};
-use crate::server::{Payability, Unpayable, resolve_address};
+use crate::config::Config;
+use crate::payout::resolver::{Payability, Unpayable, resolve_address};
 use log::warn;
-use ratum::bitcoin::opcode::OP_RETURN;
-use ratum::bitcoin::output_script_size_is_valid;
-use ratum::datum::messages::MAX_COINBASE_TAG_LEN;
+use ratum::bitcoin::script::opcode::OP_RETURN;
+use ratum::bitcoin::script::output_script_size_is_valid;
+use ratum::datum::messages::config::MAX_COINBASE_TAG_LEN;
 use ratum::rpc;
-use ratum_prime::config::Config;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const DUST_THRESHOLD_P2PKH: u64 = 546;
@@ -19,37 +19,37 @@ const DEFAULT_LISTEN: &str = "0.0.0.0:28915";
 const DEFAULT_MOTD: &str = "RATUM Prime";
 const DEFAULT_WINDOW_MULTIPLE: f64 = 8.0;
 
-pub(crate) struct Settings {
-    pub(crate) listen: String,
-    pub(crate) stats_listen: Option<String>,
-    pub(crate) advertise_address: Option<String>,
-    pub(crate) public_gateway: Option<String>,
-    pub(crate) data_dir: Option<PathBuf>,
-    pub(crate) key_path: PathBuf,
-    pub(crate) motd: String,
-    pub(crate) allowed_agents: Vec<String>,
-    pub(crate) require_v3: bool,
-    pub(crate) abw_reveal_after: Duration,
-    pub(crate) min_difficulty: u64,
-    pub(crate) max_connections: usize,
-    pub(crate) payout: Option<(PayoutFlag, String)>,
-    pub(crate) coinbase_tag: String,
-    pub(crate) prime_id: u32,
-    pub(crate) ledger_path: Option<String>,
-    pub(crate) ledger_keep: Option<usize>,
-    pub(crate) window_multiple: f64,
-    pub(crate) window_floor: u128,
-    pub(crate) min_payout: u64,
-    pub(crate) fee_bps: u16,
-    pub(crate) public_gateway_fee_bps: u16,
-    pub(crate) public_gateway_fee_subsidy_bps: u16,
-    pub(crate) public_gateway_tag: Option<String>,
-    pub(crate) poll: Duration,
-    pub(crate) require_split: bool,
-    node: NodeCredential,
+pub struct Settings {
+    pub listen: String,
+    pub stats_listen: Option<String>,
+    pub advertise_address: Option<String>,
+    pub public_gateway: Option<String>,
+    pub data_dir: Option<PathBuf>,
+    pub key_path: PathBuf,
+    pub motd: String,
+    pub allowed_agents: Vec<String>,
+    pub require_v3: bool,
+    pub abw_reveal_after: Duration,
+    pub min_difficulty: u64,
+    pub max_connections: usize,
+    pub payout: Option<PayoutSetting>,
+    pub coinbase_tag: String,
+    pub prime_id: u32,
+    pub ledger_path: Option<String>,
+    pub ledger_keep: Option<usize>,
+    pub window_multiple: f64,
+    pub window_floor: u128,
+    pub min_payout: u64,
+    pub fee_bps: u16,
+    pub public_gateway_fee_bps: u16,
+    pub public_gateway_fee_subsidy_bps: u16,
+    pub public_gateway_tag: Option<String>,
+    pub poll: Duration,
+    pub require_split: bool,
+    node: NodeRpcSettings,
 }
 
-struct NodeCredential {
+struct NodeRpcSettings {
     url: Option<String>,
     user: String,
     pass: String,
@@ -58,7 +58,7 @@ struct NodeCredential {
 }
 
 impl Settings {
-    pub(crate) fn resolve(c: &Config, f: Config) -> Self {
+    pub fn resolve(c: &Config, f: Config) -> Self {
         let payout = payout_choice(c, &f);
         let data_dir = c.data_dir.clone().or(f.data_dir).map(PathBuf::from);
         let public_gateway_fee_bps = cli::resolve(
@@ -96,7 +96,7 @@ impl Settings {
             stats_listen: c.stats_listen.clone().or(f.stats_listen),
             advertise_address: c.advertise_address.clone().or(f.advertise_address),
             public_gateway: c.public_gateway.clone().or(f.public_gateway).map(with_scheme),
-            key_path: key_path(c.key.clone().or(f.key), data_dir.as_ref()),
+            key_path: key_path(c.key.clone().or(f.key), data_dir.as_deref()),
             data_dir,
             motd: cli::resolve_str(c.motd.clone(), f.motd, DEFAULT_MOTD),
             allowed_agents: agent_prefixes(&cli::resolve_str(
@@ -173,7 +173,7 @@ impl Settings {
             ),
             poll: poll_interval(c.poll, f.poll),
             require_split: c.require_split.or(f.require_split).unwrap_or(true),
-            node: NodeCredential {
+            node: NodeRpcSettings {
                 url: c.rpc.clone().or(f.rpc),
                 user: cli::resolve_str(c.rpc_user.clone(), f.rpc_user, ""),
                 pass: cli::resolve_str(c.rpc_pass.clone(), f.rpc_pass, ""),
@@ -183,7 +183,7 @@ impl Settings {
         }
     }
 
-    pub(crate) fn connect_node(&self) -> std::io::Result<rpc::Client> {
+    pub fn connect_node(&self) -> std::io::Result<rpc::Client> {
         self.node.connect()
     }
 }
@@ -258,7 +258,7 @@ fn with_scheme(url: String) -> String {
     }
 }
 
-fn key_path(named: Option<String>, data_dir: Option<&PathBuf>) -> PathBuf {
+fn key_path(named: Option<String>, data_dir: Option<&Path>) -> PathBuf {
     const KEY_FILE: &str = "ratum-prime.key";
     match (named, data_dir) {
         (Some(p), _) => PathBuf::from(p),
@@ -267,7 +267,7 @@ fn key_path(named: Option<String>, data_dir: Option<&PathBuf>) -> PathBuf {
     }
 }
 
-impl NodeCredential {
+impl NodeRpcSettings {
     fn connect(&self) -> std::io::Result<rpc::Client> {
         if self.pass_on_argv {
             warn!(
@@ -299,30 +299,30 @@ impl NodeCredential {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum PayoutFlag {
-    Address,
-    Script,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PayoutSetting {
+    Address(String),
+    Script(String),
 }
 
-impl PayoutFlag {
-    fn flag(self) -> &'static str {
+impl PayoutSetting {
+    fn flag(&self) -> &'static str {
         match self {
-            Self::Address => "--payout-address",
-            Self::Script => "--payout-script",
+            Self::Address(_) => "--payout-address",
+            Self::Script(_) => "--payout-script",
         }
     }
 }
 
-fn payout_choice(c: &Config, f: &Config) -> Option<(PayoutFlag, String)> {
+fn payout_choice(c: &Config, f: &Config) -> Option<PayoutSetting> {
     let sources = [
         (c.payout_address.as_ref(), c.payout_script.as_ref()),
         (f.payout_address.as_ref(), f.payout_script.as_ref()),
     ];
     for (address, script) in sources {
         match (address, script) {
-            (Some(a), None) => return Some((PayoutFlag::Address, a.clone())),
-            (None, Some(s)) => return Some((PayoutFlag::Script, s.clone())),
+            (Some(a), None) => return Some(PayoutSetting::Address(a.clone())),
+            (None, Some(s)) => return Some(PayoutSetting::Script(s.clone())),
             (Some(_), Some(_)) => fatal!("give --payout-address or --payout-script, not both"),
             (None, None) => {}
         }
@@ -330,8 +330,8 @@ fn payout_choice(c: &Config, f: &Config) -> Option<(PayoutFlag, String)> {
     None
 }
 
-pub(crate) fn payout_script(node: &rpc::Client, payout: Option<(PayoutFlag, String)>) -> Vec<u8> {
-    let Some((kind, value)) = payout else {
+pub fn payout_script(node: &rpc::Client, payout: Option<&PayoutSetting>) -> Vec<u8> {
+    let Some(setting) = payout else {
         fatal!(
             "--payout-address (or --payout-script) is required: the gateway reserves a \
              coinbase output for it on every job, and it receives the value of every \
@@ -339,8 +339,8 @@ pub(crate) fn payout_script(node: &rpc::Client, payout: Option<(PayoutFlag, Stri
              empty window, a split that could not be encoded)"
         )
     };
-    let script = match kind {
-        PayoutFlag::Script => match hex::decode(&value) {
+    let script = match setting {
+        PayoutSetting::Script(value) => match hex::decode(value) {
             Ok(b) if b.first() == Some(&OP_RETURN) => fatal!(
                 "--payout-script starts with OP_RETURN, which would burn every fallback \
                  payment rather than pay it"
@@ -348,9 +348,9 @@ pub(crate) fn payout_script(node: &rpc::Client, payout: Option<(PayoutFlag, Stri
             Ok(b) if !b.is_empty() => b,
             _ => fatal!("--payout-script must be a non-empty hex script, got {value:?}"),
         },
-        PayoutFlag::Address => match resolve_address(node, &value) {
+        PayoutSetting::Address(value) => match resolve_address(node, value) {
             Payability::Script(b) => b,
-            Payability::Unpayable(Unpayable::ScriptTooLong(len)) => script_too_long(kind, len),
+            Payability::Unpayable(Unpayable::ScriptTooLong(len)) => script_too_long(setting, len),
             Payability::Unpayable(Unpayable::NoScript) => {
                 fatal!("the node gave no scriptPubKey for {value:?}")
             }
@@ -363,16 +363,16 @@ pub(crate) fn payout_script(node: &rpc::Client, payout: Option<(PayoutFlag, Stri
         },
     };
     if !output_script_size_is_valid(&script) {
-        script_too_long(kind, script.len());
+        script_too_long(setting, script.len());
     }
     script
 }
 
-fn script_too_long(kind: PayoutFlag, len: usize) -> ! {
+fn script_too_long(setting: &PayoutSetting, len: usize) -> ! {
     fatal!(
         "{} gives a {len}-byte script, which a block carrying it would be rejected for: \
          a coinbase output script may be at most {} bytes",
-        kind.flag(),
-        ratum::bitcoin::MAX_OUTPUT_SCRIPT_SIZE
+        setting.flag(),
+        ratum::bitcoin::script::MAX_OUTPUT_SCRIPT_SIZE
     )
 }

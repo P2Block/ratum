@@ -7,6 +7,18 @@ const RATE_TOLERANCE: u64 = 2;
 const MIN_QUICKDIFF_SHIFT: u32 = 2;
 const MIN_SHARES_TO_DOUBLE: u64 = 16;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VardiffEvent {
+    ShareAccepted,
+    JobSent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VardiffUpdate {
+    Quickdiff,
+    Deferred,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct VardiffParams {
     pub min: u64,
@@ -90,13 +102,14 @@ impl Vardiff {
         self.forced_floor.max(self.params.min)
     }
 
-    pub fn update(&mut self, no_quick: bool, now: Instant) -> bool {
+    pub fn update(&mut self, event: VardiffEvent, now: Instant) -> VardiffUpdate {
         let p = self.params;
+        let share_accepted = event == VardiffEvent::ShareAccepted;
         if self.current != self.last_sent {
-            return false;
+            return VardiffUpdate::Deferred;
         }
-        if !no_quick && self.shares_since_snapshot < p.quickdiff_count {
-            return false;
+        if share_accepted && self.shares_since_snapshot < p.quickdiff_count {
+            return VardiffUpdate::Deferred;
         }
         let delta = now.saturating_duration_since(self.snapshot_at).as_millis() as u64;
         let n = self.shares_since_snapshot;
@@ -106,14 +119,14 @@ impl Vardiff {
                 self.current = (self.current >> 1).max(self.floor());
                 self.reset_snapshot(now);
             }
-            return false;
+            return VardiffUpdate::Deferred;
         }
         if delta < MIN_SAMPLE_MS {
-            return false;
+            return VardiffUpdate::Deferred;
         }
         let ms_per_share = (delta / n).max(1);
         if !self.quickdiff_active
-            && !no_quick
+            && share_accepted
             && ms_per_share < target_ms / p.quickdiff_delta.max(1)
         {
             let factor = target_ms / ms_per_share;
@@ -121,21 +134,21 @@ impl Vardiff {
             self.current =
                 ratum::target::pow2_floor(raw).max(1).max(self.current << MIN_QUICKDIFF_SHIFT);
             self.reset_snapshot(now);
-            return true;
+            return VardiffUpdate::Quickdiff;
         }
         if ms_per_share > target_ms * RATE_TOLERANCE {
             self.current = (self.current >> 1).max(self.floor());
             self.reset_snapshot(now);
-            return false;
+            return VardiffUpdate::Deferred;
         }
         if n < MIN_SHARES_TO_DOUBLE {
-            return false;
+            return VardiffUpdate::Deferred;
         }
         if ms_per_share < target_ms / RATE_TOLERANCE {
             self.current <<= 1;
             self.reset_snapshot(now);
         }
-        false
+        VardiffUpdate::Deferred
     }
 }
 
@@ -165,13 +178,22 @@ mod tests {
         let (mut v, now) = started();
         v.current = 65536;
         v.mark_sent();
-        assert!(!v.update(true, now + Duration::from_secs(61)));
+        assert_eq!(
+            v.update(VardiffEvent::JobSent, now + Duration::from_secs(61)),
+            VardiffUpdate::Deferred
+        );
         assert_eq!(v.current, 32768);
         v.mark_sent();
-        assert!(!v.update(true, now + Duration::from_secs(122)));
+        assert_eq!(
+            v.update(VardiffEvent::JobSent, now + Duration::from_secs(122)),
+            VardiffUpdate::Deferred
+        );
         assert_eq!(v.current, 16384);
         v.mark_sent();
-        assert!(!v.update(true, now + Duration::from_secs(183)));
+        assert_eq!(
+            v.update(VardiffEvent::JobSent, now + Duration::from_secs(183)),
+            VardiffUpdate::Deferred
+        );
         assert_eq!(v.current, 16384, "never under vardiff_min");
     }
 
@@ -180,7 +202,10 @@ mod tests {
         let (mut v, now) = started();
         v.raise_floor(524_288);
         v.mark_sent();
-        assert!(!v.update(true, now + Duration::from_secs(61)));
+        assert_eq!(
+            v.update(VardiffEvent::JobSent, now + Duration::from_secs(61)),
+            VardiffUpdate::Deferred
+        );
         assert_eq!(v.current, 524_288);
     }
 
@@ -188,7 +213,10 @@ mod tests {
     fn eight_shares_in_two_seconds_quick_raise_by_the_measured_factor() {
         let (mut v, now) = started();
         shares(&mut v, 8);
-        assert!(v.update(false, now + Duration::from_secs(2)));
+        assert_eq!(
+            v.update(VardiffEvent::ShareAccepted, now + Duration::from_secs(2)),
+            VardiffUpdate::Quickdiff
+        );
         assert_eq!(v.current, 16384 * 16);
         assert!(v.change_pending(), "the caller must announce it");
     }
@@ -197,11 +225,22 @@ mod tests {
     fn a_quick_raise_is_at_least_four_times_and_never_before_the_count_or_from_a_notify() {
         let (mut v, now) = started();
         shares(&mut v, 7);
-        assert!(!v.update(false, now + Duration::from_secs(1)), "seven shares are too few");
+        assert_eq!(
+            v.update(VardiffEvent::ShareAccepted, now + Duration::from_secs(1)),
+            VardiffUpdate::Deferred,
+            "seven shares are too few"
+        );
         v.count_share();
-        assert!(!v.update(true, now + Duration::from_secs(1)), "a notify never quick-raises");
+        assert_eq!(
+            v.update(VardiffEvent::JobSent, now + Duration::from_secs(1)),
+            VardiffUpdate::Deferred,
+            "a notify never quick-raises"
+        );
         assert_eq!(v.current, 16384);
-        assert!(v.update(false, now + Duration::from_secs(1)));
+        assert_eq!(
+            v.update(VardiffEvent::ShareAccepted, now + Duration::from_secs(1)),
+            VardiffUpdate::Quickdiff
+        );
         assert!(v.current >= 16384 * 4);
     }
 
@@ -211,14 +250,20 @@ mod tests {
         v.current = 65536;
         v.mark_sent();
         shares(&mut v, 2);
-        assert!(!v.update(true, now + Duration::from_secs(40)));
+        assert_eq!(
+            v.update(VardiffEvent::JobSent, now + Duration::from_secs(40)),
+            VardiffUpdate::Deferred
+        );
         assert_eq!(v.current, 32768);
         v.mark_sent();
         let t = now + Duration::from_secs(40);
         v.reset_snapshot(t);
         shares(&mut v, 16);
         v.quickdiff_active = false;
-        assert!(!v.update(false, t + Duration::from_secs(48)));
+        assert_eq!(
+            v.update(VardiffEvent::ShareAccepted, t + Duration::from_secs(48)),
+            VardiffUpdate::Deferred
+        );
         assert_eq!(v.current, 65536);
     }
 
@@ -232,9 +277,12 @@ mod tests {
         v.reset_snapshot(now);
         shares(&mut v, 4);
         let at_tolerance = Duration::from_millis(4 * target_ms * RATE_TOLERANCE);
-        assert!(!v.update(true, now + at_tolerance));
+        assert_eq!(v.update(VardiffEvent::JobSent, now + at_tolerance), VardiffUpdate::Deferred);
         assert_eq!(v.current, 65536, "exactly at the tolerance does not halve");
-        assert!(!v.update(true, now + at_tolerance + Duration::from_millis(4)));
+        assert_eq!(
+            v.update(VardiffEvent::JobSent, now + at_tolerance + Duration::from_millis(4)),
+            VardiffUpdate::Deferred
+        );
         assert_eq!(v.current, 32768, "one millisecond per share slower halves");
 
         let (mut v, now) = started();
@@ -244,7 +292,13 @@ mod tests {
         let short = MIN_SHARES_TO_DOUBLE - 1;
         shares(&mut v, short);
         v.quickdiff_active = false;
-        assert!(!v.update(false, now + Duration::from_millis(short * target_ms / 4)));
+        assert_eq!(
+            v.update(
+                VardiffEvent::ShareAccepted,
+                now + Duration::from_millis(short * target_ms / 4)
+            ),
+            VardiffUpdate::Deferred
+        );
         assert_eq!(v.current, 65536, "one share short of the count does not double");
     }
 
@@ -253,7 +307,10 @@ mod tests {
         let (mut v, now) = started();
         v.current = 32768;
         shares(&mut v, 16);
-        assert!(!v.update(false, now + Duration::from_secs(2)));
+        assert_eq!(
+            v.update(VardiffEvent::ShareAccepted, now + Duration::from_secs(2)),
+            VardiffUpdate::Deferred
+        );
         assert_eq!(v.current, 32768, "unchanged until the change is sent to the miner");
     }
 }

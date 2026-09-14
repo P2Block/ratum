@@ -1,5 +1,11 @@
 use serde_json::json;
 
+#[derive(Clone, Debug, Default)]
+pub struct ShareTallies {
+    pub accepted: Tally,
+    pub rejected: Tally,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Tally {
     pub count: u64,

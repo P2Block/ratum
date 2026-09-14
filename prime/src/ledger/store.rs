@@ -1,7 +1,8 @@
-use super::{
-    ConfirmationReading, FoundBlock, MAX_SHARES, OwedBlock, ReadBack, SHARES_PER_KEEP_UNIT, Share,
-};
+use super::blocks::{ConfirmationReading, FoundBlock, OwedBlock};
+use super::split::Payout;
+use super::{MAX_SHARES, ReadBack, SHARES_PER_KEEP_UNIT, Share};
 use bytes::BufMut as _;
+use log::warn;
 use ratum::bitcoin::HASH_SIZE;
 use ratum::reader::ByteReader;
 use redb::{
@@ -22,32 +23,39 @@ const META_CUMULATIVE_WORK: &str = "cumulative_work";
 
 const NAME_SEPARATOR: u8 = 0x00;
 
+const SHARE_PREFIX_LEN: usize = 2 * size_of::<u64>() + HASH_SIZE;
+const SHARE_HASH_AT: std::ops::Range<usize> = SHARE_PREFIX_LEN - HASH_SIZE..SHARE_PREFIX_LEN;
+const OWED_PREFIX_LEN: usize =
+    size_of::<u64>() + size_of::<u32>() + 2 * size_of::<u64>() + size_of::<u16>();
+const OWED_ENTRY_PREFIX_LEN: usize = size_of::<u16>() + size_of::<u64>();
+const BLOCK_PREFIX_LEN: usize =
+    size_of::<u64>() + size_of::<u32>() + 3 * size_of::<u64>() + size_of::<u128>();
+const CONFIRMATION_READING_LEN: usize = size_of::<u64>() + size_of::<i64>();
+
 fn pack(share: &Share) -> Vec<u8> {
-    let mut v = Vec::with_capacity(SHARE_PREFIX_LEN + 1 + share.identity.len() + share.tag.len());
-    v.put_u64_le(share.at);
+    let mut v =
+        Vec::with_capacity(SHARE_PREFIX_LEN + 1 + share.identity.len() + share.tag_secondary.len());
+    v.put_u64_le(share.accepted_at);
     v.put_u64_le(share.difficulty);
     v.put_slice(&share.block_hash);
     v.put_slice(share.identity.as_bytes());
     v.put_u8(NAME_SEPARATOR);
-    v.put_slice(share.tag.as_bytes());
+    v.put_slice(share.tag_secondary.as_bytes());
     v
 }
 
-const SHARE_PREFIX_LEN: usize = 2 * size_of::<u64>() + HASH_SIZE;
-const SHARE_HASH_AT: std::ops::Range<usize> = SHARE_PREFIX_LEN - HASH_SIZE..SHARE_PREFIX_LEN;
-
 fn unpack(bytes: &[u8]) -> Option<Share> {
     let mut c = ByteReader::new(bytes);
-    let at = c.u64("at").ok()?;
+    let accepted_at = c.u64("accepted_at").ok()?;
     let difficulty = c.u64("difficulty").ok()?;
     let hash: [u8; HASH_SIZE] = c.arr("hash").ok()?;
     let (identity, tag) = split_at_separator(c.rest());
     Some(Share {
-        at,
+        accepted_at,
         identity: String::from_utf8_lossy(identity).into_owned(),
         difficulty,
         block_hash: hash,
-        tag: String::from_utf8_lossy(tag).into_owned(),
+        tag_secondary: String::from_utf8_lossy(tag).into_owned(),
     })
 }
 
@@ -59,29 +67,25 @@ fn split_at_separator(rest: &[u8]) -> (&[u8], &[u8]) {
 }
 
 fn pack_owed(o: &OwedBlock) -> Vec<u8> {
-    let entries: usize = o.entries.iter().map(|(i, _)| OWED_ENTRY_PREFIX_LEN + i.len()).sum();
+    let entries: usize = o.entries.iter().map(|p| OWED_ENTRY_PREFIX_LEN + p.identity.len()).sum();
     let mut v = Vec::with_capacity(OWED_PREFIX_LEN + entries);
-    v.put_u64_le(o.at);
+    v.put_u64_le(o.found_at);
     v.put_u32_le(o.height);
     v.put_u64_le(o.total);
     v.put_u64_le(o.settled_at.unwrap_or(0));
     v.put_u16_le(o.entries.len() as u16);
-    for (identity, sats) in &o.entries {
-        v.put_u16_le(identity.len() as u16);
-        v.put_slice(identity.as_bytes());
-        v.put_u64_le(*sats);
+    for p in &o.entries {
+        v.put_u16_le(p.identity.len() as u16);
+        v.put_slice(p.identity.as_bytes());
+        v.put_u64_le(p.sats);
     }
     v
 }
 
-const OWED_PREFIX_LEN: usize =
-    size_of::<u64>() + size_of::<u32>() + 2 * size_of::<u64>() + size_of::<u16>();
-const OWED_ENTRY_PREFIX_LEN: usize = size_of::<u16>() + size_of::<u64>();
-
 fn unpack_owed(hash: &[u8], bytes: &[u8]) -> Option<OwedBlock> {
     let block_hash: [u8; HASH_SIZE] = hash.try_into().ok()?;
     let mut c = ByteReader::new(bytes);
-    let at = c.u64("at").ok()?;
+    let found_at = c.u64("found_at").ok()?;
     let height = c.u32("height").ok()?;
     let total = c.u64("total").ok()?;
     let settled = c.u64("settled_at").ok()?;
@@ -90,10 +94,10 @@ fn unpack_owed(hash: &[u8], bytes: &[u8]) -> Option<OwedBlock> {
     for _ in 0..count {
         let len = c.u16("identity length").ok()? as usize;
         let identity = String::from_utf8_lossy(c.take(len, "identity").ok()?).into_owned();
-        entries.push((identity, c.u64("sats").ok()?));
+        entries.push(Payout { identity, sats: c.u64("sats").ok()? });
     }
     Some(OwedBlock {
-        at,
+        found_at,
         height,
         block_hash,
         total,
@@ -103,8 +107,8 @@ fn unpack_owed(hash: &[u8], bytes: &[u8]) -> Option<OwedBlock> {
 }
 
 fn pack_block(b: &FoundBlock) -> Vec<u8> {
-    let mut v = Vec::with_capacity(BLOCK_PREFIX_LEN + 1 + b.finder.len() + b.tag.len());
-    v.put_u64_le(b.at);
+    let mut v = Vec::with_capacity(BLOCK_PREFIX_LEN + 1 + b.finder.len() + b.tag_secondary.len());
+    v.put_u64_le(b.found_at);
     v.put_u32_le(b.height);
     v.put_u64_le(b.paid_to_split);
     v.put_u64_le(b.paid_to_pool);
@@ -112,17 +116,14 @@ fn pack_block(b: &FoundBlock) -> Vec<u8> {
     v.put_u128_le(b.cumulative_work);
     v.put_slice(b.finder.as_bytes());
     v.put_u8(NAME_SEPARATOR);
-    v.put_slice(b.tag.as_bytes());
+    v.put_slice(b.tag_secondary.as_bytes());
     v
 }
-
-const BLOCK_PREFIX_LEN: usize =
-    size_of::<u64>() + size_of::<u32>() + 3 * size_of::<u64>() + size_of::<u128>();
 
 fn unpack_block(hash: &[u8], bytes: &[u8]) -> Option<FoundBlock> {
     let block_hash: [u8; HASH_SIZE] = hash.try_into().ok()?;
     let mut c = ByteReader::new(bytes);
-    let at = c.u64("at").ok()?;
+    let found_at = c.u64("found_at").ok()?;
     let height = c.u32("height").ok()?;
     let paid_to_split = c.u64("paid_to_split").ok()?;
     let paid_to_pool = c.u64("paid_to_pool").ok()?;
@@ -130,7 +131,7 @@ fn unpack_block(hash: &[u8], bytes: &[u8]) -> Option<FoundBlock> {
     let cumulative_work = u128::from_le_bytes(c.arr("cumulative work").ok()?);
     let (finder, tag) = split_at_separator(c.rest());
     Some(FoundBlock {
-        at,
+        found_at,
         height,
         block_hash,
         paid_to_split,
@@ -138,7 +139,7 @@ fn unpack_block(hash: &[u8], bytes: &[u8]) -> Option<FoundBlock> {
         network_difficulty,
         cumulative_work,
         finder: String::from_utf8_lossy(finder).into_owned(),
-        tag: String::from_utf8_lossy(tag).into_owned(),
+        tag_secondary: String::from_utf8_lossy(tag).into_owned(),
     })
 }
 
@@ -148,8 +149,6 @@ fn pack_confirmations(c: &ConfirmationReading) -> Vec<u8> {
     v.put_i64_le(c.confirmations);
     v
 }
-
-const CONFIRMATION_READING_LEN: usize = size_of::<u64>() + size_of::<i64>();
 
 fn unpack_confirmations(
     hash: &[u8],
@@ -177,6 +176,7 @@ pub(super) struct Store {
     next_seq: u64,
     retain_bound: Option<u64>,
     pub(super) cumulative_work: u128,
+    pub(super) stamped: bool,
 }
 
 impl Store {
@@ -201,7 +201,7 @@ impl Store {
             let (key, value) = entry.db()?;
             match unpack(key.value(), value.value()) {
                 Some(row) => out.push(row),
-                None => log::warn!(
+                None => warn!(
                     "skipping {what} row ({}) that did not unpack, which an uncorrupted \
                      database never produces",
                     hex::encode(key.value())
@@ -211,11 +211,7 @@ impl Store {
         Ok(out)
     }
 
-    pub(super) fn open(
-        path: &Path,
-        keep: Option<usize>,
-        chain: Option<&str>,
-    ) -> io::Result<(Self, bool)> {
+    pub(super) fn open(path: &Path, keep: Option<usize>, chain: Option<&str>) -> io::Result<Self> {
         let db = Database::create(path).db()?;
         let w = db.begin_write().db()?;
         let mut stamped = false;
@@ -261,7 +257,7 @@ impl Store {
             shares.last().db()?.map_or(0, |(k, _)| k.value() + 1)
         };
         let retain = keep.map(|k| (k.max(1) as u64).saturating_mul(SHARES_PER_KEEP_UNIT));
-        Ok((Self { db, next_seq, retain_bound: retain, cumulative_work }, stamped))
+        Ok(Self { db, next_seq, retain_bound: retain, cumulative_work, stamped })
     }
 
     pub(super) fn insert(&mut self, share: &Share) -> io::Result<bool> {
@@ -362,7 +358,7 @@ impl Store {
 
     pub(super) fn read_blocks(&self) -> io::Result<Vec<FoundBlock>> {
         let mut out = self.read_packed(BLOCKS, "a block", unpack_block)?;
-        out.sort_by_key(|b| (b.at, b.height));
+        out.sort_by_key(|b| (b.found_at, b.height));
         Ok(out)
     }
 
@@ -385,7 +381,7 @@ impl Store {
 
     pub(super) fn read_owed(&self) -> io::Result<Vec<OwedBlock>> {
         let mut out = self.read_packed(OWED, "an owed", unpack_owed)?;
-        out.sort_by_key(|o| (o.at, o.height));
+        out.sort_by_key(|o| (o.found_at, o.height));
         Ok(out)
     }
 
@@ -426,7 +422,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ledger::tests::{Scratch, found, hash, owed};
+    use crate::fixtures::{Scratch, found, hash, owed};
 
     #[test]
     fn packs_and_unpacks_a_confirmation_reading() {
@@ -450,14 +446,14 @@ mod tests {
     #[test]
     fn packs_and_unpacks_a_share() {
         let share = Share {
-            at: 1_750_000_000,
+            accepted_at: 1_750_000_000,
             identity: "bc1qexample".into(),
             difficulty: 16384,
             block_hash: hash(7),
-            tag: "garage".into(),
+            tag_secondary: "garage".into(),
         };
         assert_eq!(unpack(&pack(&share)), Some(share.clone()));
-        let untagged = Share { tag: String::new(), ..share.clone() };
+        let untagged = Share { tag_secondary: String::new(), ..share.clone() };
         let mut bytes = pack(&untagged);
         assert_eq!(bytes.pop(), Some(0x00), "the separator is the last byte when the tag is empty");
         assert_eq!(unpack(&bytes), Some(untagged));
@@ -477,14 +473,14 @@ mod tests {
             found(1, 0),
             found(2, u128::MAX),
             FoundBlock { finder: String::new(), ..found(3, 7) },
-            FoundBlock { tag: String::new(), ..found(4, 9) },
+            FoundBlock { tag_secondary: String::new(), ..found(4, 9) },
         ] {
             assert_eq!(unpack_block(&b.block_hash, &pack_block(&b)), Some(b));
         }
     }
     #[test]
     fn a_block_row_without_the_tag_separator_reads_back_with_an_empty_tag() {
-        let b = FoundBlock { tag: String::new(), ..found(1, 48) };
+        let b = FoundBlock { tag_secondary: String::new(), ..found(1, 48) };
         let mut bytes = pack_block(&b);
         assert_eq!(bytes.pop(), Some(0x00), "the separator is the last byte when the tag is empty");
         assert_eq!(unpack_block(&b.block_hash, &bytes), Some(b));
@@ -493,31 +489,31 @@ mod tests {
     #[test]
     fn retention_keeps_the_most_recent_shares() {
         let scratch = Scratch::new("retain");
-        let (mut store, _) = Store::open(&scratch.join("regtest.redb"), None, None).unwrap();
+        let mut store = Store::open(&scratch.join("regtest.redb"), None, None).unwrap();
         store.retain_bound = Some(5);
         for i in 0..12u64 {
             let share = Share {
-                at: i,
+                accepted_at: i,
                 identity: "m".into(),
                 difficulty: 16,
                 block_hash: hash(i),
-                tag: String::new(),
+                tag_secondary: String::new(),
             };
             store.insert(&share).unwrap();
             store.retain().unwrap();
         }
         let dumped = store.dump().unwrap();
         assert_eq!(dumped.len(), 5, "only the five most recent are retained");
-        assert_eq!(dumped.first().unwrap().at, 7, "the oldest kept");
-        assert_eq!(dumped.last().unwrap().at, 11, "through the newest");
+        assert_eq!(dumped.first().unwrap().accepted_at, 7, "the oldest kept");
+        assert_eq!(dumped.last().unwrap().accepted_at, 11, "through the newest");
         assert!(
             store
                 .insert(&Share {
-                    at: 0,
+                    accepted_at: 0,
                     identity: "m".into(),
                     difficulty: 16,
                     block_hash: hash(0),
-                    tag: String::new(),
+                    tag_secondary: String::new(),
                 })
                 .unwrap()
         );

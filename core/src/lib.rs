@@ -5,11 +5,13 @@ pub mod fixtures;
 pub mod hashrate;
 pub mod header;
 pub mod http;
+pub mod net;
 pub mod nonce;
 pub mod poll;
 pub mod rand;
 pub mod reader;
 pub mod rpc;
+pub mod siphash;
 pub mod target;
 pub mod thread;
 

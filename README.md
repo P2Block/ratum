@@ -62,14 +62,17 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
   per-thread settings size the duplicate-share table and share queue. `empty_thread`
   disconnects every client; `/threads` is not served.
 - New stratum connections are refused while the gateway's own miners measure above
-  `stratum.max_network_share_bps` of the network hashrate (not a C key; 500 basis points,
-  5%, by default; 0 refuses none). The gateway's hashrate is the sum of its clients'
-  measured windows; the network's is `getnetworkhashps` from the configured node, read once
-  a minute. Connections already established keep mining and no client is disconnected; the
-  status page and `/stats.json` report the share (`stratum.network_share`) whether or not it
-  is over. The limit applies on chain `main` alone, and is not enforced while the node has
-  answered no estimate: a node that does not serve `getnetworkhashps`, or a regtest chain,
-  leaves every connection accepted. The C gateway has no such limit.
+  `stratum.max_network_share_bps` of the network hashrate (not a C key; 1000 basis points,
+  10%, by default; 0 refuses none). The limit keeps a gateway open to the public from
+  growing past that fraction of the chain, and the miner lookup reports it as
+  `max_network_share_bps` beside the current `network_share`. The gateway's hashrate is the
+  sum of its clients' measured windows; the network's is `getnetworkhashps` from the
+  configured node, read once a minute. Connections already established keep mining and no
+  client is disconnected; the status page and `/stats.json` report the share
+  (`stratum.network_share`) whether or not it is over. The limit applies on chain `main`
+  alone, and is not enforced while the node has answered no estimate: a node that does not
+  serve `getnetworkhashps`, or a regtest chain, leaves every connection accepted. The C
+  gateway has no such limit.
 - The extranonce1 session id is the 32-bit connection counter, so it never repeats for a live
   connection.
 - A new tip builds three immutable jobs (empty, priority, coinbaser) where C rewrites one, so
@@ -311,8 +314,11 @@ The pool finds an orphaned block itself: every five minutes it asks the node
 (`getblockheader`) for the confirmation count of each recorded block under 100 confirmations,
 at most 32 per pass, oldest first, and stores the answer. A block the node answers with a
 negative count is on a branch the best chain does not include, which is logged as an error
-naming the amounts owed against it, and shown in `/stats.json` as `confirmations` on both the
-block and its owed record (null until the pool has read it). `--settle-block` refuses a block
+naming the amounts owed against it. `/stats.json` shows `confirmations` on both the block and
+its owed record: the block's depth below the node's tip (tip height less block height plus
+one) while its last reading, if any, is on the best chain, so the figure keeps growing after
+the pool stops asking at 100; a negative last reading is shown as read; null only while the
+pool has neither a tip nor a reading. `--settle-block` refuses a block
 whose last reading was off the best chain and names `--void-block` instead, so a payout is
 not recorded against a coinbase that pays nobody. `submitblock` answering null means the node
 accepted the block, not that it stayed in the chain, and nothing else in the pool re-read

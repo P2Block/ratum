@@ -1,10 +1,10 @@
+use crate::config::{self, Config};
 use clap::Parser as _;
 use log::warn;
-use ratum_prime::config::{self, Config};
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 
-pub(crate) const USAGE_EXIT: i32 = 2;
+pub const USAGE_EXIT: i32 = 2;
 
 macro_rules! fatal {
     ($($arg:tt)*) => {{
@@ -15,12 +15,12 @@ macro_rules! fatal {
 
 pub(crate) use fatal;
 
-pub(crate) struct Invocation {
+pub struct Invocation {
     pub command_line: Config,
     pub file: Config,
 }
 
-pub(crate) fn load() -> Invocation {
+pub fn load() -> Invocation {
     let command_line = Config::parse();
     let path = match (&command_line.config, &command_line.data_dir) {
         (Some(p), _) => Some(PathBuf::from(p)),
@@ -51,7 +51,7 @@ fn load_file(path: &Path, required: bool) -> Config {
     }
 }
 
-pub(crate) fn resolve<T: Display>(
+pub fn resolve<T: Display>(
     cli: Option<T>,
     file: Option<T>,
     default: T,
@@ -62,7 +62,7 @@ pub(crate) fn resolve<T: Display>(
     resolve_opt(cli, file, flag, must_be, ok).unwrap_or(default)
 }
 
-pub(crate) fn resolve_opt<T: Display>(
+pub fn resolve_opt<T: Display>(
     cli: Option<T>,
     file: Option<T>,
     flag: &str,
@@ -76,7 +76,7 @@ pub(crate) fn resolve_opt<T: Display>(
     Some(value)
 }
 
-pub(crate) fn resolve_str(cli: Option<String>, file: Option<String>, default: &str) -> String {
+pub fn resolve_str(cli: Option<String>, file: Option<String>, default: &str) -> String {
     cli.or(file).unwrap_or_else(|| default.to_string())
 }
 

@@ -98,31 +98,8 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn bind_candidates(addr: &str, port: u16) -> Vec<String> {
-    if addr.is_empty() {
-        vec![format!("[::]:{port}"), format!("0.0.0.0:{port}")]
-    } else {
-        vec![format!("{addr}:{port}")]
-    }
-}
-
-pub fn bind_first<T, E: std::fmt::Display>(
-    addr: &str,
-    port: u16,
-    open: impl Fn(&str) -> Result<T, E>,
-) -> Result<T, String> {
-    let mut last = String::new();
-    for candidate in bind_candidates(addr, port) {
-        match open(&candidate) {
-            Ok(listener) => return Ok(listener),
-            Err(e) => last = format!("{candidate}: {e}"),
-        }
-    }
-    Err(last)
-}
-
 pub fn bind(addr: &str, port: u16) -> Result<Server, String> {
-    bind_first(addr, port, |candidate: &str| Server::http(candidate))
+    crate::net::bind_first(addr, port, |candidate: &str| Server::http(candidate))
 }
 
 pub fn serve(name: &str, server: Server, handle: impl Fn(Request) + Send + 'static) {
@@ -147,11 +124,5 @@ mod tests {
             pairs("a=1&&b=x+y"),
             [("a".to_string(), "1".to_string()), ("b".to_string(), "x y".to_string())]
         );
-    }
-
-    #[test]
-    fn candidates() {
-        assert_eq!(bind_candidates("", 80), ["[::]:80", "0.0.0.0:80"]);
-        assert_eq!(bind_candidates("127.0.0.1", 80), ["127.0.0.1:80"]);
     }
 }

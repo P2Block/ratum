@@ -1,6 +1,16 @@
 use crate::address;
 
-pub type Modifiers = Vec<(String, Vec<(String, f64)>)>;
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsernameModifier {
+    pub name: String,
+    pub ranges: Vec<ModifierRange>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModifierRange {
+    pub address: String,
+    pub proportion: f64,
+}
 
 pub fn address_of(username: &str) -> &str {
     let end = username.find(['.', '~']).unwrap_or(username.len());
@@ -15,7 +25,7 @@ pub const SELECTOR_SPACE: f64 = 65536.0;
 pub const SELECTOR_MAX: i64 = u16::MAX as i64;
 
 pub fn apply_modifier(
-    modifiers: &Modifiers,
+    modifiers: &[UsernameModifier],
     pool_address: &str,
     username: &str,
     hash: &[u8; 32],
@@ -23,18 +33,18 @@ pub fn apply_modifier(
     let tilde = username.find('~')?;
     let modname = &username[tilde + 1..];
     let base = &username[..tilde];
-    let ranges = &modifiers.iter().find(|(name, _)| name == modname)?.1;
+    let ranges = &modifiers.iter().find(|m| m.name == modname)?.ranges;
     let selector = i64::from(u16::from_le_bytes([hash[31], hash[30]]));
     let worker = base.find('.').map_or("", |d| &base[d..]);
     let mut sum = 0f64;
-    for (addr, proportion) in ranges {
-        sum += proportion.max(0.0);
+    for range in ranges {
+        sum += range.proportion.max(0.0);
         let end = ((sum * SELECTOR_SPACE).ceil() as i64 - 1).min(SELECTOR_MAX);
         if selector <= end {
-            return Some(if addr.is_empty() {
+            return Some(if range.address.is_empty() {
                 base.to_string()
             } else {
-                format!("{addr}{worker}")
+                format!("{}{worker}", range.address)
             });
         }
     }
@@ -63,8 +73,14 @@ mod tests {
         h
     }
 
-    fn modifiers() -> Modifiers {
-        vec![("split".to_string(), vec![("bc1qfirst".to_string(), 0.3), (String::new(), 0.5)])]
+    fn modifiers() -> Vec<UsernameModifier> {
+        vec![UsernameModifier {
+            name: "split".to_string(),
+            ranges: vec![
+                ModifierRange { address: "bc1qfirst".to_string(), proportion: 0.3 },
+                ModifierRange { address: String::new(), proportion: 0.5 },
+            ],
+        }]
     }
 
     #[test]

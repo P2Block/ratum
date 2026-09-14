@@ -1,3 +1,4 @@
+use crate::username::{ModifierRange, UsernameModifier};
 use serde::Deserialize;
 
 const EXTRA_JOBS_PER_TIP: u64 = 2;
@@ -9,7 +10,7 @@ const MIN_VARDIFF_TARGET_SHARES_MIN: u64 = 1;
 const MIN_VARDIFF_QUICKDIFF_COUNT: u64 = 4;
 const MIN_VARDIFF_QUICKDIFF_DELTA: u64 = 3;
 const SHARE_STALE_SECONDS_RANGE: std::ops::RangeInclusive<u64> = 60..=150;
-pub const DEFAULT_MAX_NETWORK_SHARE_BPS: u32 = 500;
+pub const DEFAULT_MAX_NETWORK_SHARE_BPS: u32 = 1000;
 pub const GLOBAL_TIMEOUT_MARGIN_SECS: u64 = 5;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,7 +58,7 @@ pub struct StratumConfig {
     pub idle_timeout_max_last_work: u64,
     pub require_address_username: bool,
     #[serde(deserialize_with = "deserialize_modifiers")]
-    pub username_modifiers: crate::username::Modifiers,
+    pub username_modifiers: Vec<UsernameModifier>,
 }
 
 struct OrderedPairs<V>(Vec<(String, V)>);
@@ -87,9 +88,20 @@ impl<'de, V: Deserialize<'de>> Deserialize<'de> for OrderedPairs<V> {
 
 fn deserialize_modifiers<'de, D: serde::Deserializer<'de>>(
     d: D,
-) -> Result<crate::username::Modifiers, D::Error> {
+) -> Result<Vec<UsernameModifier>, D::Error> {
     let mods = OrderedPairs::<OrderedPairs<f64>>::deserialize(d)?;
-    Ok(mods.0.into_iter().map(|(name, ranges)| (name, ranges.0)).collect())
+    Ok(mods
+        .0
+        .into_iter()
+        .map(|(name, ranges)| UsernameModifier {
+            name,
+            ranges: ranges
+                .0
+                .into_iter()
+                .map(|(address, proportion)| ModifierRange { address, proportion })
+                .collect(),
+        })
+        .collect())
 }
 
 impl Default for StratumConfig {
@@ -244,13 +256,16 @@ pub struct Config {
     pub logger: LoggerConfig,
     pub datum: DatumConfig,
     #[serde(skip)]
-    pub startup_notes: Vec<(log::Level, String)>,
+    pub startup_notes: Vec<StartupNote>,
     #[serde(skip)]
     pub pool_output_script: Vec<u8>,
 }
 
-pub const MAX_COINBASE_TAG_SPACE: usize = 86;
-pub const WIDE_PRIME_PUSH_EXTRA_BYTES: usize = 4;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupNote {
+    pub level: log::Level,
+    pub message: String,
+}
 
 pub const MAX_CONFIGURED_TAG_LEN: usize = 60;
 pub const MAX_CONFIGURED_TAGS_TOTAL_LEN: usize = 88;
@@ -280,8 +295,8 @@ impl Config {
         self.validate_username_modifiers()
     }
 
-    fn warn(&mut self, message: impl Into<String>) {
-        self.startup_notes.push((log::Level::Warn, message.into()));
+    fn note_warning(&mut self, message: impl Into<String>) {
+        self.startup_notes.push(StartupNote { level: log::Level::Warn, message: message.into() });
     }
 
     fn validate_bitcoind(&mut self) -> Result<(), String> {
@@ -340,7 +355,9 @@ impl Config {
             let rounded = ratum::target::pow2_floor(s.vardiff_min);
             let was = s.vardiff_min;
             self.stratum.vardiff_min = rounded;
-            self.warn(format!("stratum.vardiff_min {was} is not a power of two; using {rounded}"));
+            self.note_warning(format!(
+                "stratum.vardiff_min {was} is not a power of two; using {rounded}"
+            ));
         }
         let max_network_share_bps = self.stratum.max_network_share_bps;
         if u64::from(max_network_share_bps) > ratum::BASIS_POINTS_PER_UNIT {
@@ -350,12 +367,12 @@ impl Config {
             ));
         }
         if max_network_share_bps == 0 {
-            self.warn(
+            self.note_warning(
                 "stratum.max_network_share_bps is 0: new stratum connections are accepted whatever share of the network hashrate this gateway holds",
             );
         }
         if self.stratum.trust_proxy != -1 {
-            self.warn("stratum.trust_proxy is set but the PROXY protocol is not supported; a connection that sends a PROXY line is closed");
+            self.note_warning("stratum.trust_proxy is set but the PROXY protocol is not supported; a connection that sends a PROXY line is closed");
         }
         Ok(())
     }
@@ -382,27 +399,27 @@ impl Config {
 
     fn validate_api(&mut self) {
         if self.api.allow_insecure_auth {
-            self.warn(
+            self.note_warning(
                 "api.allow_insecure_auth has no effect: the API uses HTTP Basic authentication",
             );
         }
         if self.api.modify_conf && self.api.admin_password.is_empty() {
-            self.warn("api.modify_conf is set but api.admin_password is empty, so the settings page cannot save");
+            self.note_warning("api.modify_conf is set but api.admin_password is empty, so the settings page cannot save");
         }
     }
 
     fn validate_logger(&mut self) {
         if self.logger.log_rotate_daily.is_some() {
-            self.warn("logger.log_rotate_daily has no effect: the file is held open, so rotate it with logrotate's copytruncate");
+            self.note_warning("logger.log_rotate_daily has no effect: the file is held open, so rotate it with logrotate's copytruncate");
         }
     }
 
     fn validate_datum(&mut self) -> Result<(), String> {
         let d = &self.datum;
-        if !(1..=ratum::datum::share::MAX_JOBS).contains(&d.protocol_job_slots) {
+        if !(1..=ratum::datum::messages::share::MAX_JOBS).contains(&d.protocol_job_slots) {
             return Err(format!(
                 "datum.protocol_job_slots must be 1..{}",
-                ratum::datum::share::MAX_JOBS
+                ratum::datum::messages::share::MAX_JOBS
             ));
         }
         let min_slots = EXTRA_JOBS_PER_TIP
@@ -430,24 +447,28 @@ impl Config {
                 .map_err(|e| format!("datum.pool_pubkey: {e}"))?;
         }
         if self.stratum.require_address_username && !self.datum.pool_pass_full_users {
-            self.warn("stratum.require_address_username is set but datum.pool_pass_full_users is not, so the pool never receives the address the username was checked for");
+            self.note_warning("stratum.require_address_username is set but datum.pool_pass_full_users is not, so the pool never receives the address the username was checked for");
         }
         if self.datum.always_pay_self.is_some() {
-            self.warn("datum.always_pay_self has no effect: the coinbase always pays the pool script the split leaves");
+            self.note_warning("datum.always_pay_self has no effect: the coinbase always pays the pool script the split leaves");
         }
         Ok(())
     }
 
     fn validate_username_modifiers(&mut self) -> Result<(), String> {
         let mut notes = Vec::new();
-        for (modname, ranges) in &self.stratum.username_modifiers {
+        for modifier in &self.stratum.username_modifiers {
+            let modname = &modifier.name;
             let mut sum = 0f64;
             let mut covered = false;
-            for (addr, proportion) in ranges {
-                if *proportion < 0.0 {
-                    return Err(format!("stratum.username_modifiers.{modname}.{addr} is negative"));
+            for range in &modifier.ranges {
+                if range.proportion < 0.0 {
+                    return Err(format!(
+                        "stratum.username_modifiers.{modname}.{} is negative",
+                        range.address
+                    ));
                 }
-                sum += proportion;
+                sum += range.proportion;
                 if (sum * crate::username::SELECTOR_SPACE).ceil() - 1.0
                     >= crate::username::SELECTOR_MAX as f64
                 {
@@ -456,13 +477,13 @@ impl Config {
                 }
             }
             if !covered {
-                notes.push((
-                    log::Level::Error,
-                    format!(
+                notes.push(StartupNote {
+                    level: log::Level::Error,
+                    message: format!(
                         "Username modifier '{modname}' is configured to not distribute {}% of shares!",
                         100.0 * (1.0 - sum)
                     ),
-                ));
+                });
             }
         }
         self.startup_notes.extend(notes);
@@ -518,10 +539,10 @@ mod tests {
     }
 
     #[test]
-    fn the_network_share_limit_defaults_to_five_percent_and_zero_disables_it() {
+    fn the_network_share_limit_defaults_to_ten_percent_and_zero_disables_it() {
         let c = Config::parse(&minimal()).unwrap();
         assert_eq!(c.stratum.max_network_share_bps, DEFAULT_MAX_NETWORK_SHARE_BPS);
-        assert_eq!(c.max_network_share(), Some(0.05));
+        assert_eq!(c.max_network_share(), Some(0.1));
         assert!(c.startup_notes.is_empty(), "{:?}", c.startup_notes);
 
         let with_bps = |bps: &str| {
@@ -533,13 +554,13 @@ mod tests {
                 ),
             )
         };
-        let c = Config::parse(&with_bps("1000")).unwrap();
-        assert_eq!(c.max_network_share(), Some(0.1));
+        let c = Config::parse(&with_bps("500")).unwrap();
+        assert_eq!(c.max_network_share(), Some(0.05));
 
         let c = Config::parse(&with_bps("0")).unwrap();
         assert_eq!(c.max_network_share(), None, "0 refuses no connection");
         assert!(
-            c.startup_notes.iter().any(|(_, m)| m.contains("max_network_share_bps is 0")),
+            c.startup_notes.iter().any(|n| n.message.contains("max_network_share_bps is 0")),
             "a limit of 0 is reported at startup: {:?}",
             c.startup_notes
         );
@@ -567,9 +588,9 @@ mod tests {
         let c = Config::parse(&text).unwrap();
         assert_eq!(c.startup_notes.len(), 1);
         assert!(
-            c.startup_notes[0].1.contains("not distribute 50% of shares"),
+            c.startup_notes[0].message.contains("not distribute 50% of shares"),
             "{}",
-            c.startup_notes[0].1
+            c.startup_notes[0].message
         );
         let text = minimal().replace(
             "\"datum\":",
@@ -586,10 +607,10 @@ mod tests {
         );
         let c = Config::parse(&text).unwrap();
         let names: Vec<&str> =
-            c.stratum.username_modifiers.iter().map(|(n, _)| n.as_str()).collect();
+            c.stratum.username_modifiers.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, ["z", "a"]);
         let addrs: Vec<&str> =
-            c.stratum.username_modifiers[0].1.iter().map(|(a, _)| a.as_str()).collect();
+            c.stratum.username_modifiers[0].ranges.iter().map(|r| r.address.as_str()).collect();
         assert_eq!(addrs, ["bcrt1qzed", "bcrt1qamy"]);
     }
 

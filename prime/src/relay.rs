@@ -1,32 +1,38 @@
+use crate::verify::AcceptedShare;
 use log::{debug, error, info, warn};
 use ratum::rpc;
-use ratum_prime::verify::AcceptedShare;
 use std::net::SocketAddr;
 use std::time::Duration;
 
 const SUBMIT_ATTEMPTS: usize = 3;
 const SUBMIT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
-pub(crate) fn submit_or_request_txns(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayOutcome {
+    Submitted,
+    AwaitingTxns,
+}
+
+pub fn submit_if_complete(
     peer: SocketAddr,
     node: &rpc::Client,
     a: &AcceptedShare,
     subsidy_only: bool,
-) -> bool {
+) -> RelayOutcome {
     let template_txns = a.rebuilt.txn_count;
     if !subsidy_only && template_txns != 0 {
         info!("[{peer}]      block has {template_txns} more transactions; requesting them");
-        return true;
+        return RelayOutcome::AwaitingTxns;
     }
-    send(
+    submit_with_retries(
         peer,
         node,
         &ratum::bitcoin::serialize_block(&a.rebuilt.header, &a.rebuilt.coinbase_tx, &[]),
     );
-    false
+    RelayOutcome::Submitted
 }
 
-pub(crate) fn submit_with_txns(
+pub fn submit_with_txns(
     peer: SocketAddr,
     node: &rpc::Client,
     job_index: u8,
@@ -37,7 +43,7 @@ pub(crate) fn submit_with_txns(
         error!("[{peer}]      not relaying job {job_index}: {why}");
         return;
     }
-    send(
+    submit_with_retries(
         peer,
         node,
         &ratum::bitcoin::serialize_block(&a.rebuilt.header, &a.rebuilt.coinbase_tx, txns),
@@ -52,30 +58,30 @@ fn block_matches_header(a: &AcceptedShare, txns: &[Vec<u8>]) -> Result<(), Strin
     let mut ids = Vec::with_capacity(txns.len() + 1);
     ids.push(ratum::bitcoin::sha256d(&a.rebuilt.coinbase_tx));
     for (i, raw) in txns.iter().enumerate() {
-        match ratum::bitcoin::txid(raw) {
+        match ratum::bitcoin::transaction::txid(raw) {
             Ok(id) => ids.push(id),
             Err(e) => return Err(format!("transaction {i} does not decode: {e}")),
         }
     }
     let count = ids.len();
-    let (built, mutated) = ratum::bitcoin::merkle_root_of(&ids).ok_or("no transactions")?;
-    if mutated {
+    let tree = ratum::bitcoin::merkle_tree_root(&ids).ok_or("no transactions")?;
+    if tree.mutated {
         return Err(format!(
             "{count} transactions form a mutated merkle tree (duplicate hashes); \
              the node would reject the block"
         ));
     }
-    if built != committed {
+    if tree.root != committed {
         return Err(format!(
             "{count} transactions have merkle root {}, but the header commits to {}",
-            ratum::header::hash_to_display_hex(&built),
-            ratum::header::hash_to_display_hex(&committed)
+            ratum::bitcoin::hash_to_display_hex(&tree.root),
+            ratum::bitcoin::hash_to_display_hex(&committed)
         ));
     }
     Ok(())
 }
 
-fn send(peer: SocketAddr, node: &rpc::Client, block: &[u8]) {
+fn submit_with_retries(peer: SocketAddr, node: &rpc::Client, block: &[u8]) {
     debug!("[{peer}]      block ({} bytes): {}", block.len(), hex::encode(block));
     for attempt in 1..=SUBMIT_ATTEMPTS {
         match node.submit_block(block) {

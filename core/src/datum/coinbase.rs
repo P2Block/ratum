@@ -10,7 +10,7 @@ pub const UNIQUE_ID_PUSH_DATA_SIZE_V1: usize = UNIQUE_ID_PUSH_DATA_SIZE_NO_PRIME
 pub const UNIQUE_ID_PUSH_DATA_SIZE_V3: usize = UNIQUE_ID_PUSH_DATA_SIZE_NO_PRIME + size_of::<u64>();
 
 pub const ENPREFIX_SIZE: usize = 2;
-pub const EXTRANONCE_PUSH_SIZE: usize = 1 + ENPREFIX_SIZE + super::share::EXTRANONCE_SIZE;
+pub const EXTRANONCE_PUSH_SIZE: usize = 1 + ENPREFIX_SIZE + super::messages::share::EXTRANONCE_SIZE;
 pub const EXTRANONCE_PUSH_OPCODE: u8 = (EXTRANONCE_PUSH_SIZE - 1) as u8;
 pub const TAG_MARKER_BYTES: usize = 2;
 

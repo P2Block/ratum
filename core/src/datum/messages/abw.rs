@@ -1,5 +1,6 @@
-use super::framing::STRUCT_END;
-use crate::reader::ByteReader;
+use super::STRUCT_END;
+use crate::header::{XorKey, xor_key_hash};
+use crate::reader::{ByteReader, Truncated};
 use bytes::BufMut as _;
 
 pub const DRAFT_REVISION: u8 = 0;
@@ -7,7 +8,6 @@ pub const ASSIGNMENT_SLOTS: u8 = 16;
 pub const SHARE_TARGET_BASE_BITS: u8 = 32;
 pub const ASSIGNMENT_ACTIVE: u8 = 0x01;
 
-pub type XorKey = [u8; 16];
 pub type SlotKeys = [Option<XorKey>; ASSIGNMENT_SLOTS as usize];
 
 pub mod subcmd {
@@ -21,8 +21,6 @@ pub mod subcmd {
 pub fn clear_bits(target_byte: u8) -> u8 {
     (u32::from(SHARE_TARGET_BASE_BITS) + u32::from(target_byte)).min(u32::from(u8::MAX)) as u8
 }
-
-use crate::header::xor_key_hash;
 
 pub fn key_matches_hash(xor_key: &XorKey, hash: &[u8; 32]) -> bool {
     xor_key_hash(xor_key) == *hash
@@ -50,8 +48,8 @@ pub enum Error {
     BadShape,
 }
 
-impl From<crate::reader::Truncated> for Error {
-    fn from(t: crate::reader::Truncated) -> Self {
+impl From<Truncated> for Error {
+    fn from(t: Truncated) -> Self {
         Self::Truncated(t.0)
     }
 }
@@ -69,7 +67,7 @@ pub struct Activation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AbwShareRef {
+pub struct ShareRef {
     pub slot: u8,
     pub raw_pow_hash_le: [u8; 32],
 }
@@ -150,7 +148,7 @@ impl Activation {
     }
 }
 
-impl AbwShareRef {
+impl ShareRef {
     pub fn encode_candidate(&self, subcmd: u8) -> Vec<u8> {
         debug_assert!(matches!(subcmd, subcmd::CANDIDATE_RECEIPT | subcmd::CANDIDATE_RELEASE));
         message(subcmd, |out| {
@@ -188,7 +186,7 @@ impl Reveal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::header::{BlockHeaderV2, xor_key_mask};
+    use crate::header::{BlockHeaderV2, PowHashes, xor_key_mask};
 
     #[test]
     fn clear_bits_matches_the_c_vectors() {
@@ -248,7 +246,7 @@ mod tests {
             ..Default::default()
         };
         pool.prev_block = [0x22; 32];
-        let (pool_pow, pool_block) = pool.raw_pow_and_block_hash();
+        let PowHashes { raw_pow_hash: pool_pow, block_hash: pool_block } = pool.pow_hashes();
 
         let mut gw = pool.clone();
         gw.xor_key = [0u8; 16];
@@ -286,14 +284,14 @@ mod tests {
         assert_eq!(b, vec![0xA6, 0, 3, 0xFE]);
         assert_eq!(Activation::decode(&b).unwrap(), act);
 
-        let cand = AbwShareRef { slot: 3, raw_pow_hash_le: [0x80; 32] };
+        let cand = ShareRef { slot: 3, raw_pow_hash_le: [0x80; 32] };
         let b = cand.encode_candidate(subcmd::CANDIDATE_RECEIPT);
         assert_eq!(b.len(), 36);
         assert_eq!(b[0], 0xA5);
-        assert_eq!(AbwShareRef::decode_candidate(&b, subcmd::CANDIDATE_RECEIPT).unwrap(), cand);
+        assert_eq!(ShareRef::decode_candidate(&b, subcmd::CANDIDATE_RECEIPT).unwrap(), cand);
         let b = cand.encode_candidate(subcmd::CANDIDATE_RELEASE);
         assert_eq!(b[0], 0xA7);
-        assert_eq!(AbwShareRef::decode_candidate(&b, subcmd::CANDIDATE_RELEASE).unwrap(), cand);
+        assert_eq!(ShareRef::decode_candidate(&b, subcmd::CANDIDATE_RELEASE).unwrap(), cand);
 
         let reveal = Reveal { slot: 3, xor_key: [0x11; 16] };
         let b = reveal.encode();

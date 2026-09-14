@@ -1,9 +1,11 @@
-use crate::server::{AddressResolver, Server, split_after_fee};
+use crate::ledger::IdentityWork;
+use crate::ledger::blocks::{ConfirmationReading, FoundBlock, OwedBlock};
+use crate::ledger::split::Payout;
+use crate::payout::split_after_fee;
+use crate::server::Server;
 use log::warn;
-use ratum::hashrate::{self, HashrateHistory};
-use ratum::http;
-use ratum::lock;
-use ratum_prime::ledger::{self, ConfirmationReading, FoundBlock};
+use ratum::hashrate::{self, HashrateHistory, HashrateSample};
+use ratum::{http, lock};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -29,11 +31,20 @@ const RECENT_BLOCKS: usize = 50;
 
 fn sample_hashrate(server: &Server, history: &Mutex<HashrateHistory>) {
     let now = ratum::unix_now();
-    let (work, _) = lock(&server.ledger).work_since(now.saturating_sub(HASHRATE_SPAN_SECS));
-    hashrate::push_sample(&mut lock(history), now, hashes_per_second(work, HASHRATE_SPAN_SECS));
+    let recent = lock(&server.ledger).work_since(now.saturating_sub(HASHRATE_SPAN_SECS));
+    lock(history).push(HashrateSample {
+        sampled_at: now,
+        hashes_per_second: hashes_per_second(recent.total, HASHRATE_SPAN_SECS),
+    });
 }
 
-fn luck_percent(blocks: &[FoundBlock]) -> (Option<f64>, u32) {
+#[derive(Debug, PartialEq)]
+struct Luck {
+    percent: Option<f64>,
+    blocks: u32,
+}
+
+fn luck(blocks: &[FoundBlock]) -> Luck {
     let mut expected = 0.0f64;
     let mut counted = 0u32;
     for pair in blocks.windows(2) {
@@ -44,15 +55,15 @@ fn luck_percent(blocks: &[FoundBlock]) -> (Option<f64>, u32) {
         }
     }
     if counted == 0 || expected <= 0.0 {
-        return (None, 0);
+        return Luck { percent: None, blocks: 0 };
     }
-    (Some(f64::from(counted) / expected * 100.0), counted)
+    Luck { percent: Some(f64::from(counted) / expected * 100.0), blocks: counted }
 }
 
-pub(crate) fn spawn(server: Arc<Server>, listen: &str) -> Result<SocketAddr, String> {
+pub fn spawn(server: Arc<Server>, listen: &str) -> Result<SocketAddr, String> {
     let http = HttpServer::http(listen).map_err(|e| e.to_string())?;
     let addr = http.server_addr().to_ip().ok_or("no socket address")?;
-    let history = Arc::new(Mutex::new(HashrateHistory::new()));
+    let history = Arc::new(Mutex::new(HashrateHistory::default()));
     let (sampler, sampler_history) = (Arc::clone(&server), Arc::clone(&history));
     hashrate::sample_periodically("stats-sampler", move || {
         sample_hashrate(&sampler, &sampler_history);
@@ -97,7 +108,7 @@ fn network_json(
     json!({
         "chain": t.chain.name(),
         "tip_height": t.height,
-        "tip_hash": ratum::header::hash_to_display_hex(&t.hash),
+        "tip_hash": ratum::bitcoin::hash_to_display_hex(&t.hash),
         "difficulty": t.difficulty,
         "coinbase_value": coinbase_value,
         "observed_block_seconds": observed_block_secs,
@@ -111,59 +122,75 @@ fn network_json(
     })
 }
 
-fn confirmations_json(state: Option<&ConfirmationReading>) -> Value {
-    state.map_or(Value::Null, |s| json!(s.confirmations))
+fn confirmations_json(
+    state: Option<&ConfirmationReading>,
+    height: u32,
+    tip_height: Option<u32>,
+) -> Value {
+    match (state, tip_height) {
+        (Some(s), _) if !s.on_best_chain() => json!(s.confirmations),
+        (_, Some(tip)) if tip >= height => json!(i64::from(tip) - i64::from(height) + 1),
+        (Some(s), _) => json!(s.confirmations),
+        (None, _) => Value::Null,
+    }
+}
+
+struct OwedJson {
+    unsettled_sats: u64,
+    by_identity: Vec<Value>,
+    blocks: Vec<Value>,
 }
 
 fn owed_json(
-    owed: &[ledger::OwedBlock],
+    owed: &[OwedBlock],
     confirmations: &HashMap<[u8; 32], ConfirmationReading>,
-) -> (u64, Vec<Value>, Vec<Value>) {
-    let mut unsettled: u64 = 0;
+    tip_height: Option<u32>,
+) -> OwedJson {
+    let mut unsettled_sats: u64 = 0;
     let mut unsettled_per_identity: HashMap<String, u64> = HashMap::new();
     let blocks: Vec<Value> = owed
         .iter()
         .map(|o| {
             if o.settled_at.is_none() {
-                unsettled += o.total;
-                for (identity, sats) in &o.entries {
-                    *unsettled_per_identity.entry(identity.clone()).or_insert(0) += sats;
+                unsettled_sats += o.total;
+                for p in &o.entries {
+                    *unsettled_per_identity.entry(p.identity.clone()).or_insert(0) += p.sats;
                 }
             }
             json!({
                 "height": o.height,
                 "block_hash": hex::encode(o.block_hash),
-                "found_at": o.at,
+                "found_at": o.found_at,
                 "total_sats": o.total,
                 "settled_at": o.settled_at,
-                "confirmations": confirmations_json(confirmations.get(&o.block_hash)),
-                "miners": o.entries.iter().map(|(identity, sats)| {
-                    json!({ "identity": identity, "sats": sats })
+                "confirmations": confirmations_json(confirmations.get(&o.block_hash), o.height, tip_height),
+                "miners": o.entries.iter().map(|p| {
+                    json!({ "identity": p.identity, "sats": p.sats })
                 }).collect::<Vec<_>>(),
             })
         })
         .collect();
-    let mut ranked: Vec<(String, u64)> = unsettled_per_identity.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let by_identity = ranked
+    let mut ranked: Vec<Payout> = unsettled_per_identity
         .into_iter()
-        .map(|(identity, sats)| json!({ "identity": identity, "sats": sats }))
+        .map(|(identity, sats)| Payout { identity, sats })
         .collect();
-    (unsettled, by_identity, blocks)
+    ranked.sort_by(|a, b| b.sats.cmp(&a.sats).then_with(|| a.identity.cmp(&b.identity)));
+    let by_identity =
+        ranked.into_iter().map(|p| json!({ "identity": p.identity, "sats": p.sats })).collect();
+    OwedJson { unsettled_sats, by_identity, blocks }
 }
 
 fn miners_json(server: &Server, l: &LedgerView) -> Vec<Value> {
     l.work_by_identity
         .iter()
-        .map(|(identity, work)| {
+        .map(|IdentityWork { identity, work }| {
             let share_percent =
                 if l.total_work > 0 { *work as f64 / l.total_work as f64 * 100.0 } else { 0.0 };
-            let (payable, unpayable_reason) =
-                match AddressResolver::cached(&server.resolver, identity) {
-                    Some(Ok(_)) => (Some(true), None),
-                    Some(Err(why)) => (Some(false), Some(why.to_string())),
-                    None => (None, None),
-                };
+            let (payable, unpayable_reason) = match server.resolver.cached(identity) {
+                Some(Ok(_)) => (Some(true), None),
+                Some(Err(why)) => (Some(false), Some(why.to_string())),
+                None => (None, None),
+            };
             json!({
                 "identity": identity,
                 "work": work.to_string(),
@@ -214,16 +241,16 @@ struct LedgerView {
     total_work: u128,
     target_work: u128,
     shares: usize,
-    work_by_identity: Vec<(String, u128)>,
+    work_by_identity: Vec<IdentityWork>,
     tags: HashMap<String, String>,
     payout_sats: HashMap<String, u64>,
-    owed: Vec<ledger::OwedBlock>,
+    owed: Vec<OwedBlock>,
     blocks: Vec<FoundBlock>,
     confirmations: HashMap<[u8; 32], ConfirmationReading>,
     recent_work: u128,
     recent_by_identity: HashMap<String, u128>,
     own_gateway_work_by_identity: HashMap<String, u128>,
-    public_gateway_fee_work: Option<ledger::PublicGatewayFeeWork>,
+    public_gateway_fee_work: Option<crate::ledger::split::PublicGatewayFeeWork>,
     public_gateway_tag: Option<String>,
 }
 
@@ -231,15 +258,16 @@ impl LedgerView {
     fn read(server: &Server, coinbase_value: Option<u64>) -> Self {
         let cutoff = ratum::unix_now().saturating_sub(HASHRATE_SPAN_SECS);
         let l = lock(&server.ledger);
-        let (recent_work, recent_by_identity) = l.work_since(cutoff);
+        let recent = l.work_since(cutoff);
         Self {
             total_work: l.total_work(),
             target_work: l.window(),
             shares: l.len(),
             work_by_identity: l.work_by_identity(),
-            tags: l.tags_by_identity(),
+            tags: l.tag_secondary_by_identity(),
             payout_sats: split_after_fee(&l, &server.payout_policy, coinbase_value.unwrap_or(0))
                 .into_iter()
+                .map(|p| (p.identity, p.sats))
                 .collect(),
             own_gateway_work_by_identity: l.own_gateway_work_by_identity(),
             public_gateway_fee_work: server
@@ -256,8 +284,8 @@ impl LedgerView {
                 .chain(l.blocks().iter().map(|b| b.block_hash))
                 .filter_map(|hash| l.confirmations(&hash).map(|state| (hash, state)))
                 .collect(),
-            recent_work,
-            recent_by_identity,
+            recent_work: recent.total,
+            recent_by_identity: recent.by_identity,
         }
     }
 }
@@ -265,6 +293,7 @@ impl LedgerView {
 fn recent_blocks_json(
     blocks: &[FoundBlock],
     confirmations: &HashMap<[u8; 32], ConfirmationReading>,
+    tip_height: Option<u32>,
 ) -> Vec<Value> {
     blocks
         .iter()
@@ -274,40 +303,31 @@ fn recent_blocks_json(
             json!({
                 "height": b.height,
                 "block_hash": hex::encode(b.block_hash),
-                "found_at": b.at,
+                "found_at": b.found_at,
                 "paid_to_split": b.paid_to_split,
                 "paid_to_pool": b.paid_to_pool,
                 "finder": b.finder,
-                "tag": b.tag,
-                "confirmations": confirmations_json(confirmations.get(&b.block_hash)),
+                "tag": b.tag_secondary,
+                "confirmations": confirmations_json(confirmations.get(&b.block_hash), b.height, tip_height),
             })
         })
         .collect()
 }
 
-fn observed_block_seconds(server: &Server) -> Option<f64> {
-    let tips = lock(&server.node_view.tip_history);
-    match (tips.front(), tips.back()) {
-        (Some(&(h0, t0)), Some(&(h1, t1))) if h1 > h0 && t1 > t0 => {
-            Some((t1 - t0) as f64 / f64::from(h1 - h0))
-        }
-        _ => None,
-    }
-}
-
 fn snapshot(server: &Server, history: &Mutex<HashrateHistory>) -> Value {
-    let tip = *lock(&server.node_view.tip);
-    let coinbase_value = *lock(&server.node_view.coinbase_value);
+    let tip = server.node_view.tip();
+    let tip_height = tip.as_ref().map(|t| t.height);
+    let coinbase_value = server.node_view.coinbase_value();
     let operator_fee = coinbase_value.map_or(0, |v| server.payout_policy.fee_on(v));
     let l = LedgerView::read(server, coinbase_value);
 
-    let (luck, luck_blocks) = luck_percent(&l.blocks);
-    let (owed_unsettled, owed_by_identity, owed_blocks) = owed_json(&l.owed, &l.confirmations);
+    let luck = luck(&l.blocks);
+    let owed = owed_json(&l.owed, &l.confirmations, tip_height);
     let miners = miners_json(server, &l);
     let public_gateway_fee = public_gateway_fee_json(server, &l, coinbase_value);
-    let network = network_json(tip, coinbase_value, observed_block_seconds(server));
+    let network = network_json(tip, coinbase_value, server.node_view.observed_block_seconds());
     let pool_hs = hashes_per_second(l.recent_work, HASHRATE_SPAN_SECS);
-    let network_hashps = *lock(&server.node_view.network_hashps);
+    let network_hashps = server.node_view.network_hashps();
 
     json!({
         "pool": {
@@ -341,8 +361,8 @@ fn snapshot(server: &Server, history: &Mutex<HashrateHistory>) -> Value {
                 .map(|hs| pool_hs / hs),
             "interval_seconds": hashrate::INTERVAL_SECS,
             "history": lock(history)
-                .iter()
-                .map(|&(t, hs)| json!([t, hs as u64]))
+                .samples()
+                .map(|s| json!([s.sampled_at, s.hashes_per_second as u64]))
                 .collect::<Vec<_>>(),
         },
         "window": {
@@ -354,17 +374,17 @@ fn snapshot(server: &Server, history: &Mutex<HashrateHistory>) -> Value {
         },
         "public_gateway_fee": public_gateway_fee,
         "owed": {
-            "unsettled_sats": owed_unsettled,
-            "by_identity": owed_by_identity,
-            "blocks": owed_blocks,
+            "unsettled_sats": owed.unsettled_sats,
+            "by_identity": owed.by_identity,
+            "blocks": owed.blocks,
         },
         "blocks": {
             "found": l.blocks.len(),
-            "luck_percent": luck,
-            "luck_blocks": luck_blocks,
-            "recent": recent_blocks_json(&l.blocks, &l.confirmations),
+            "luck_percent": luck.percent,
+            "luck_blocks": luck.blocks,
+            "recent": recent_blocks_json(&l.blocks, &l.confirmations, tip_height),
         },
-        "node_warnings": lock(&server.node_view.warnings).clone(),
+        "node_warnings": server.node_view.warnings(),
         "generated_at": ratum::unix_now(),
     })
 }
@@ -375,13 +395,13 @@ mod tests {
 
     fn block(n: u8, cumulative_work: u128, network_difficulty: f64) -> FoundBlock {
         FoundBlock {
-            at: u64::from(n),
+            found_at: u64::from(n),
             height: u32::from(n),
             block_hash: [n; 32],
             paid_to_split: 0,
             paid_to_pool: 0,
             finder: "a".into(),
-            tag: String::new(),
+            tag_secondary: String::new(),
             network_difficulty,
             cumulative_work,
         }
@@ -390,18 +410,33 @@ mod tests {
     #[test]
     fn luck_is_found_over_expected_between_consecutive_blocks() {
         let blocks = [block(1, 0, 100.0), block(2, 100, 100.0), block(3, 300, 100.0)];
-        let (luck, counted) = luck_percent(&blocks);
-        assert_eq!(counted, 2, "the span before the first block has no start mark");
-        assert!((luck.unwrap() - 2.0 / 3.0 * 100.0).abs() < 1e-9);
+        let luck = luck(&blocks);
+        assert_eq!(luck.blocks, 2, "the span before the first block has no start mark");
+        assert!((luck.percent.unwrap() - 2.0 / 3.0 * 100.0).abs() < 1e-9);
     }
 
     #[test]
     fn luck_needs_two_blocks_and_skips_unusable_spans() {
-        assert_eq!(luck_percent(&[]), (None, 0));
-        assert_eq!(luck_percent(&[block(1, 100, 100.0)]), (None, 0));
+        let none = Luck { percent: None, blocks: 0 };
+        assert_eq!(luck(&[]), none);
+        assert_eq!(luck(&[block(1, 100, 100.0)]), none);
         let broken = [block(1, 0, 0.0), block(2, 100, 0.0)];
-        assert_eq!(luck_percent(&broken), (None, 0));
+        assert_eq!(luck(&broken), none);
         let reset = [block(1, 500, 100.0), block(2, 100, 100.0)];
-        assert_eq!(luck_percent(&reset), (None, 0));
+        assert_eq!(luck(&reset), none);
+    }
+    #[test]
+    fn confirmations_are_the_depth_below_the_tip_unless_the_last_reading_left_the_chain() {
+        let read = |confirmations: i64| ConfirmationReading { checked_at: 1, confirmations };
+        assert_eq!(confirmations_json(None, 971_765, Some(972_091)), json!(327));
+        assert_eq!(confirmations_json(Some(&read(100)), 971_765, Some(972_091)), json!(327));
+        assert_eq!(confirmations_json(Some(&read(100)), 971_765, None), json!(100));
+        assert_eq!(confirmations_json(Some(&read(-1)), 971_765, Some(972_091)), json!(-1));
+        assert_eq!(confirmations_json(None, 971_765, None), Value::Null);
+        assert_eq!(
+            confirmations_json(Some(&read(3)), 971_765, Some(971_760)),
+            json!(3),
+            "a tip behind the block leaves the reading in place"
+        );
     }
 }

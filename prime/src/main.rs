@@ -1,70 +1,38 @@
 mod abw;
 mod admin;
+mod bounded;
 mod cli;
 mod coinbaser;
+mod config;
 mod confirmations;
 mod connection;
-mod credit;
+#[cfg(test)]
+mod fixtures;
+mod keys;
+mod ledger;
+mod node;
+mod payout;
 mod relay;
 mod server;
+mod sessions;
 mod settings;
 mod stats;
+mod verify;
 
-use admin::LedgerLocation;
 use cli::fatal;
 use connection::handle;
+use ledger::LedgerLocation;
 use log::{error, info, warn};
-use ratum::datum::handshake::KeyPairs;
-use ratum::datum::messages::ClientConfig;
+use node::{NodeView, watch_node};
+use ratum::datum::messages::config::ClientConfig;
 use ratum::rpc;
-use ratum_prime::ledger;
-use ratum_prime::verify::{AcceptedShareHashes, SharePolicy};
-use server::{AddressResolver, NodeView, OpenConnectionGuard, PayoutPolicy, Server, watch_node};
+use server::{OpenConnectionGuard, Server};
 use settings::Settings;
 use std::io;
 use std::net::TcpListener;
-use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-
-fn load_or_create_keys(path: &Path) -> io::Result<KeyPairs> {
-    if !path.exists() {
-        let keys = KeyPairs::generate();
-        write_private(path, hex::encode(keys.to_bytes()).as_bytes())?;
-        info!("generated new pool keys at {}", path.display());
-        return Ok(keys);
-    }
-    let text = std::fs::read_to_string(path)?;
-    let raw =
-        hex::decode(text.trim()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    KeyPairs::from_bytes(&raw).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "key file must decode to {} bytes of hex",
-                ratum::datum::handshake::KEY_PAIRS_LEN
-            ),
-        )
-    })
-}
-
-#[cfg(unix)]
-fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(data)
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
-    std::fs::write(path, data)
-}
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use verify::SharePolicy;
 
 fn init_logging() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -118,15 +86,6 @@ fn watch_node_in_background(
         node.url(),
         s.poll.as_secs_f64()
     );
-}
-
-fn accepted_hashes_from(ledger: &ledger::Ledger) -> Arc<Mutex<AcceptedShareHashes>> {
-    let mut hashes = AcceptedShareHashes::default();
-    let seeded = ledger.block_hashes().fold(0usize, |n, h| n + usize::from(hashes.accept(*h)));
-    if seeded != 0 {
-        info!("{seeded} accepted share hash(es) seeded from the ledger");
-    }
-    Arc::new(Mutex::new(hashes))
 }
 
 fn accept_connections(listener: TcpListener, server: &Arc<Server>) {
@@ -202,28 +161,28 @@ fn main() -> io::Result<()> {
     let loaded = cli::load();
     info!("ratum-prime {}", ratum::VERSION);
 
-    let mut s = Settings::resolve(&loaded.command_line, loaded.file);
+    let s = Settings::resolve(&loaded.command_line, loaded.file);
     if let Some(dir) = &s.data_dir {
         std::fs::create_dir_all(dir)?;
     }
-    let ledger_location = LedgerLocation::new(s.ledger_path.clone(), s.data_dir.as_ref());
+    let ledger_location = LedgerLocation::new(s.ledger_path.clone(), s.data_dir.as_deref());
     if let Some(done) = admin::run_command(&loaded.command_line, &ledger_location) {
         return done;
     }
 
-    let pool_keys = load_or_create_keys(&s.key_path)?;
+    let pool_keys = keys::load_or_create_keys(&s.key_path)?;
     info!("pool_pubkey: {}", pool_keys.pubkey_hex());
 
     let node = s.connect_node()?;
-    let payout_script = settings::payout_script(&node, s.payout.take());
+    let payout_script = settings::payout_script(&node, s.payout.as_ref());
     info!("pool payout script: {}", hex::encode(&payout_script));
 
     let (chain, startup_window) = startup_chain_and_window(&node, &ledger_location, &s);
     let node_view = Arc::new(NodeView::default());
     watch_node_in_background(&node, &node_view, &s, chain);
 
-    let mut ledger = admin::open_share_ledger(
-        ledger_location.file_for(chain).as_ref(),
+    let mut ledger = ledger::open_share_ledger(
+        ledger_location.file_for(chain).as_deref(),
         startup_window,
         s.ledger_keep,
         chain.map(rpc::Chain::name),
@@ -238,7 +197,7 @@ fn main() -> io::Result<()> {
     let config = ClientConfig {
         payout_script,
         prime_id: s.prime_id,
-        coinbase_tag: s.coinbase_tag,
+        coinbase_tag: s.coinbase_tag.clone(),
         min_difficulty: s.min_difficulty,
     };
     let config_payload = match config.encode() {
@@ -248,34 +207,8 @@ fn main() -> io::Result<()> {
     let mut share_policy = SharePolicy::from_config(&config);
     share_policy.require_split = s.require_split;
 
-    let server = Arc::new(Server {
-        pool_keys,
-        node_view,
-        motd: s.motd,
-        allowed_agents: s.allowed_agents,
-        require_v3: s.require_v3,
-        sessions: Mutex::new(server::SessionStore::default()),
-        abw_reveal_after: s.abw_reveal_after,
-        accepted_hashes: accepted_hashes_from(&ledger),
-        node,
-        ledger: Mutex::new(ledger),
-        resolver: Mutex::new(AddressResolver::new()),
-        payout_policy: PayoutPolicy {
-            min_payout: s.min_payout,
-            window_multiple: s.window_multiple,
-            window_floor: s.window_floor,
-            fee_bps: s.fee_bps,
-            public_gateway_fee_bps: s.public_gateway_fee_bps,
-            public_gateway_fee_subsidy_bps: s.public_gateway_fee_subsidy_bps,
-        },
-        share_policy,
-        config_payload,
-        open_connections: AtomicUsize::new(0),
-        max_connections: s.max_connections,
-        datum_port: s.listen.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(0),
-        advertise_address: s.advertise_address,
-        public_gateway: s.public_gateway,
-    });
+    let server =
+        Arc::new(Server::new(&s, pool_keys, node, node_view, ledger, share_policy, config_payload));
 
     confirmations::watch(Arc::clone(&server));
 

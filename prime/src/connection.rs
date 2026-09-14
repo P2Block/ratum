@@ -1,23 +1,24 @@
-use crate::abw::{AbwSlotState, PendingReveal};
+mod assignments;
+mod blocks;
+mod credit;
+mod shares;
+
+use crate::abw::AbwSlotState;
 use crate::coinbaser;
-use crate::credit::CreditState;
-use crate::relay;
-use crate::server::{SavedSession, Server, SessionState};
+use crate::server::Server;
+use crate::sessions::{SavedSession, SessionState, StartedSession};
+use crate::verify::{AcceptedShare, Verifier};
+use credit::CreditState;
 use log::{debug, error, info, warn};
 use mio::Waker;
-use ratum::datum::abw::{AbwShareRef, raw_pow_hash_le};
 use ratum::datum::bulk::{self, Reassembler};
 use ratum::datum::framing::{self, FrameHeader, HeaderKeyRatchet};
-use ratum::datum::handshake::{ProtocolVersion, ServerChannel, accept, open_hello};
-use ratum::datum::messages::{
-    CoinbaserRequest, RejectReason, ResumeToken, ShareResponse, ShareVerdict, blocknotify,
-    client_subcmd,
-};
-use ratum::datum::share::PowSubmit;
-use ratum::datum::validation::{self, TxnList};
+use ratum::datum::handshake::{ProtocolVersion, ResumeToken};
+use ratum::datum::messages::client_subcmd;
+use ratum::datum::messages::coinbaser::CoinbaserRequest;
+use ratum::datum::server::{Hello, ServerChannel, accept, open_hello};
 use ratum::lock;
-use ratum::poll::{PolledSocket, WRITE_TIMEOUT};
-use ratum_prime::verify::{AcceptedShare, RebuiltShare, Verifier};
+use ratum::poll::{Fill, PolledSocket, WRITE_TIMEOUT};
 use std::collections::HashMap;
 use std::io;
 use std::net::TcpStream;
@@ -26,6 +27,12 @@ use std::time::{Duration, Instant};
 
 const LOG_PAYLOAD_BYTES: usize = 16;
 const LOG_HEX_CHARS: usize = 16;
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(15);
+const FRAME_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+const FRAME_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+const FRAME_BODY_DEADLINE: Duration = Duration::from_secs(120);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+const MAX_HELLO_FRAME_LEN: usize = 4 * 1024;
 
 fn describe(header: FrameHeader, payload: &[u8]) -> String {
     let sub = payload.first().copied();
@@ -42,20 +49,13 @@ fn describe(header: FrameHeader, payload: &[u8]) -> String {
     format!("{name}: {} bytes [{head}...]", payload.len())
 }
 
-const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(15);
-const FRAME_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
-const FRAME_BODY_TIMEOUT: Duration = Duration::from_secs(30);
-const FRAME_BODY_DEADLINE: Duration = Duration::from_secs(120);
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
-const MAX_HELLO_FRAME_LEN: usize = 4 * 1024;
-
 fn read_hello(
     socket: &mut PolledSocket,
     server: &Server,
     peer: std::net::SocketAddr,
-    started: Instant,
-) -> io::Result<Option<ratum::datum::handshake::Hello>> {
-    let left = || HANDSHAKE_DEADLINE.saturating_sub(started.elapsed());
+    started_at: Instant,
+) -> io::Result<Option<Hello>> {
+    let left = || HANDSHAKE_DEADLINE.saturating_sub(started_at.elapsed());
     let mut rx = HeaderKeyRatchet::initial();
     let mut header_bytes = [0u8; framing::HEADER_LEN];
     socket.read_exact(&mut header_bytes, left(), left())?;
@@ -78,13 +78,13 @@ fn read_hello(
     }
 }
 
-pub(crate) fn handle(stream: TcpStream, server: &Server) -> io::Result<()> {
+pub fn handle(stream: TcpStream, server: &Server) -> io::Result<()> {
     let peer = stream.peer_addr()?;
     debug!("[{peer}] connected");
     let mut socket = PolledSocket::new(stream)?;
 
-    let handshake_started = Instant::now();
-    let Some(hello) = read_hello(&mut socket, server, peer, handshake_started)? else {
+    let handshake_started_at = Instant::now();
+    let Some(hello) = read_hello(&mut socket, server, peer, handshake_started_at)? else {
         return Ok(());
     };
     if !agent_allowed(&server.allowed_agents, &hello.user_agent) {
@@ -133,17 +133,17 @@ pub(crate) fn handle(stream: TcpStream, server: &Server) -> io::Result<()> {
     let mut conn = Connection {
         server,
         peer,
-        opened: handshake_started,
+        opened_at: handshake_started_at,
         socket,
         waker,
         channel,
         verifier: Verifier::new(server.share_policy.clone(), Arc::clone(&server.accepted_hashes)),
         credit: CreditState::new(peer),
-        coinbaser_id: 0,
+        last_coinbaser_id: 0,
         awaiting_txns: HashMap::new(),
         known_tip: None,
         known_next_bits: None,
-        last_send: Instant::now(),
+        last_send_at: Instant::now(),
         client_sign_pk,
         v3: None,
         bulk: Reassembler::new(),
@@ -160,10 +160,10 @@ pub(crate) fn handle(stream: TcpStream, server: &Server) -> io::Result<()> {
     conn.run()
 }
 
-struct ShareOutcome {
-    verdict: ShareVerdict,
-    followup_request: Option<Vec<u8>>,
-    raw_pow_hash: Option<[u8; 32]>,
+enum FrameHeaderRead {
+    Complete,
+    Idle,
+    Closed,
 }
 
 struct V3Session {
@@ -174,17 +174,17 @@ struct V3Session {
 struct Connection<'a> {
     server: &'a Server,
     peer: std::net::SocketAddr,
-    opened: Instant,
+    opened_at: Instant,
     socket: PolledSocket,
     waker: Arc<Waker>,
     channel: ServerChannel,
     verifier: Verifier,
     credit: CreditState,
-    coinbaser_id: u8,
+    last_coinbaser_id: u8,
     awaiting_txns: HashMap<u8, AcceptedShare>,
     known_tip: Option<[u8; 32]>,
     known_next_bits: Option<u32>,
-    last_send: Instant,
+    last_send_at: Instant,
     client_sign_pk: [u8; 32],
     v3: Option<V3Session>,
     bulk: Reassembler,
@@ -198,9 +198,13 @@ impl Drop for Connection<'_> {
                 token: v3.token,
                 abw: v3.abw,
                 splits: self.verifier.take_splits(),
-                coinbaser_id: self.coinbaser_id,
+                last_coinbaser_id: self.last_coinbaser_id,
             };
-            let session = SavedSession { state, saved_at: Instant::now(), held_since: self.opened };
+            let session = SavedSession {
+                state,
+                saved_at: Instant::now(),
+                connection_opened_at: self.opened_at,
+            };
             lock(&self.server.sessions).save(self.client_sign_pk, session);
             debug!("[{}] session saved for resume", self.peer);
         }
@@ -222,12 +226,12 @@ impl Connection<'_> {
             .encrypt(cmd, payload, sign)
             .map_err(|e| io::Error::other(e.to_string()))?;
         self.socket.write_all(&wire, WRITE_TIMEOUT)?;
-        self.last_send = Instant::now();
+        self.last_send_at = Instant::now();
         Ok(())
     }
 
     fn until_next_action(&self) -> Duration {
-        let mut due = self.last_send + KEEPALIVE_INTERVAL;
+        let mut due = self.last_send_at + KEEPALIVE_INTERVAL;
         if let Some(next) = self.abw().map(AbwSlotState::next_due) {
             due = due.min(next);
         }
@@ -240,7 +244,7 @@ impl Connection<'_> {
     ) -> io::Result<FrameHeaderRead> {
         let mut got = 0usize;
         let mut partial_since: Option<Instant> = None;
-        while got < hdr.len() {
+        loop {
             if !self.socket.readable() {
                 let Some(since) = partial_since else { return Ok(FrameHeaderRead::Idle) };
                 let left =
@@ -254,16 +258,15 @@ impl Connection<'_> {
                 self.socket.wait(Some(left))?;
                 continue;
             }
-            match self.socket.read(&mut hdr[got..])? {
-                Some(0) => return Ok(FrameHeaderRead::Closed),
-                Some(n) => {
-                    got += n;
-                    partial_since.get_or_insert_with(Instant::now);
-                }
-                None => {}
+            match self.socket.fill(hdr, &mut got)? {
+                Fill::Closed => return Ok(FrameHeaderRead::Closed),
+                Fill::Complete => return Ok(FrameHeaderRead::Complete),
+                Fill::Partial => {}
+            }
+            if got > 0 {
+                partial_since.get_or_insert_with(Instant::now);
             }
         }
-        Ok(FrameHeaderRead::Complete)
     }
 
     fn read_frame_body(&mut self, n: usize) -> io::Result<Vec<u8>> {
@@ -282,9 +285,10 @@ impl Connection<'_> {
         resume: Option<&ResumeToken>,
     ) -> io::Result<()> {
         let peer = self.peer;
-        let (state, resumed) = self.server.resume_or_start(client_sign_pk, resume, Instant::now());
+        let StartedSession { state, resumed } =
+            self.server.resume_or_start(client_sign_pk, resume, Instant::now());
         self.verifier.restore_splits(state.splits);
-        self.coinbaser_id = state.coinbaser_id;
+        self.last_coinbaser_id = state.last_coinbaser_id;
         let payload = self.server.config_payload_v3(&state.token);
         self.v3 = Some(V3Session { token: state.token, abw: state.abw });
         let notices = self.with_abw(|abw| abw.notices()).expect("a version 3 session");
@@ -308,110 +312,9 @@ impl Connection<'_> {
         Ok(())
     }
 
-    fn abw(&self) -> Option<&AbwSlotState> {
-        self.v3.as_ref().map(|v| &v.abw)
-    }
-
-    fn with_abw<R>(&mut self, f: impl FnOnce(&mut AbwSlotState) -> R) -> Option<R> {
-        let abw = &mut self.v3.as_mut()?.abw;
-        let r = f(abw);
-        let keys = abw.keys();
-        self.verifier.set_abw_keys(Some(keys));
-        Some(r)
-    }
-
     fn send_keepalive(&mut self) -> io::Result<()> {
         self.send_frame(framing::cmd::HELLO_OR_PING, &[], false)?;
         debug!("[{}]   <- keepalive ping", self.peer);
-        Ok(())
-    }
-
-    fn notify_tip_change(&mut self) -> io::Result<()> {
-        let current = lock(&self.server.node_view.tip).map(|t| t.hash);
-        let next_bits = *lock(&self.server.node_view.next_bits);
-        if current != self.known_tip {
-            let tip_replaced = self.known_tip.is_some();
-            self.known_tip = current;
-            self.verifier.set_tip(current, ratum::unix_now());
-            self.verifier.set_next_target(next_bits);
-            self.known_next_bits = next_bits;
-            if current.is_some() {
-                if tip_replaced {
-                    self.rotate_on_tip()?;
-                }
-                self.send_mining(&blocknotify(), false)?;
-                debug!("[{}]   <- blocknotify (new tip)", self.peer);
-            }
-        } else if next_bits != self.known_next_bits {
-            self.verifier.set_next_target(next_bits);
-            self.known_next_bits = next_bits;
-            debug!("[{}]   next target set for the current tip", self.peer);
-        }
-        Ok(())
-    }
-
-    fn rotate_on_tip(&mut self) -> io::Result<()> {
-        match self.abw() {
-            Some(abw) if abw.tip_rotation_allowed(Instant::now()) => self.rotate_abw("new tip"),
-            Some(_) => {
-                debug!(
-                    "[{}]   the active ABW slot is too young to rotate on the new tip",
-                    self.peer
-                );
-                Ok(())
-            }
-            None => Ok(()),
-        }
-    }
-
-    fn send_reveals(&mut self, reveals: &[PendingReveal], rotating: bool) -> io::Result<()> {
-        for r in reveals {
-            self.send_mining(&r.payload, false)?;
-            match (rotating, r.resend) {
-                (_, true) => {
-                    debug!("[{}]   <- sent the reveal of ABW slot {} again", self.peer, r.slot);
-                }
-                (false, false) => {
-                    debug!("[{}]   <- revealed the retired ABW slot {}", self.peer, r.slot);
-                }
-                (true, false) => warn!(
-                    "[{}]   <- revealed ABW slot {} early: the rotation reached it again \
-                     before its reveal was due",
-                    self.peer, r.slot
-                ),
-            }
-        }
-        Ok(())
-    }
-
-    fn rotate_abw(&mut self, why: &str) -> io::Result<()> {
-        let Some((reveals, notice)) = self.with_abw(|abw| abw.rotate(Instant::now())) else {
-            return Ok(());
-        };
-        self.send_reveals(&reveals, true)?;
-        self.send_mining(&notice, false)?;
-        debug!("[{}]   <- rotated the ABW assignment ({why})", self.peer);
-        Ok(())
-    }
-
-    fn send_due_reveals(&mut self) -> io::Result<()> {
-        let now = Instant::now();
-        if !self.abw().is_some_and(|abw| abw.reveal_due(now)) || !self.socket_drained()? {
-            return Ok(());
-        }
-        let reveals = self.with_abw(|abw| abw.reveals_due(now)).unwrap_or_default();
-        self.send_reveals(&reveals, false)
-    }
-
-    fn socket_drained(&mut self) -> io::Result<bool> {
-        self.socket.wait(Some(Duration::ZERO))?;
-        Ok(!self.socket.readable())
-    }
-
-    fn send_abw_receipt(&mut self, s: &PowSubmit, rebuilt: &RebuiltShare) -> io::Result<()> {
-        let Some(slot) = s.abw_slot.filter(|_| self.v3.is_some()) else { return Ok(()) };
-        self.send_mining(&AbwSlotState::receipt(slot, rebuilt.raw_pow_hash), false)?;
-        debug!("[{}]   <- ABW receipt for the block on slot {slot}", self.peer);
         Ok(())
     }
 
@@ -423,7 +326,7 @@ impl Connection<'_> {
                 self.rotate_abw(why)?;
             }
             self.send_due_reveals()?;
-            if self.last_send.elapsed() >= KEEPALIVE_INTERVAL {
+            if self.last_send_at.elapsed() >= KEEPALIVE_INTERVAL {
                 self.send_keepalive()?;
             }
 
@@ -442,13 +345,6 @@ impl Connection<'_> {
                 FrameHeaderRead::Complete => {}
             }
             let header = self.channel.unmask_header(hdr);
-            if header.cmd_len as usize > framing::MAX_CMD_DATA_SIZE as usize {
-                warn!(
-                    "[{peer}] cmd_len {} exceeds MAX_CMD_DATA_SIZE; closing the connection",
-                    header.cmd_len
-                );
-                return Ok(());
-            }
             let body = self.read_frame_body(header.cmd_len as usize)?;
             let plain = match self.channel.decrypt(header, &body) {
                 Ok(p) => p,
@@ -517,258 +413,18 @@ impl Connection<'_> {
         if !coinbaser::value_is_plausible(self.server, peer, req.value) {
             return Ok(());
         }
-        self.coinbaser_id = coinbaser::next_id(self.coinbaser_id);
-        let split = coinbaser::dictate(self.server, peer, req.value, self.coinbaser_id)?;
-        self.verifier.record_dictated(&split.response, split.identities, ratum::unix_now());
+        self.last_coinbaser_id = coinbaser::next_id(self.last_coinbaser_id);
+        let split = coinbaser::dictate(self.server, peer, req.value, self.last_coinbaser_id)?;
+        self.verifier.record_dictated(self.last_coinbaser_id, split.dictated, ratum::unix_now());
         self.send_mining(&split.payload, false)?;
         info!(
             "[{peer}]   <- coinbaser response ({} outputs, id {})",
             split.response.outputs.len(),
-            self.coinbaser_id
+            self.last_coinbaser_id
         );
         Ok(())
     }
-
-    fn on_share(&mut self, plain: &[u8]) -> io::Result<()> {
-        let peer = self.peer;
-        let (response, followup_request) = match PowSubmit::decode(plain) {
-            Ok(s) => {
-                debug!("[{peer}]   -> share {}", describe_share(&s));
-                self.with_abw(AbwSlotState::note_share);
-                let outcome = self.check_share(&s, ratum::unix_now())?;
-                let abw_ref =
-                    outcome.raw_pow_hash.zip(s.abw_slot).filter(|_| self.v3.is_some()).map(
-                        |(hash, slot)| AbwShareRef {
-                            slot,
-                            raw_pow_hash_le: raw_pow_hash_le(&hash),
-                        },
-                    );
-                let response = ShareResponse {
-                    verdict: outcome.verdict,
-                    nonce: s.nonce,
-                    target_byte: s.target_byte,
-                    job_id: s.job_id,
-                    abw_ref,
-                };
-                (response, outcome.followup_request)
-            }
-            Err(e) => {
-                warn!("[{peer}]   !! could not decode share: {e}");
-                if matches!(
-                    e,
-                    ratum::datum::share::Error::BadBlake2bSection
-                        | ratum::datum::share::Error::MissingBlake2bSection
-                        | ratum::datum::share::Error::BadExtranonceSize(_)
-                ) {
-                    warn!(
-                        "[{peer}]      a share this pool cannot read indicates a gateway \
-                         built against a different revision of the protocol (an upstream \
-                         DATUM gateway sends no BLAKE2b section); the pool and the gateway \
-                         are released together"
-                    );
-                }
-                let (job_id, target_byte, nonce) = PowSubmit::prefix(plain).unwrap_or((
-                    0,
-                    ratum::datum::coinbase::TARGET_BYTE_PLACEHOLDER,
-                    0,
-                ));
-                let response = ShareResponse {
-                    verdict: ShareVerdict::Rejected(Verifier::reason_for_decode_error(&e)),
-                    nonce,
-                    target_byte,
-                    job_id,
-                    abw_ref: None,
-                };
-                (response, None)
-            }
-        };
-        self.send_mining(&response.encode(), false)?;
-        if let Some(request) = followup_request {
-            self.send_mining(&request, false)?;
-            info!("[{peer}]   <- requested the block's transactions (0x50 0x12)");
-        }
-        Ok(())
-    }
-
-    fn check_share(&mut self, s: &PowSubmit, now: u64) -> io::Result<ShareOutcome> {
-        match self.verifier.verify(s, now) {
-            Ok(a) => self.on_accepted(s, &a, now),
-            Err(reason) => self.on_refused(s, reason),
-        }
-    }
-
-    fn on_accepted(
-        &mut self,
-        s: &PowSubmit,
-        a: &AcceptedShare,
-        now: u64,
-    ) -> io::Result<ShareOutcome> {
-        let peer = self.peer;
-        let raw_pow_hash = Some(a.rebuilt.raw_pow_hash);
-        let candidate = self.verifier.block_candidate(&a.rebuilt);
-        if a.is_block {
-            warn!(
-                "[{peer}]   ** BLOCK at height {}: {}",
-                a.rebuilt.height,
-                hex::encode(a.rebuilt.block_hash)
-            );
-        } else if candidate {
-            info!(
-                "[{peer}]      share meets its job's bits {:#010x} but not the node's \
-                 next target; not relayed",
-                a.rebuilt.job_bits
-            );
-        }
-        if candidate {
-            self.send_abw_receipt(s, &a.rebuilt)?;
-        }
-        let followup_request = if a.is_block {
-            self.relay_and_record(s, a, now)
-        } else {
-            if s.is_block {
-                warn!(
-                    "[{peer}]   !! gateway flagged a block but the hash does not meet the \
-                     network target"
-                );
-            }
-            None
-        };
-        if self.credit.is_unpayable(self.server, &s.username) {
-            let verdict = ShareVerdict::Rejected(RejectReason::BadUsername);
-            return Ok(ShareOutcome { verdict, followup_request, raw_pow_hash });
-        }
-        if let Err(e) = self.credit.record_and_credit(self.server, s, a, now) {
-            error!(
-                "[{peer}]   !! could not record the share to the ledger ({e}); it is \
-                 not credited and its hash was removed from the accepted share hashes so a \
-                 resend can be credited"
-            );
-        }
-        Ok(ShareOutcome { verdict: ShareVerdict::Accepted, followup_request, raw_pow_hash })
-    }
-
-    fn relay_and_record(&mut self, s: &PowSubmit, a: &AcceptedShare, now: u64) -> Option<Vec<u8>> {
-        let peer = self.peer;
-        let mut followup_request = None;
-        if relay::submit_or_request_txns(peer, &self.server.node, a, s.subsidy_only) {
-            if let Some(prev) = self.awaiting_txns.insert(s.job_id, a.clone()) {
-                error!(
-                    "[{peer}]   !! a block on job {} was still awaiting its transactions \
-                     and is abandoned: {}",
-                    s.job_id,
-                    hex::encode(prev.rebuilt.block_hash)
-                );
-            }
-            followup_request = Some(validation::request_block_txns(s.job_id));
-        }
-        self.credit.record_found_block(self.server, a, s, now);
-        if !a.rebuilt.unpaid_output_indexes.is_empty() {
-            self.credit.record_unpaid_outputs(self.server, &self.verifier, a, now);
-        } else if a.rebuilt.paid_to_split == 0 {
-            self.credit.record_owed_block(self.server, a, now);
-        }
-        followup_request
-    }
-
-    fn on_refused(&mut self, s: &PowSubmit, reason: RejectReason) -> io::Result<ShareOutcome> {
-        let peer = self.peer;
-        debug!("[{peer}]   <- rejected: {reason:?}");
-        let rebuilt = self.verifier.rebuild_refused(s);
-        if let Some(r) = &rebuilt
-            && s.is_block
-        {
-            warn!(
-                "[{peer}]   !! pool built header {} coinbase {}",
-                hex::encode(r.header),
-                hex::encode(&r.coinbase_tx)
-            );
-        }
-        let rebuilt = rebuilt.filter(|_| self.v3.is_some());
-        if let Some(r) = &rebuilt
-            && self.verifier.block_candidate(r)
-        {
-            warn!(
-                "[{peer}]   ** the refused share ({reason:?}) meets a block \
-                 target: sending the ABW receipt so the gateway counts it handled"
-            );
-            self.send_abw_receipt(s, r)?;
-        }
-        Ok(ShareOutcome {
-            verdict: ShareVerdict::Rejected(reason),
-            followup_request: None,
-            raw_pow_hash: rebuilt.map(|r| r.raw_pow_hash),
-        })
-    }
-
-    fn on_block_txns(&mut self, plain: &[u8]) {
-        let peer = self.peer;
-        let selector = plain.get(validation::SELECTOR_AT).copied();
-        if selector != Some(validation::response::BLOCK_TXNS) {
-            warn!("[{peer}]   !! unhandled 0x50 response {selector:?}");
-            return;
-        }
-        let list = match TxnList::decode(plain, validation::response::BLOCK_TXNS) {
-            Ok(b) => b,
-            Err(e) => {
-                error!("[{peer}]   !! bad block response: {e}");
-                return;
-            }
-        };
-        info!(
-            "[{peer}]   -> block transactions: job {} {} {} txns",
-            list.job_index,
-            list.status,
-            list.txns.len()
-        );
-        let Some(a) = self.awaiting_txns.remove(&list.job_index) else {
-            warn!(
-                "[{peer}]      transactions for job {} that nothing is waiting on",
-                list.job_index
-            );
-            return;
-        };
-        if list.status != validation::TxnListStatus::Ok {
-            error!("[{peer}]      cannot assemble the block: {}", list.status);
-            return;
-        }
-        relay::submit_with_txns(peer, &self.server.node, list.job_index, &a, &list.txns);
-    }
 }
-
-enum FrameHeaderRead {
-    Complete,
-    Idle,
-    Closed,
-}
-
-fn describe_share(s: &PowSubmit) -> String {
-    let sections = match (&s.job, &s.coinbase) {
-        (Some(j), Some(c)) => format!(
-            " +job(h={} {} branches) +coinbase(id={} {}+{}B)",
-            j.height,
-            j.merkle_branches.len(),
-            c.coinbase_id,
-            c.coinb1.len(),
-            c.coinb2.len()
-        ),
-        (Some(j), None) => format!(" +job(h={} {} branches)", j.height, j.merkle_branches.len()),
-        (None, Some(c)) => format!(" +coinbase(id={})", c.coinbase_id),
-        (None, None) => String::new(),
-    };
-    format!(
-        "job={} cb={} diff={} nonce={:08x} ntime={:08x} user={:?}{}{}{}",
-        s.job_id,
-        s.coinbase_id,
-        s.difficulty(),
-        s.nonce,
-        s.ntime,
-        s.username,
-        if s.is_block { " is_block" } else { "" },
-        if s.quickdiff { " quickdiff" } else { "" },
-        sections
-    )
-}
-
 fn agent_allowed(allowed: &[String], user_agent: &str) -> bool {
     allowed.is_empty() || allowed.iter().any(|p| user_agent.starts_with(p))
 }

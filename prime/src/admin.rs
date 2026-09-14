@@ -1,80 +1,16 @@
 use crate::cli::fatal;
-use log::{info, warn};
-use ratum::rpc;
-use ratum_prime::config::Config;
-use ratum_prime::ledger::{self, Ledger};
+use crate::config::Config;
+use crate::ledger::blocks::{ConfirmationReading, OwedBlock};
+use crate::ledger::split::Payout;
+use crate::ledger::{Ledger, LedgerLocation};
 use std::io;
-use std::path::{Path, PathBuf};
 
-pub(crate) enum LedgerLocation {
-    File(PathBuf),
-    InDir(PathBuf),
-    MemoryOnly,
+fn open_whole_ledger(location: &LedgerLocation, flag: &str) -> io::Result<Ledger> {
+    let path = location.existing_file(flag)?;
+    Ledger::open(&path, u128::MAX, None, None).map(|(ledger, _)| ledger)
 }
 
-impl LedgerLocation {
-    pub(crate) fn new(ledger_path: Option<String>, data_dir: Option<&PathBuf>) -> Self {
-        match (ledger_path, data_dir) {
-            (Some(p), _) => Self::File(PathBuf::from(p)),
-            (None, Some(dir)) => Self::InDir(dir.clone()),
-            (None, None) => Self::MemoryOnly,
-        }
-    }
-
-    pub(crate) fn file_for(&self, chain: Option<rpc::Chain>) -> Option<PathBuf> {
-        match (self, chain) {
-            (Self::File(p), _) => Some(p.clone()),
-            (Self::InDir(dir), Some(rpc::Chain::Other)) => fatal!(
-                "the node reports a chain this pool has no name for, so it cannot name the \
-                 ledger in {}; give --ledger a file for it",
-                dir.display()
-            ),
-            (Self::InDir(dir), Some(c)) => Some(dir.join(format!("{}.redb", c.name()))),
-            (Self::InDir(_), None) => {
-                unreachable!("a data directory waits for the chain")
-            }
-            (Self::MemoryOnly, _) => None,
-        }
-    }
-
-    fn existing_file(&self, flag: &str) -> io::Result<PathBuf> {
-        Ok(match self {
-            Self::File(p) => p.clone(),
-            Self::InDir(dir) => match ledger_files_in(dir)?.as_slice() {
-                [one] => one.clone(),
-                [] => fatal!("no ledger (*.redb) in {}", dir.display()),
-                many => {
-                    let names: Vec<String> = many.iter().map(|p| p.display().to_string()).collect();
-                    fatal!(
-                        "{} holds more than one ledger; give --ledger to choose one of: {}",
-                        dir.display(),
-                        names.join(", ")
-                    )
-                }
-            },
-            Self::MemoryOnly => fatal!("{flag} needs a ledger: give --ledger or --data-dir"),
-        })
-    }
-
-    fn open(&self, flag: &str) -> io::Result<Ledger> {
-        let path = self.existing_file(flag)?;
-        Ledger::open(&path, u128::MAX, None, None).map(|(ledger, _)| ledger)
-    }
-}
-
-fn ledger_files_in(dir: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "redb"))
-        .collect();
-    found.sort();
-    Ok(found)
-}
-
-pub(crate) fn run_command(
-    command_line: &Config,
-    location: &LedgerLocation,
-) -> Option<io::Result<()>> {
+pub fn run_command(command_line: &Config, location: &LedgerLocation) -> Option<io::Result<()>> {
     if command_line.dump_ledger {
         return Some(dump_ledger(location));
     }
@@ -99,18 +35,14 @@ fn block_hash_arg(flag: &str, arg: &str, also: &str) -> [u8; 32] {
     }
 }
 
-fn print_or_refuse(
-    arg: &str,
-    record: Option<ledger::OwedBlock>,
-    state: Option<ledger::ConfirmationReading>,
-) {
+fn print_or_refuse(arg: &str, record: Option<OwedBlock>, state: Option<ConfirmationReading>) {
     let Some(owed) = record else {
         fatal!("no owed block under {arg}; --settle-block list prints them")
     };
     print_owed(&owed, state);
 }
 
-fn confirmations_text(state: Option<ledger::ConfirmationReading>) -> String {
+fn confirmations_text(state: Option<ConfirmationReading>) -> String {
     match state {
         Some(s) if s.on_best_chain() => format!(" {} confirmations", s.confirmations),
         Some(s) => format!(" NOT ON THE BEST CHAIN as of {}", s.checked_at),
@@ -118,7 +50,7 @@ fn confirmations_text(state: Option<ledger::ConfirmationReading>) -> String {
     }
 }
 
-fn print_owed(o: &ledger::OwedBlock, state: Option<ledger::ConfirmationReading>) {
+fn print_owed(o: &OwedBlock, state: Option<ConfirmationReading>) {
     let status = match o.settled_at {
         Some(at) => format!("settled at {at}"),
         None => "unsettled".to_string(),
@@ -127,41 +59,41 @@ fn print_owed(o: &ledger::OwedBlock, state: Option<ledger::ConfirmationReading>)
         "height {} block {} found {} total {} sats {status}{}",
         o.height,
         hex::encode(o.block_hash),
-        o.at,
+        o.found_at,
         o.total,
         confirmations_text(state)
     );
-    for (identity, sats) in &o.entries {
+    for Payout { identity, sats } in &o.entries {
         println!("  {identity} {sats}");
     }
 }
 
 fn dump_ledger(location: &LedgerLocation) -> io::Result<()> {
     use std::fmt::Write as _;
-    let ledger = location.open("--dump-ledger")?;
+    let ledger = open_whole_ledger(location, "--dump-ledger")?;
     let mut out = String::new();
     for share in ledger.dump()? {
         let _ = writeln!(
             out,
             "{} {} {} {} {}",
-            share.at,
+            share.accepted_at,
             share.difficulty,
             share.identity,
             hex::encode(share.block_hash),
-            share.tag
+            share.tag_secondary
         );
     }
     print!("{out}");
     Ok(())
 }
 
-fn owed_entries(entries: &[String]) -> Vec<(String, u64)> {
-    let mut parsed: Vec<(String, u64)> = Vec::with_capacity(entries.len());
+fn owed_entries(entries: &[String]) -> Vec<Payout> {
+    let mut parsed: Vec<Payout> = Vec::with_capacity(entries.len());
     for entry in entries {
         let split = entry.split_once('=').map(|(id, sats)| (id.trim(), sats.trim().parse::<u64>()));
         match split {
             Some((id, Ok(sats))) if !id.is_empty() && sats > 0 => {
-                parsed.push((id.to_string(), sats));
+                parsed.push(Payout { identity: id.to_string(), sats });
             }
             _ => fatal!(
                 "--owed takes identity=sats with a positive whole number of sats, got {entry:?}"
@@ -175,7 +107,7 @@ fn owed_entries(entries: &[String]) -> Vec<(String, u64)> {
 }
 
 fn record_owed(location: &LedgerLocation, arg: &str, entries: &[String]) -> io::Result<()> {
-    let mut ledger = location.open("--record-owed")?;
+    let mut ledger = open_whole_ledger(location, "--record-owed")?;
     let hash = block_hash_arg("--record-owed", arg, "");
     let Some(block) = ledger.blocks().iter().find(|b| b.block_hash == hash).cloned() else {
         fatal!(
@@ -189,7 +121,7 @@ fn record_owed(location: &LedgerLocation, arg: &str, entries: &[String]) -> io::
         std::process::exit(crate::cli::USAGE_EXIT);
     }
     let entries = owed_entries(entries);
-    let total: u64 = entries.iter().map(|(_, sats)| *sats).sum();
+    let total: u64 = entries.iter().map(|p| p.sats).sum();
     if total > block.paid_to_pool {
         fatal!(
             "the entries total {total} sats, more than the {} sats the block's coinbase paid to \
@@ -198,8 +130,8 @@ fn record_owed(location: &LedgerLocation, arg: &str, entries: &[String]) -> io::
             block.paid_to_pool
         );
     }
-    let owed = ledger::OwedBlock {
-        at: block.at,
+    let owed = OwedBlock {
+        found_at: block.found_at,
         height: block.height,
         block_hash: hash,
         total,
@@ -212,7 +144,7 @@ fn record_owed(location: &LedgerLocation, arg: &str, entries: &[String]) -> io::
 }
 
 fn settle_block(location: &LedgerLocation, arg: &str) -> io::Result<()> {
-    let mut ledger = location.open("--settle-block")?;
+    let mut ledger = open_whole_ledger(location, "--settle-block")?;
     if arg == "list" {
         if ledger.owed().is_empty() {
             println!("no owed blocks");
@@ -229,7 +161,10 @@ fn settle_block(location: &LedgerLocation, arg: &str) -> io::Result<()> {
             print_owed(owed, state);
         }
         fatal!(
-            "block {arg} was not on the node's best chain when the pool last read it at {}              (the node answered {} confirmations), so its coinbase pays nobody and the amounts              against it are not owed; --void-block {arg} removes the record. Re-run the pool              to re-read the block if you believe the chain has changed since.",
+            "block {arg} was not on the node's best chain when the pool last read it at {} (the \
+             node answered {} confirmations), so its coinbase pays nobody and the amounts against \
+             it are not owed; --void-block {arg} removes the record. Re-run the pool to re-read \
+             the block if you believe the chain has changed since.",
             s.checked_at,
             s.confirmations
         );
@@ -239,54 +174,9 @@ fn settle_block(location: &LedgerLocation, arg: &str) -> io::Result<()> {
 }
 
 fn void_block(location: &LedgerLocation, arg: &str) -> io::Result<()> {
-    let mut ledger = location.open("--void-block")?;
+    let mut ledger = open_whole_ledger(location, "--void-block")?;
     let hash = block_hash_arg("--void-block", arg, "");
     let state = ledger.confirmations(&hash);
     print_or_refuse(arg, ledger.void_owed(&hash)?, state);
     Ok(())
-}
-
-pub(crate) fn open_share_ledger(
-    path: Option<&PathBuf>,
-    startup_window: u128,
-    keep: Option<usize>,
-    chain_name: Option<&str>,
-) -> io::Result<Ledger> {
-    let Some(path) = path else {
-        warn!("no --ledger file or --data-dir; the share window is lost on restart");
-        return Ok(Ledger::new(startup_window));
-    };
-    let (ledger, read_back) = Ledger::open(path, startup_window, keep, chain_name)?;
-    if read_back.stamped {
-        info!(
-            "{} carried no chain stamp and is now stamped {}",
-            path.display(),
-            chain_name.unwrap_or("?")
-        );
-    }
-    if read_back.skipped != 0 {
-        warn!("{} unreadable rows in {} were skipped", read_back.skipped, path.display());
-    }
-    if read_back.truncated {
-        warn!(
-            "the share window exceeds the retained ledger in {}: older work is not credited \
-             (raise --ledger-keep to keep it)",
-            path.display()
-        );
-    }
-    info!(
-        "share window from {}: {} shares, {} work",
-        path.display(),
-        ledger.len(),
-        ledger.total_work()
-    );
-    match keep {
-        Some(n) => info!(
-            "keeping at most {} of the most recent shares in {}",
-            n as u64 * ledger::SHARES_PER_KEEP_UNIT,
-            path.display()
-        ),
-        None => info!("every share in {} is kept", path.display()),
-    }
-    Ok(ledger)
 }

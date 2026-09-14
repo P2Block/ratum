@@ -4,6 +4,9 @@ use std::time::Duration;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
+const HTTP_PORT: u16 = 80;
+const HTTPS_PORT: u16 = 443;
+
 const TEMPLATE_RULES: [&str; 2] = ["segwit", "blake2b"];
 
 #[derive(Debug, thiserror::Error)]
@@ -18,28 +21,32 @@ pub enum Error {
     Transport(#[from] minreq::Error),
     #[error("malformed rpc response: {0}")]
     BadResponse(String),
-    #[error("rpc http {0}: {1}")]
-    Http(u16, String),
-    #[error("rpc error: {0}")]
-    Rpc(String),
+    #[error("rpc http {status}: {body}")]
+    Http { status: u16, body: String },
+    #[error("rpc error {code}: {message}")]
+    Rpc { code: i64, message: String },
 }
+
+const RPC_METHOD_NOT_FOUND: i64 = -32601;
+const RPC_INVALID_ADDRESS_OR_KEY: i64 = -5;
 
 impl Error {
     pub fn is_unauthorized(&self) -> bool {
-        matches!(self, Self::Http(401 | 403, _))
+        matches!(self, Self::Http { status: 401 | 403, .. })
     }
 
     pub fn is_method_not_found(&self) -> bool {
-        match self {
-            Self::Rpc(m) => m.contains("-32601") || m.contains("Method not found"),
-            _ => false,
-        }
+        matches!(self, Self::Rpc { code: RPC_METHOD_NOT_FOUND, .. })
     }
 
     pub fn is_not_found(&self) -> bool {
-        match self {
-            Self::Rpc(m) => m.contains(r#""code":-5"#) || m.contains("not found"),
-            _ => false,
+        matches!(self, Self::Rpc { code: RPC_INVALID_ADDRESS_OR_KEY, .. })
+    }
+
+    fn from_rpc_object(error: &serde_json::Value) -> Self {
+        Self::Rpc {
+            code: error["code"].as_i64().unwrap_or(0),
+            message: error["message"].as_str().map_or_else(|| error.to_string(), str::to_string),
         }
     }
 }
@@ -117,7 +124,7 @@ pub struct Client {
     url: String,
     authorization: Arc<Mutex<String>>,
     cookie_path: Option<PathBuf>,
-    pub timeout: Duration,
+    timeout: Duration,
 }
 
 impl std::fmt::Debug for Client {
@@ -137,35 +144,68 @@ fn basic_auth(user: &str, password: &str) -> String {
     format!("Basic {credential}")
 }
 
+struct RpcUrl {
+    url: String,
+    user: String,
+    password: String,
+}
+
+fn parse_url(url: &str) -> Result<RpcUrl, Error> {
+    let bad = || Error::BadUrl(url.to_string());
+    let (scheme, rest) = url.split_once("://").ok_or_else(bad)?;
+    if scheme != "http" && scheme != "https" {
+        return Err(bad());
+    }
+    let (user, password, host) = match rest.rsplit_once('@') {
+        Some((credentials, host)) => {
+            let (user, password) = credentials.split_once(':').unwrap_or((credentials, ""));
+            (user, password, host)
+        }
+        None => ("", "", rest),
+    };
+    let (authority, path) = match host.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{path}")),
+        None => (host, String::new()),
+    };
+    if authority.is_empty() {
+        return Err(bad());
+    }
+    let has_port = authority.rsplit_once(']').map_or(authority, |(_, after)| after).contains(':');
+    let port = match (has_port, scheme) {
+        (true, _) => String::new(),
+        (false, "https") => format!(":{HTTPS_PORT}"),
+        (false, _) => format!(":{HTTP_PORT}"),
+    };
+    Ok(RpcUrl {
+        url: format!("{scheme}://{authority}{port}{path}"),
+        user: user.to_string(),
+        password: password.to_string(),
+    })
+}
+
 impl Client {
     pub fn new(url: &str, user: &str, password: &str) -> Result<Self, Error> {
-        Self::build(url, basic_auth(user, password), None)
+        Ok(Self::build(parse_url(url)?.url, basic_auth(user, password), None))
     }
 
     pub fn with_cookie(url: &str, cookie_path: PathBuf) -> Result<Self, Error> {
+        let url = parse_url(url)?.url;
         let (user, password) = read_cookie(&cookie_path)?;
-        Self::build(url, basic_auth(&user, &password), Some(cookie_path))
+        Ok(Self::build(url, basic_auth(&user, &password), Some(cookie_path)))
     }
 
-    fn build(
-        url: &str,
-        authorization: String,
-        cookie_path: Option<PathBuf>,
-    ) -> Result<Self, Error> {
-        let rest = url
-            .strip_prefix("http://")
-            .or_else(|| url.strip_prefix("https://"))
-            .ok_or_else(|| Error::BadUrl(url.to_string()))?;
-        let authority = rest.split('/').next().unwrap_or(rest);
-        if authority.is_empty() || !authority.contains(':') {
-            return Err(Error::BadUrl(url.to_string()));
-        }
-        Ok(Self {
-            url: url.to_string(),
+    pub fn from_url(url: &str) -> Result<Self, Error> {
+        let parsed = parse_url(url)?;
+        Ok(Self::build(parsed.url, basic_auth(&parsed.user, &parsed.password), None))
+    }
+
+    fn build(url: String, authorization: String, cookie_path: Option<PathBuf>) -> Self {
+        Self {
+            url,
             authorization: Arc::new(Mutex::new(authorization)),
             cookie_path,
             timeout: DEFAULT_TIMEOUT,
-        })
+        }
     }
 
     fn refresh_cookie(&self) -> bool {
@@ -218,15 +258,15 @@ impl Client {
                 return Err(if status == 200 {
                     Error::BadResponse(e.to_string())
                 } else {
-                    Error::Http(status, json.to_string())
+                    Error::Http { status, body: json.to_string() }
                 });
             }
         };
         if !parsed["error"].is_null() {
-            return Err(Error::Rpc(parsed["error"].to_string()));
+            return Err(Error::from_rpc_object(&parsed["error"]));
         }
         if status != 200 {
-            return Err(Error::Http(status, json.to_string()));
+            return Err(Error::Http { status, body: json.to_string() });
         }
         parsed
             .get("result")
@@ -351,39 +391,68 @@ mod tests {
         let c = Client::new("https://node.example:8332", "u", "p").unwrap();
         assert_eq!(c.url, "https://node.example:8332");
 
-        for bad in ["127.0.0.1:18443", "ftp://127.0.0.1:18443", "http://", "http://nohost"] {
+        let c = Client::new("http://nohost", "u", "p").unwrap();
+        assert_eq!(c.url, "http://nohost:80", "the scheme's port applies");
+
+        for bad in ["127.0.0.1:18443", "ftp://127.0.0.1:18443", "http://"] {
             assert!(Client::new(bad, "x", "y").is_err(), "{bad:?} should not parse");
         }
     }
 
     #[test]
     fn recognizes_a_credential_the_node_refuses() {
-        assert!(Error::Http(401, "Unauthorized".into()).is_unauthorized());
-        assert!(Error::Http(403, String::new()).is_unauthorized());
+        assert!(Error::Http { status: 401, body: "Unauthorized".into() }.is_unauthorized());
+        assert!(Error::Http { status: 403, body: String::new() }.is_unauthorized());
         for other in [
-            Error::Http(500, "internal".into()),
-            Error::Http(404, String::new()),
-            Error::Rpc(r#"{"code":-8}"#.to_string()),
+            Error::Http { status: 500, body: "internal".into() },
+            Error::Http { status: 404, body: String::new() },
+            rpc_error(-8, "Invalid parameter"),
             Error::BadResponse("no status code".into()),
         ] {
             assert!(!other.is_unauthorized(), "{other} is not a refused credential");
         }
     }
 
+    fn rpc_error(code: i64, message: &str) -> Error {
+        Error::from_rpc_object(&serde_json::json!({"code": code, "message": message}))
+    }
+
+    #[test]
+    fn an_error_object_is_read_into_its_code_and_message() {
+        let e = rpc_error(-5, "Block not found");
+        assert!(matches!(&e, Error::Rpc { code: -5, message } if message == "Block not found"));
+        assert_eq!(e.to_string(), "rpc error -5: Block not found");
+        let bare = Error::from_rpc_object(&serde_json::json!("string error"));
+        assert!(matches!(&bare, Error::Rpc { code: 0, message } if message == "\"string error\""));
+    }
+
     #[test]
     fn recognizes_a_hash_the_node_stores_no_block_under() {
-        let missing = Error::Rpc(r#"{"code":-5,"message":"Block not found"}"#.to_string());
-        assert!(missing.is_not_found());
-
+        assert!(rpc_error(-5, "Block not found").is_not_found());
         for other in [
-            Error::Rpc(r#"{"code":-8,"message":"Block height out of range"}"#.to_string()),
-            Error::Rpc(r#"{"code":-32601,"message":"Method not found"}"#.to_string()),
-            Error::Http(404, String::new()),
+            rpc_error(-8, "Block height out of range"),
+            rpc_error(-32601, "Method not found"),
+            rpc_error(-1, "Block not found"),
+            Error::Http { status: 404, body: String::new() },
             Error::BadResponse("no confirmations in getblockheader".into()),
         ] {
-            let missing_method = other.is_method_not_found();
-            assert_eq!(other.is_not_found(), missing_method, "{other}");
+            assert!(!other.is_not_found(), "{other} is not a missing block: the code decides");
         }
+    }
+
+    #[test]
+    fn urls_take_both_schemes_and_optional_credentials() {
+        assert!(Client::from_url("http://u:p@127.0.0.1:8332").is_ok());
+        assert!(Client::from_url("https://u:p@node.example:8332").is_ok());
+        assert!(Client::from_url("http://127.0.0.1:8332").is_ok());
+        assert!(matches!(Client::from_url("ftp://127.0.0.1:8332"), Err(Error::BadUrl(_))));
+        assert!(matches!(Client::from_url("127.0.0.1:8332"), Err(Error::BadUrl(_))));
+        assert_eq!(
+            Client::from_url("http://nohost").map(|c| c.url).ok(),
+            Some("http://nohost:80".to_string()),
+            "the scheme's port applies"
+        );
+        assert!(Client::from_url("http://").is_err());
     }
 
     #[test]
@@ -405,12 +474,12 @@ mod tests {
 
     #[test]
     fn recognizes_a_method_the_node_does_not_serve() {
-        let missing = Error::Rpc(r#"{"code":-32601,"message":"Method not found"}"#.to_string());
-        assert!(missing.is_method_not_found());
+        assert!(rpc_error(-32601, "Method not found").is_method_not_found());
 
         for other in [
-            Error::Rpc(r#"{"code":-8,"message":"Block height out of range"}"#.to_string()),
-            Error::Http(500, "internal".into()),
+            rpc_error(-8, "Block height out of range"),
+            rpc_error(-5, "Method not found"),
+            Error::Http { status: 500, body: "internal".into() },
             Error::BadResponse("no header/body split".into()),
             Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out")),
         ] {

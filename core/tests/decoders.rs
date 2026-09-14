@@ -1,9 +1,9 @@
 use ratum::bitcoin;
-use ratum::datum::messages::{
-    ClientConfig, CoinbaserRequest, CoinbaserResponse, RejectReason, ShareResponse, ShareVerdict,
-};
-use ratum::datum::share::{Blake2bSection, CoinbaseSection, JobSection, PowSubmit};
-use ratum::datum::validation::{self, TxnList, TxnListStatus};
+use ratum::datum::messages::coinbaser::{CoinbaserRequest, CoinbaserResponse};
+use ratum::datum::messages::config::ClientConfig;
+use ratum::datum::messages::share::{Blake2bSection, CoinbaseSection, JobSection, PowSubmit};
+use ratum::datum::messages::share_response::{RejectReason, ShareResponse, ShareVerdict};
+use ratum::datum::messages::validation::{self, TxnList, TxnListStatus};
 use ratum::header::{self, BlockHeaderV2};
 use ratum::target;
 
@@ -44,9 +44,9 @@ fn feed_everything(blob: &[u8]) {
     let _ = TxnList::decode(blob, validation::response::TXNS);
     let _ = TxnList::decode(blob, validation::response::BLOCK_TXNS);
     let _ = BlockHeaderV2::deserialize(blob);
-    let _ = bitcoin::parse_coinbase(blob);
-    let _ = bitcoin::txid(blob);
-    let _ = bitcoin::script_pushes(blob);
+    let _ = bitcoin::transaction::parse_coinbase(blob);
+    let _ = bitcoin::transaction::txid(blob);
+    let _ = bitcoin::script::script_pushes(blob);
     if blob.len() >= 4 {
         let bits = u32::from_le_bytes(blob[..4].try_into().unwrap());
         let _ = target::bits_to_target(bits);
@@ -221,7 +221,7 @@ fn a_damaged_coinbaser_response_is_refused_or_reproduces_itself() {
         value: 312_500_000,
         coinbaser_id: 9,
         outputs: (0..6)
-            .map(|i| bitcoin::TxOut {
+            .map(|i| bitcoin::transaction::TxOut {
                 value: 1_000_000 + i,
                 script_pubkey: vec![0x00, 0x14, i as u8],
             })
@@ -311,11 +311,12 @@ fn hashing_never_panics_on_a_header_that_deserialized() {
         let stages = header.hash_stages();
         let asic_input = header.asic_input_with(&stages.work_root, &stages.h2);
         assert_eq!(asic_input.len(), header::ASIC_INPUT_LEN[header.asic_profile() as usize]);
-        let (pow, block) = header.raw_pow_and_block_hash();
-        assert_eq!((pow, block), header.raw_pow_and_block_hash(), "hashing is deterministic");
-        assert_eq!(header::blake2b_256(&asic_input), pow);
-        let masked: Vec<u8> = pow.iter().zip(stages.xor_key_mask).map(|(b, m)| b ^ m).collect();
-        assert_eq!(masked, block);
+        let hashes = header.pow_hashes();
+        assert_eq!(hashes, header.pow_hashes(), "hashing is deterministic");
+        assert_eq!(header::blake2b_256(&asic_input), hashes.raw_pow_hash);
+        let masked: Vec<u8> =
+            hashes.raw_pow_hash.iter().zip(stages.xor_key_mask).map(|(b, m)| b ^ m).collect();
+        assert_eq!(masked, hashes.block_hash);
     }
 }
 
@@ -337,11 +338,12 @@ fn a_coinbase_that_parses_reports_its_script_sig_offset_output_total_and_txid() 
         tx.extend_from_slice(&[0x00, 0x14]);
         tx.extend_from_slice(&[0u8; 4]);
 
-        let parsed = bitcoin::parse_coinbase(&tx).expect("a coinbase we built must parse");
+        let parsed =
+            bitcoin::transaction::parse_coinbase(&tx).expect("a coinbase we built must parse");
         assert_eq!(parsed.script_sig, script);
         assert_eq!(&tx[parsed.script_sig_offset..][..script_len], &script[..]);
         assert_eq!(parsed.outputs.iter().map(|o| o.value).sum::<u64>(), 5_000_000_000);
-        assert_eq!(bitcoin::txid(&tx).expect("txid"), bitcoin::sha256d(&tx));
+        assert_eq!(bitcoin::transaction::txid(&tx).expect("txid"), bitcoin::sha256d(&tx));
     }
 }
 

@@ -1,20 +1,23 @@
 use crate::template::Template;
-use ratum::bitcoin::opcode::{
+use ratum::bitcoin::script::encode_push;
+use ratum::bitcoin::script::opcode::{
     OP_0, OP_16, OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY, OP_CHECKSIG, OP_CHECKSIGVERIFY,
     OP_N_BASE, OP_RETURN,
 };
-use ratum::bitcoin::{
-    HASH_SIZE, LOCK_TIME_SIZE, MIN_OUTPUT_SIZE, NULL_OUTPOINT_INDEX, OUTPOINT_SIZE, SEQUENCE_FINAL,
-    SEQUENCE_SIZE, TX_VERSION_SIZE, TxOut, WITNESS_SCALE_FACTOR, encode_compact_size,
-    encode_output, encode_push,
+use ratum::bitcoin::transaction::{
+    LOCK_TIME_SIZE, MIN_OUTPUT_SIZE, NULL_OUTPOINT_INDEX, OUTPOINT_SIZE, SEQUENCE_FINAL,
+    SEQUENCE_SIZE, TX_VERSION_SIZE, TxOut, encode_output,
 };
+use ratum::bitcoin::{HASH_SIZE, WITNESS_SCALE_FACTOR, encode_compact_size};
 use ratum::datum::coinbase::{
     EXTRANONCE_PUSH_OPCODE, EXTRANONCE_PUSH_SIZE, UNIQUE_ID_PUSH_TARGET_BYTE_AT, tag_push_data,
     unique_id_push,
 };
-use ratum::datum::share::{EXTRANONCE_SIZE, MAX_COINBASE_SECTION_BYTES};
+use ratum::datum::messages::share::{EXTRANONCE_SIZE, MAX_COINBASE_SECTION_LEN};
 
 pub const MAX_COINBASE_SCRIPT_SIG_LEN: usize = 100;
+pub const MAX_COINBASE_TAG_SPACE: usize = 86;
+pub const WIDE_PRIME_PUSH_EXTRA_BYTES: usize = 4;
 
 pub const SCRIPT_SIG_ROOM_FOR_EXTRANONCE: usize =
     MAX_COINBASE_SCRIPT_SIG_LEN - EXTRANONCE_PUSH_SIZE;
@@ -23,6 +26,14 @@ const OP_RETURN_EXTRANONCE_OUTPUT_SIZE: usize = MIN_OUTPUT_SIZE + 1 + EXTRANONCE
 
 const OP_RETURN_EXTRANONCE_EXTRA_BYTES: usize =
     OP_RETURN_EXTRANONCE_OUTPUT_SIZE - EXTRANONCE_PUSH_SIZE;
+
+const COINBASE_TX_VERSION: u32 = 1;
+const PRUNABLE_OP_RETURN: [u8; 3] = [OP_RETURN, 0x01, 0x00];
+const MIN_USEFUL_OUTPUT_ROOM: usize = 30;
+const MAX_TXN_COUNT_SIZE: usize = 5;
+const COINBASE_WITNESS_BYTES: u64 = 36;
+
+pub const COINBASE_ID_POOLED: u8 = 1;
 
 fn static_bytes(witness_commitment_len: usize) -> usize {
     const NULL_INPUT: usize = 1 + OUTPOINT_SIZE + 1;
@@ -103,7 +114,13 @@ pub fn height_push(height: u32) -> Vec<u8> {
     }
 }
 
-pub fn script_sig(t: &ScriptSigInputs<'_>) -> Result<(Vec<u8>, usize), String> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptSig {
+    pub bytes: Vec<u8>,
+    pub target_byte_index: usize,
+}
+
+pub fn script_sig(t: &ScriptSigInputs<'_>) -> Option<ScriptSig> {
     let mut script = height_push(t.height);
     script.extend_from_slice(&encode_push(&tag_push_data_that_fits(t)?));
     let prime_id = if t.prime_id == 0 && !t.datum_active {
@@ -115,24 +132,21 @@ pub fn script_sig(t: &ScriptSigInputs<'_>) -> Result<(Vec<u8>, usize), String> {
     };
     let target_byte_index = script.len() + UNIQUE_ID_PUSH_TARGET_BYTE_AT;
     script.extend_from_slice(&unique_id_push(t.unique_id, prime_id));
-    Ok((script, target_byte_index))
+    Some(ScriptSig { bytes: script, target_byte_index })
 }
 
-fn tag_push_data_that_fits(t: &ScriptSigInputs<'_>) -> Result<Vec<u8>, String> {
+fn tag_push_data_that_fits(t: &ScriptSigInputs<'_>) -> Option<Vec<u8>> {
     let tag0 = t.tag_primary.as_bytes();
     let tag1 = t.tag_secondary.as_bytes();
-    let tag_space = crate::config::MAX_COINBASE_TAG_SPACE
-        - if t.wide_prime { crate::config::WIDE_PRIME_PUSH_EXTRA_BYTES } else { 0 };
+    let tag_space =
+        MAX_COINBASE_TAG_SPACE - if t.wide_prime { WIDE_PRIME_PUSH_EXTRA_BYTES } else { 0 };
     let mut data = tag_push_data(tag0, tag1);
     if data.len() > tag_space {
         let excess = data.len() - tag_space;
         let kept = if tag1.len() > excess { &tag1[..tag1.len() - excess] } else { &[][..] };
         data = tag_push_data(tag0, kept);
     }
-    if data.len() > tag_space {
-        return Err("the coinbase tags do not fit".into());
-    }
-    Ok(data)
+    (data.len() <= tag_space).then_some(data)
 }
 
 pub struct CoinbaseSpec<'a> {
@@ -147,12 +161,12 @@ pub struct CoinbaseSpec<'a> {
     pub sigop_budget: u64,
 }
 
-const COINBASE_TX_VERSION: u32 = 1;
-const PRUNABLE_OP_RETURN: [u8; 3] = [OP_RETURN, 0x01, 0x00];
+pub struct BuiltCoinbase {
+    pub coinbase: StratumCoinbase,
+    pub included_outputs: Vec<TxOut>,
+}
 
-const MIN_USEFUL_OUTPUT_ROOM: usize = 30;
-
-pub fn build(p: &CoinbaseSpec<'_>) -> (StratumCoinbase, Vec<TxOut>) {
+pub fn build(p: &CoinbaseSpec<'_>) -> BuiltCoinbase {
     let in_script = p.script_sig.len() <= SCRIPT_SIG_ROOM_FOR_EXTRANONCE;
 
     let mut included = Vec::new();
@@ -213,10 +227,11 @@ pub fn build(p: &CoinbaseSpec<'_>) -> (StratumCoinbase, Vec<TxOut>) {
         coinb2.extend_from_slice(&encode_output(0, wc));
     }
     coinb2.extend_from_slice(&[0u8; LOCK_TIME_SIZE]);
-    (StratumCoinbase { coinb1, coinb2, target_byte_index }, included)
+    BuiltCoinbase {
+        coinbase: StratumCoinbase { coinb1, coinb2, target_byte_index },
+        included_outputs: included,
+    }
 }
-
-pub const COINBASE_ID_POOLED: u8 = 1;
 
 pub fn output_budget(fixed_bytes: usize, t: &Template) -> usize {
     let around = (ratum::header::HEADER_V2_SIZE + MAX_TXN_COUNT_SIZE) as u64;
@@ -225,18 +240,14 @@ pub fn output_budget(fixed_bytes: usize, t: &Template) -> usize {
     let weight_used =
         u64::from(t.totals.weight) + WITNESS_SCALE_FACTOR * around + COINBASE_WITNESS_BYTES;
     let by_weight = t.weightlimit.saturating_sub(weight_used) / WITNESS_SCALE_FACTOR;
-    let room = by_size.min(by_weight).min(MAX_COINBASE_SECTION_BYTES as u64) as usize;
+    let room = by_size.min(by_weight).min(MAX_COINBASE_SECTION_LEN as u64) as usize;
     room.saturating_sub(fixed_bytes)
 }
-
-const MAX_TXN_COUNT_SIZE: usize = 5;
-
-const COINBASE_WITNESS_BYTES: u64 = 36;
 
 pub fn output_sigop_cost(script: &[u8]) -> u64 {
     const MAX_PUBKEYS_PER_MULTISIG: u64 = 20;
 
-    ratum::bitcoin::script_ops(script)
+    ratum::bitcoin::script::script_ops(script)
         .map(|op| match op.opcode {
             OP_CHECKSIG | OP_CHECKSIGVERIFY => WITNESS_SCALE_FACTOR,
             OP_CHECKMULTISIG | OP_CHECKMULTISIGVERIFY => {
@@ -276,28 +287,28 @@ mod tests {
 
     #[test]
     fn script_sig_layout_is_what_the_pool_parses() {
-        let (s, target_byte_index) = script_sig(&tagging(21)).unwrap();
-        let pushes = ratum::bitcoin::script_pushes(&s);
+        let ScriptSig { bytes: s, target_byte_index } = script_sig(&tagging(21)).unwrap();
+        let pushes = ratum::bitcoin::script::script_pushes(&s);
         assert_eq!(pushes.len(), 3);
-        assert_eq!(pushes[0].1, &[21][..]);
-        assert_eq!(pushes[1].1, b"RATUM\x0fe2e\x00");
-        assert_eq!(pushes[2].1.len(), 7);
-        assert_eq!(pushes[2].0, target_byte_index);
-        assert_eq!(&pushes[2].1[3..], &7u32.to_le_bytes());
-        assert_eq!(&pushes[2].1[1..3], &4242u16.to_le_bytes());
+        assert_eq!(pushes[0].data, &[21][..]);
+        assert_eq!(pushes[1].data, b"RATUM\x0fe2e\x00");
+        assert_eq!(pushes[2].data.len(), 7);
+        assert_eq!(pushes[2].data_at, target_byte_index);
+        assert_eq!(&pushes[2].data[3..], &7u32.to_le_bytes());
+        assert_eq!(&pushes[2].data[1..3], &4242u16.to_le_bytes());
         assert_eq!(s[target_byte_index], 0xff);
 
         let mut t = tagging(21);
         t.tag_secondary = "";
-        let (s, _) = script_sig(&t).unwrap();
-        assert_eq!(ratum::bitcoin::script_pushes(&s)[1].1, b"RATUM\x00");
+        let s = script_sig(&t).unwrap().bytes;
+        assert_eq!(ratum::bitcoin::script::script_pushes(&s)[1].data, b"RATUM\x00");
 
         t.tag_primary = "";
-        let (s, target_byte_index) = script_sig(&t).unwrap();
-        let pushes = ratum::bitcoin::script_pushes(&s);
+        let ScriptSig { bytes: s, target_byte_index } = script_sig(&t).unwrap();
+        let pushes = ratum::bitcoin::script::script_pushes(&s);
         assert_eq!(pushes.len(), 3);
-        assert_eq!(pushes[1].1, b"\x00");
-        assert_eq!(pushes[2].0, target_byte_index);
+        assert_eq!(pushes[1].data, b"\x00");
+        assert_eq!(pushes[2].data_at, target_byte_index);
     }
 
     #[test]
@@ -305,10 +316,10 @@ mod tests {
         let mut t = tagging(21);
         t.prime_id = 0;
         t.datum_active = false;
-        let (s, target_byte_index) = script_sig(&t).unwrap();
-        let pushes = ratum::bitcoin::script_pushes(&s);
-        assert_eq!(pushes[2].1.len(), 3);
-        assert_eq!(pushes[2].0, target_byte_index);
+        let ScriptSig { bytes: s, target_byte_index } = script_sig(&t).unwrap();
+        let pushes = ratum::bitcoin::script::script_pushes(&s);
+        assert_eq!(pushes[2].data.len(), 3);
+        assert_eq!(pushes[2].data_at, target_byte_index);
     }
 
     fn spec<'a>(
@@ -350,7 +361,7 @@ mod tests {
 
     #[test]
     fn outputs_past_the_sigop_budget_are_left_out() {
-        let (script, target_byte_index) = script_sig(&tagging(21)).unwrap();
+        let ScriptSig { bytes: script, target_byte_index } = script_sig(&tagging(21)).unwrap();
         let outputs = vec![
             TxOut { value: 100_000_000, script_pubkey: p2pkh(1) },
             TxOut { value: 50_000_000, script_pubkey: p2pkh(2) },
@@ -358,23 +369,23 @@ mod tests {
         ];
         let mut p = spec(&script, target_byte_index, &outputs, None);
         p.sigop_budget = 4;
-        let (_, included) = build(&p);
+        let included = build(&p).included_outputs;
         assert_eq!(included.len(), 2);
         assert_eq!(included[0].script_pubkey, p2pkh(1));
         assert_eq!(included[1].value, 10_000_000);
         p.sigop_budget = 0;
-        let (_, included) = build(&p);
+        let included = build(&p).included_outputs;
         assert_eq!(included.len(), 1, "only the segwit output");
     }
 
     #[test]
     fn the_output_budget_is_the_templates_room_capped_at_the_pools_section_limit() {
-        let mut t = crate::template::tests::template();
+        let mut t = crate::fixtures::template();
         let size_used = t.totals.size as u64 + 85 + 84 + 36;
         let weight_used = t.totals.weight as u64 + 340 + 336 + 36;
         t.sizelimit = 4_000_000;
         t.weightlimit = 4_000_000;
-        assert_eq!(output_budget(100, &t), MAX_COINBASE_SECTION_BYTES - 100);
+        assert_eq!(output_budget(100, &t), MAX_COINBASE_SECTION_LEN - 100);
         t.weightlimit = weight_used + 4 * 1_000;
         assert_eq!(output_budget(100, &t), 900);
         t.weightlimit = 4_000_000;
@@ -402,18 +413,19 @@ mod tests {
             TxOut { value: 50_000_000, script_pubkey: ratum::fixtures::p2wpkh(2) },
         ];
         for t in [tagging(21), long_tagging()] {
-            let (script, target_byte_index_in_script) = script_sig(&t).unwrap();
+            let ScriptSig { bytes: script, target_byte_index: target_byte_index_in_script } =
+                script_sig(&t).unwrap();
             let force = script.len() > SCRIPT_SIG_ROOM_FOR_EXTRANONCE;
-            let (cb, included) =
+            let BuiltCoinbase { coinbase: cb, included_outputs: included } =
                 build(&spec(&script, target_byte_index_in_script, &outputs, Some(&wc)));
             assert_eq!(included.len(), 2);
             let tx = cb.assemble(&[0u8; 12]);
             assert_eq!(tx[cb.target_byte_index], 0xff);
-            let parsed = ratum::bitcoin::parse_coinbase(&tx).unwrap();
+            let parsed = ratum::bitcoin::transaction::parse_coinbase(&tx).unwrap();
             assert!(!parsed.has_witness);
-            let pushes = ratum::bitcoin::script_pushes(&parsed.script_sig);
-            let unique_id_push = pushes.iter().find(|(_, d)| d.len() == 7).unwrap();
-            assert_eq!(parsed.script_sig_offset + unique_id_push.0, cb.target_byte_index);
+            let pushes = ratum::bitcoin::script::script_pushes(&parsed.script_sig);
+            let unique_id_push = pushes.iter().find(|p| p.data.len() == 7).unwrap();
+            assert_eq!(parsed.script_sig_offset + unique_id_push.data_at, cb.target_byte_index);
             let total: u64 = parsed.outputs.iter().map(|o| o.value).sum();
             assert_eq!(total, 312_500_000);
             assert_eq!(parsed.outputs.len(), if force { 5 } else { 4 });
@@ -432,24 +444,24 @@ mod tests {
 
     #[test]
     fn the_wide_prime_push_takes_four_bytes_from_the_tags_and_stays_within_100() {
-        let v1 = script_sig(&tagging(21)).unwrap().0;
+        let v1 = script_sig(&tagging(21)).unwrap().bytes;
         let mut t = tagging(21);
         t.wide_prime = true;
-        let v3 = script_sig(&t).unwrap().0;
+        let v3 = script_sig(&t).unwrap().bytes;
         assert_eq!(v3.len(), v1.len() + 4);
-        assert_eq!(ratum::bitcoin::script_pushes(&v3).last().unwrap().1.len(), 11);
+        assert_eq!(ratum::bitcoin::script::script_pushes(&v3).last().unwrap().data.len(), 11);
 
         let mut t = long_tagging();
-        let v1 = script_sig(&t).unwrap().0;
+        let v1 = script_sig(&t).unwrap().bytes;
         t.wide_prime = true;
-        let v3 = script_sig(&t).unwrap().0;
+        let v3 = script_sig(&t).unwrap().bytes;
         assert!(v1.len() <= 100);
         assert!(
             v3.len() <= 100,
             "wide prime push must not push the scriptSig past 100: {}",
             v3.len()
         );
-        let tags = |s: &[u8]| ratum::bitcoin::script_pushes(s)[1].1.len();
+        let tags = |s: &[u8]| ratum::bitcoin::script::script_pushes(s)[1].data.len();
         assert_eq!(
             tags(&v3) + 4,
             tags(&v1),
@@ -459,26 +471,27 @@ mod tests {
 
     #[test]
     fn a_long_script_sig_moves_the_extranonce_to_an_output() {
-        let (script, target_byte_index) = script_sig(&long_tagging()).unwrap();
+        let ScriptSig { bytes: script, target_byte_index } = script_sig(&long_tagging()).unwrap();
         assert!(script.len() > SCRIPT_SIG_ROOM_FOR_EXTRANONCE);
         assert!(script.len() <= MAX_COINBASE_SCRIPT_SIG_LEN);
-        let (cb, _) = build(&spec(&script, target_byte_index, &[], None));
+        let cb = build(&spec(&script, target_byte_index, &[], None)).coinbase;
         let tx = cb.assemble(&[0u8; 12]);
-        let parsed = ratum::bitcoin::parse_coinbase(&tx).unwrap();
+        let parsed = ratum::bitcoin::transaction::parse_coinbase(&tx).unwrap();
         assert_eq!(parsed.outputs.len(), 2);
         assert_eq!(parsed.outputs[0].script_pubkey[0], 0x6a);
     }
 
     #[test]
     fn a_split_taking_the_whole_value_leaves_the_pool_a_prunable_output() {
-        let (script, target_byte_index) = script_sig(&tagging(21)).unwrap();
+        let ScriptSig { bytes: script, target_byte_index } = script_sig(&tagging(21)).unwrap();
         let outputs = vec![
             TxOut { value: 312_500_000 - 100, script_pubkey: ratum::fixtures::p2wpkh(1) },
             TxOut { value: 100, script_pubkey: ratum::fixtures::p2wpkh(2) },
         ];
-        let (cb, included) = build(&spec(&script, target_byte_index, &outputs, None));
+        let BuiltCoinbase { coinbase: cb, included_outputs: included } =
+            build(&spec(&script, target_byte_index, &outputs, None));
         assert_eq!(included.len(), 2, "an output that exactly exhausts the value is still paid");
-        let parsed = ratum::bitcoin::parse_coinbase(&cb.assemble(&[0u8; 12])).unwrap();
+        let parsed = ratum::bitcoin::transaction::parse_coinbase(&cb.assemble(&[0u8; 12])).unwrap();
         assert_eq!(parsed.outputs.iter().map(|o| o.value).sum::<u64>(), 312_500_000);
         let last = parsed.outputs.last().unwrap();
         assert_eq!(last.value, 0);
@@ -487,7 +500,7 @@ mod tests {
 
     #[test]
     fn outputs_over_the_value_or_budget_are_left_out() {
-        let (script, target_byte_index) = script_sig(&tagging(21)).unwrap();
+        let ScriptSig { bytes: script, target_byte_index } = script_sig(&tagging(21)).unwrap();
         let outputs = vec![
             TxOut { value: 300_000_000, script_pubkey: ratum::fixtures::p2wpkh(1) },
             TxOut { value: 50_000_000, script_pubkey: ratum::fixtures::p2wpkh(2) },
@@ -495,10 +508,10 @@ mod tests {
         ];
         let mut p = spec(&script, target_byte_index, &outputs, None);
         p.output_budget = 31 + 31 + 20;
-        let (cb, included) = build(&p);
+        let BuiltCoinbase { coinbase: cb, included_outputs: included } = build(&p);
         assert_eq!(included.len(), 2);
         assert_eq!(included[1].value, 10_000_000);
-        let parsed = ratum::bitcoin::parse_coinbase(&cb.assemble(&[0u8; 12])).unwrap();
+        let parsed = ratum::bitcoin::transaction::parse_coinbase(&cb.assemble(&[0u8; 12])).unwrap();
         assert_eq!(parsed.outputs[2].value, 2_500_000);
     }
 }

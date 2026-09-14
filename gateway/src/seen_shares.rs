@@ -17,7 +17,7 @@ impl SeenShareHashes {
         Self { seen: HashMap::new(), capacity: capacity.max(MIN_CAPACITY), window }
     }
 
-    pub fn insert(&mut self, h: [u8; 32], job_created: Instant) -> bool {
+    pub fn insert(&mut self, h: [u8; 32], job_created_at: Instant) -> bool {
         if self.seen.contains_key(&h) {
             return false;
         }
@@ -34,7 +34,7 @@ impl SeenShareHashes {
                 );
             }
         }
-        self.seen.insert(h, job_created);
+        self.seen.insert(h, job_created_at);
         true
     }
 }
@@ -42,12 +42,7 @@ impl SeenShareHashes {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn hash(i: u32) -> [u8; 32] {
-        let mut h = [0u8; 32];
-        h[..4].copy_from_slice(&i.to_le_bytes());
-        h
-    }
+    use crate::fixtures::hash;
 
     #[test]
     fn a_repeated_share_is_refused() {

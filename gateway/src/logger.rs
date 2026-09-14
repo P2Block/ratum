@@ -1,3 +1,4 @@
+use crate::config::{LoggerConfig, StartupNote};
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
@@ -46,7 +47,7 @@ impl Sink {
 
 pub struct Logger {
     sinks: Vec<Sink>,
-    max: LevelFilter,
+    max_level: LevelFilter,
     calling_function: bool,
 }
 
@@ -94,7 +95,7 @@ impl Logger {
 
 impl Log for Logger {
     fn enabled(&self, m: &Metadata) -> bool {
-        m.level() <= self.max
+        m.level() <= self.max_level
     }
 
     fn log(&self, r: &Record) {
@@ -114,7 +115,7 @@ impl Log for Logger {
     }
 }
 
-fn build(cfg: &crate::config::LoggerConfig) -> Result<(Logger, Vec<(Level, String)>), String> {
+fn build(cfg: &LoggerConfig) -> Result<(Logger, Vec<StartupNote>), String> {
     let mut notes = Vec::new();
     let mut sinks = Vec::with_capacity(2);
 
@@ -123,10 +124,10 @@ fn build(cfg: &crate::config::LoggerConfig) -> Result<(Logger, Vec<(Level, Strin
         if let Ok(spec) = std::env::var("RUST_LOG") {
             match spec.trim().parse::<LevelFilter>() {
                 Ok(l) => level = l,
-                Err(_) => notes.push((
-                    Level::Warn,
-                    format!("RUST_LOG={spec:?} is not a level name (off, error, warn, info, debug, trace); ignored"),
-                )),
+                Err(_) => notes.push(StartupNote {
+                    level: Level::Warn,
+                    message: format!("RUST_LOG={spec:?} is not a level name (off, error, warn, info, debug, trace); ignored"),
+                }),
             }
         }
         let output = if cfg.log_to_stderr { Output::Stderr } else { Output::Stdout };
@@ -141,15 +142,15 @@ fn build(cfg: &crate::config::LoggerConfig) -> Result<(Logger, Vec<(Level, Strin
         sinks.push(Sink { output: Output::File(file), level: level_of(cfg.log_level_file) });
     }
 
-    let max = sinks.iter().map(|s| s.level).max().unwrap_or(LevelFilter::Off);
-    Ok((Logger { sinks, max, calling_function: cfg.log_calling_function }, notes))
+    let max_level = sinks.iter().map(|s| s.level).max().unwrap_or(LevelFilter::Off);
+    Ok((Logger { sinks, max_level, calling_function: cfg.log_calling_function }, notes))
 }
 
-pub fn init(cfg: &crate::config::LoggerConfig) -> Result<Vec<(Level, String)>, String> {
+pub fn init(cfg: &LoggerConfig) -> Result<Vec<StartupNote>, String> {
     let (logger, notes) = build(cfg)?;
-    let max = logger.max;
+    let max_level = logger.max_level;
     if log::set_boxed_logger(Box::new(logger)).is_ok() {
-        log::set_max_level(max);
+        log::set_max_level(max_level);
     }
     Ok(notes)
 }
@@ -181,7 +182,7 @@ mod tests {
         let file = OpenOptions::new().create(true).append(true).open(&path).unwrap();
         let logger = Logger {
             sinks: vec![Sink { output: Output::File(file), level: LevelFilter::Info }],
-            max: LevelFilter::Info,
+            max_level: LevelFilter::Info,
             calling_function: true,
         };
         logger.log(

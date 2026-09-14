@@ -1,4 +1,4 @@
-use crate::template::TemplateWaker;
+use crate::template::waker::TemplateWaker;
 use log::{info, warn};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};

@@ -3,12 +3,25 @@ use std::collections::VecDeque;
 pub const INTERVAL_SECS: u64 = crate::SECS_PER_MINUTE;
 const HISTORY_CAP: usize = (crate::SECS_PER_DAY / INTERVAL_SECS) as usize;
 
-pub type HashrateHistory = VecDeque<(u64, f64)>;
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HashrateSample {
+    pub sampled_at: u64,
+    pub hashes_per_second: f64,
+}
 
-pub fn push_sample(history: &mut HashrateHistory, at: u64, hashes_per_second: f64) {
-    history.push_back((at, hashes_per_second));
-    while history.len() > HISTORY_CAP {
-        history.pop_front();
+#[derive(Debug, Default)]
+pub struct HashrateHistory(VecDeque<HashrateSample>);
+
+impl HashrateHistory {
+    pub fn push(&mut self, sample: HashrateSample) {
+        self.0.push_back(sample);
+        while self.0.len() > HISTORY_CAP {
+            self.0.pop_front();
+        }
+    }
+
+    pub fn samples(&self) -> impl Iterator<Item = &HashrateSample> {
+        self.0.iter()
     }
 }
 
@@ -28,11 +41,15 @@ mod tests {
 
     #[test]
     fn history_keeps_the_newest_cap_samples() {
-        let mut h = HashrateHistory::new();
+        let mut h = HashrateHistory::default();
         for i in 0..(HISTORY_CAP as u64 + 5) {
-            push_sample(&mut h, i, 1.0);
+            h.push(HashrateSample { sampled_at: i, hashes_per_second: 1.0 });
         }
-        assert_eq!(h.len(), HISTORY_CAP);
-        assert_eq!(h.front().copied(), Some((5, 1.0)), "the oldest five were discarded");
+        assert_eq!(h.0.len(), HISTORY_CAP);
+        assert_eq!(
+            h.samples().next().copied(),
+            Some(HashrateSample { sampled_at: 5, hashes_per_second: 1.0 }),
+            "the oldest five were discarded"
+        );
     }
 }

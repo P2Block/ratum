@@ -10,6 +10,13 @@ const EVENT_CAPACITY: usize = 8;
 
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fill {
+    Complete,
+    Partial,
+    Closed,
+}
+
 pub struct PolledSocket {
     stream: TcpStream,
     poll: Poll,
@@ -58,6 +65,15 @@ impl PolledSocket {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    pub fn fill(&mut self, buf: &mut [u8], filled: &mut usize) -> io::Result<Fill> {
+        match self.read(&mut buf[*filled..])? {
+            Some(0) => return Ok(Fill::Closed),
+            Some(n) => *filled += n,
+            None => {}
+        }
+        Ok(if *filled == buf.len() { Fill::Complete } else { Fill::Partial })
     }
 
     pub fn read_exact(

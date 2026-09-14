@@ -1,14 +1,16 @@
-use super::{ClientEntry, ClientStats, Server};
+mod shares;
+
+use super::notify_id::{NotifyId, NotifyPrefix};
+use super::{ClientEntry, ClientStats, CurrentJob, Server};
 use crate::coinbase::COINBASE_ID_POOLED;
-use crate::datum::QueuedShare;
-use crate::job::{JOB_ID_TIME_CHARS, Job, NotifyId, parse_sia_field};
+use crate::job::Job;
 use crate::username;
-use crate::vardiff::{self, Vardiff};
-use log::{debug, info, warn};
-use ratum::datum::share::{
-    COINBASE_ID_SUBSIDY_ONLY, EXTRANONCE1_SIZE, EXTRANONCE2_SIZE, HEADER_EXTRANONCE_PAD,
-    HEADER_EXTRANONCE_SIZE, MAX_JOBS, SIA_FIELD_SIZE,
+use crate::vardiff::{self, Vardiff, VardiffEvent, VardiffUpdate};
+use log::{debug, info};
+use ratum::datum::messages::share::{
+    COINBASE_ID_SUBSIDY_ONLY, HEADER_EXTRANONCE_PAD, HEADER_EXTRANONCE_SIZE, MAX_JOBS,
 };
+use ratum::lock;
 use ratum::poll::{PolledSocket, WRITE_TIMEOUT};
 use ratum::target;
 use serde_json::{Value, json};
@@ -27,19 +29,31 @@ const IDLE_CHECK_INTERVAL: Duration = Duration::from_millis(11150);
 const FIRST_IDLE_CHECK_DELAY: Duration = Duration::from_secs(10);
 const READ_CHUNK: usize = 4096;
 const SESSION_ID_XOR: u32 = 0xB10C_F00D;
-const BLOCK_FOUND_LOG_LINES: usize = 3;
 const HASHRATE_WINDOW: Duration = Duration::from_secs(60);
+const EXTRANONCE1_SIZE: usize = HEADER_EXTRANONCE_PAD + size_of::<u32>();
+const EXTRANONCE2_SIZE: usize = HEADER_EXTRANONCE_SIZE - EXTRANONCE1_SIZE;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NotifyKind {
+    FirstJob,
+    JobUpdate,
+    EmptyWork,
+    Quickdiff,
+}
 
 #[derive(Clone, Copy)]
-struct StratumError(i64, &'static str);
+struct StratumError {
+    code: i64,
+    message: &'static str,
+}
 
-const UNKNOWN_WORK: StratumError = StratumError(20, "unknown-work");
-const STALE_WORK: StratumError = StratumError(21, "stale-work");
-const STALE_PREVBLK: StratumError = StratumError(21, "stale-prevblk");
-const DUPLICATE: StratumError = StratumError(22, "duplicate");
-const HIGH_HASH: StratumError = StratumError(23, "high-hash");
-const UNAUTHORIZED_WORKER: StratumError = StratumError(24, "unauthorized-worker");
-const METHOD_NOT_FOUND: StratumError = StratumError(-3, "Method not found");
+const UNKNOWN_WORK: StratumError = StratumError { code: 20, message: "unknown-work" };
+const STALE_WORK: StratumError = StratumError { code: 21, message: "stale-work" };
+const STALE_PREVBLK: StratumError = StratumError { code: 21, message: "stale-prevblk" };
+const DUPLICATE: StratumError = StratumError { code: 22, message: "duplicate" };
+const HIGH_HASH: StratumError = StratumError { code: 23, message: "high-hash" };
+const UNAUTHORIZED_WORKER: StratumError = StratumError { code: 24, message: "unauthorized-worker" };
+const METHOD_NOT_FOUND: StratumError = StratumError { code: -3, message: "Method not found" };
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum Disconnect {
@@ -53,37 +67,27 @@ pub(super) enum Disconnect {
     Killed,
 }
 
-struct SubmitRequest {
-    job: Arc<Job>,
-    job_diff: u64,
-    notify_id: NotifyId,
-    extranonce: [u8; HEADER_EXTRANONCE_SIZE],
-    ntime: [u8; SIA_FIELD_SIZE],
-    nonce: [u8; SIA_FIELD_SIZE],
-    miner_username: String,
-}
-
 pub(super) struct Connection {
     server: Arc<Server>,
     entry: Arc<ClientEntry>,
     socket: PolledSocket,
-    remote: String,
+    peer: String,
     sid: u32,
     subscribed: bool,
     username: String,
     vardiff: Vardiff,
     job_diffs: Vec<Option<u64>>,
     sent_generation: u64,
-    connected: Instant,
-    last_accepted: Option<Instant>,
+    connected_at: Instant,
+    last_accepted_at: Option<Instant>,
     diff_since_window_start: u64,
-    window_started: Instant,
+    window_started_at: Instant,
     next_idle_check: Instant,
 }
 
 impl Connection {
     pub(super) fn run(server: Arc<Server>, stream: TcpStream) -> Result<(), Disconnect> {
-        let remote = stream.peer_addr().map_or_else(|_| "?".to_string(), |a| a.to_string());
+        let peer = stream.peer_addr().map_or_else(|_| "?".to_string(), |a| a.to_string());
         stream.set_nodelay(true)?;
         let socket = PolledSocket::new(stream)?;
         let waker = Arc::new(socket.waker()?);
@@ -93,20 +97,20 @@ impl Connection {
             kill_requested: AtomicBool::new(false),
             waker,
             stats: Mutex::new(ClientStats {
-                remote: remote.clone(),
+                peer: peer.clone(),
                 unique_id,
                 current_diff: server.config.stratum.vardiff_min,
                 ..Default::default()
             }),
         });
-        ratum::lock(&server.clients).push(Arc::clone(&entry));
-        debug!("New Stratum client connected. {remote} ({unique_id})");
+        lock(&server.clients).push(Arc::clone(&entry));
+        debug!("New Stratum client connected. {peer} ({unique_id})");
         let now = Instant::now();
         let s = &server.config.stratum;
         let mut c = Self {
             entry: Arc::clone(&entry),
             socket,
-            remote,
+            peer,
             sid,
             subscribed: false,
             username: String::new(),
@@ -121,15 +125,15 @@ impl Connection {
             ),
             job_diffs: vec![None; MAX_JOBS],
             sent_generation: 0,
-            connected: now,
-            last_accepted: None,
+            connected_at: now,
+            last_accepted_at: None,
             diff_since_window_start: 0,
-            window_started: now,
+            window_started_at: now,
             next_idle_check: now + FIRST_IDLE_CHECK_DELAY,
             server: Arc::clone(&server),
         };
         let result = c.serve();
-        ratum::lock(&server.clients).retain(|e| !Arc::ptr_eq(e, &entry));
+        lock(&server.clients).retain(|e| !Arc::ptr_eq(e, &entry));
         debug!("Stratum client connection closed. ({:?})", result.as_ref().err());
         result
     }
@@ -175,26 +179,26 @@ impl Connection {
     }
 
     fn until_next_check(&self) -> Duration {
-        let due = self.next_idle_check.min(self.window_started + HASHRATE_WINDOW);
+        let due = self.next_idle_check.min(self.window_started_at + HASHRATE_WINDOW);
         due.saturating_duration_since(Instant::now())
     }
 
     fn with_stats(&self, f: impl FnOnce(&mut ClientStats)) {
-        f(&mut ratum::lock(&self.entry.stats));
+        f(&mut lock(&self.entry.stats));
     }
 
     fn roll_window(&mut self) {
-        if self.window_started.elapsed() < HASHRATE_WINDOW {
+        if self.window_started_at.elapsed() < HASHRATE_WINDOW {
             return;
         }
-        let (diff, window) = (self.diff_since_window_start, self.window_started.elapsed());
+        let (diff, window) = (self.diff_since_window_start, self.window_started_at.elapsed());
         self.with_stats(|s| {
             s.window_diff = diff;
-            s.window = window;
-            s.window_ended = Some(Instant::now());
+            s.window_length = window;
+            s.window_ended_at = Some(Instant::now());
         });
         self.diff_since_window_start = 0;
-        self.window_started = Instant::now();
+        self.window_started_at = Instant::now();
     }
 
     fn idle_checks(&mut self) -> Result<(), Disconnect> {
@@ -205,14 +209,16 @@ impl Connection {
         let s = &self.server.config.stratum;
         let idle =
             |limit: u64, since: Instant| limit != 0 && since.elapsed() > Duration::from_secs(limit);
-        let accepted = ratum::lock(&self.entry.stats).accepted.count;
-        let reason = if !self.subscribed && idle(s.idle_timeout_no_subscribe, self.connected) {
+        let accepted = lock(&self.entry.stats).shares.accepted.count;
+        let reason = if !self.subscribed && idle(s.idle_timeout_no_subscribe, self.connected_at) {
             Some(("not subscribing", s.idle_timeout_no_subscribe))
-        } else if self.subscribed && accepted == 0 && idle(s.idle_timeout_no_shares, self.connected)
+        } else if self.subscribed
+            && accepted == 0
+            && idle(s.idle_timeout_no_shares, self.connected_at)
         {
             Some(("submitting no accepted share", s.idle_timeout_no_shares))
         } else if self.subscribed
-            && let Some(last) = self.last_accepted
+            && let Some(last) = self.last_accepted_at
             && idle(s.idle_timeout_max_last_work, last)
         {
             Some(("submitting no share", s.idle_timeout_max_last_work))
@@ -222,7 +228,7 @@ impl Connection {
         if let Some((what, secs)) = reason {
             debug!(
                 "Kicking client {} ({}) for {what} for more than {secs} seconds",
-                self.remote, self.username
+                self.peer, self.username
             );
             return Err(Disconnect::Idle(what));
         }
@@ -236,7 +242,7 @@ impl Connection {
 
     fn reply(&mut self, id: &str, error: Option<StratumError>, result: Value) -> io::Result<()> {
         let error = match error {
-            Some(StratumError(code, text)) => format!("[{code},\"{text}\",null]"),
+            Some(StratumError { code, message }) => format!("[{code},\"{message}\",null]"),
             None => "null".to_string(),
         };
         self.send_line(&format!("{{\"error\":{error},\"id\":{id},\"result\":{result}}}"))
@@ -319,10 +325,10 @@ impl Connection {
             st.subscribed_at = Some(Instant::now());
         });
         self.vardiff.reset_snapshot(Instant::now());
-        let (job, _, generation) = self.server.current_for_send();
+        let CurrentJob { job, generation } = self.server.current_for_send();
         self.sent_generation = generation;
         if let Some(job) = job {
-            self.notify(&job, true, false, false)?;
+            self.notify(&job, NotifyKind::FirstJob)?;
         }
         Ok(())
     }
@@ -339,7 +345,7 @@ impl Connection {
                 .collect();
             info!(
                 "Refusing authorization of \"{shown}\" from {}: stratum.require_address_username is set and the username does not begin with an address a coinbase output can pay.",
-                self.remote
+                self.peer
             );
             return self.reply(id, Some(UNAUTHORIZED_WORKER), Value::Bool(false));
         }
@@ -370,33 +376,24 @@ impl Connection {
         ))
     }
 
-    fn served_diff(&self, r: NotifyId) -> Option<u64> {
-        if r.quickdiff {
-            Some(self.vardiff.quickdiff_value())
-        } else {
-            self.job_diffs[r.global_index as usize]
-        }
-    }
-
     fn send_current_job(&mut self) -> io::Result<()> {
-        let (job, empty_work, generation) = self.server.current_for_send();
+        let CurrentJob { job, generation } = self.server.current_for_send();
         self.sent_generation = generation;
         match job {
-            Some(job) => self.notify(&job, empty_work, false, empty_work),
+            Some(job) => {
+                let kind =
+                    if job.is_empty_work { NotifyKind::EmptyWork } else { NotifyKind::JobUpdate };
+                self.notify(&job, kind)
+            }
             None => Ok(()),
         }
     }
 
-    fn notify(
-        &mut self,
-        job: &Arc<Job>,
-        clean: bool,
-        quickdiff: bool,
-        new_block: bool,
-    ) -> io::Result<()> {
-        let quickdiff = quickdiff && !new_block;
+    fn notify(&mut self, job: &Arc<Job>, kind: NotifyKind) -> io::Result<()> {
+        let quickdiff = kind == NotifyKind::Quickdiff;
+        let empty_work = kind == NotifyKind::EmptyWork;
         if !quickdiff {
-            self.vardiff.update(true, Instant::now());
+            let _: VardiffUpdate = self.vardiff.update(VardiffEvent::JobSent, Instant::now());
         }
         if job.is_datum_job {
             self.vardiff.hold_at_least(self.server.pool.min_difficulty());
@@ -410,15 +407,18 @@ impl Connection {
         }
         let r = NotifyId {
             global_index: job.global_index,
-            quickdiff,
-            empty_work: new_block,
-            coinbase_id: if new_block { COINBASE_ID_SUBSIDY_ONLY } else { COINBASE_ID_POOLED },
+            prefix: match kind {
+                NotifyKind::Quickdiff => NotifyPrefix::Quickdiff,
+                NotifyKind::EmptyWork => NotifyPrefix::EmptyWork,
+                NotifyKind::FirstJob | NotifyKind::JobUpdate => NotifyPrefix::Plain,
+            },
+            coinbase_id: if empty_work { COINBASE_ID_SUBSIDY_ONLY } else { COINBASE_ID_POOLED },
         };
         let target_byte = target::floor_log2(diff.max(1));
         let Some(commitment) = job.commitment(r.coinbase_id, target_byte) else {
             return Err(io::Error::other("job has no coinbase for the selection"));
         };
-        let clean_flag = clean || quickdiff || new_block;
+        let clean_flag = kind != NotifyKind::JobUpdate;
         let coinb1 = format!(
             "{}{}",
             "00".repeat(ratum::header::COINB1_LEADING_ZEROS),
@@ -433,165 +433,14 @@ impl Connection {
         );
         self.send_line(&line)
     }
-
-    fn on_submit(&mut self, id: &str, params: &Value) -> io::Result<()> {
-        let req = match self.parse_submit(params) {
-            Ok(req) => req,
-            Err((reject, diff)) => {
-                let diff = diff.unwrap_or_else(|| self.vardiff.last_sent());
-                self.with_stats(|st| st.rejected.add(diff));
-                return self.reply_error(id, reject);
-            }
-        };
-        let diff = req.job_diff;
-        match self.evaluate(&req) {
-            Ok(()) => {
-                self.reply_result(id, Value::Bool(true))?;
-                self.count_accepted(diff)
-            }
-            Err(reject) => {
-                self.with_stats(|st| st.rejected.add(diff));
-                self.reply_error(id, reject)
-            }
-        }
-    }
-
-    fn count_accepted(&mut self, diff: u64) -> io::Result<()> {
-        let now = Instant::now();
-        self.with_stats(|st| {
-            st.accepted.add(diff);
-            st.last_accepted = Some(now);
-        });
-        self.vardiff.count_share();
-        self.diff_since_window_start = self.diff_since_window_start.saturating_add(diff);
-        self.last_accepted = Some(now);
-        if self.vardiff.update(false, now)
-            && let Some(job) = self.server.current_job()
-        {
-            self.notify(&job, true, true, false)?;
-        }
-        Ok(())
-    }
-
-    fn parse_submit(&self, params: &Value) -> Result<SubmitRequest, (StratumError, Option<u64>)> {
-        let unknown = (UNKNOWN_WORK, None);
-        let id_param = params.get(1).and_then(Value::as_str).ok_or(unknown)?;
-        let (notify_id, job_id) = NotifyId::parse(id_param).ok_or(unknown)?;
-        let job = ratum::lock(&self.server.jobs).ring[notify_id.global_index as usize]
-            .clone()
-            .ok_or(unknown)?;
-        if job.job_id.get(..JOB_ID_TIME_CHARS) != job_id.get(..JOB_ID_TIME_CHARS) {
-            return Err(unknown);
-        }
-        let job_diff = self.served_diff(notify_id).ok_or(unknown)?;
-        let rejected = (UNKNOWN_WORK, Some(job_diff));
-
-        let en2 = params.get(2).and_then(Value::as_str).ok_or(rejected)?;
-        if en2.len() != 2 * EXTRANONCE2_SIZE {
-            return Err(rejected);
-        }
-        let en2 = hex::decode(en2).map_err(|_| rejected)?;
-        let mut extranonce = [0u8; HEADER_EXTRANONCE_SIZE];
-        let sid_at = HEADER_EXTRANONCE_PAD;
-        let en2_at = EXTRANONCE1_SIZE;
-        extranonce[sid_at..en2_at].copy_from_slice(&self.sid.to_be_bytes());
-        extranonce[en2_at..].copy_from_slice(&en2);
-        if !notify_id.empty_work && notify_id.coinbase_id != COINBASE_ID_POOLED {
-            return Err(rejected);
-        }
-        let ntime =
-            params.get(3).and_then(Value::as_str).and_then(parse_sia_field).ok_or(rejected)?;
-        let nonce =
-            params.get(4).and_then(Value::as_str).and_then(parse_sia_field).ok_or(rejected)?;
-        let miner_username = params.get(0).and_then(Value::as_str).unwrap_or("NULL").to_string();
-        Ok(SubmitRequest { job, job_diff, notify_id, extranonce, ntime, nonce, miner_username })
-    }
-
-    fn evaluate(&mut self, req: &SubmitRequest) -> Result<(), StratumError> {
-        let job = &req.job;
-        let r = req.notify_id;
-        let target_byte = target::floor_log2(req.job_diff);
-        let header = job
-            .header(r.coinbase_id, target_byte, req.extranonce, req.nonce, req.ntime)
-            .ok_or(UNKNOWN_WORK)?;
-        let hash = job.raw_pow_hash(&header);
-        let is_block = job.abw.is_none() && target::meets_target(&hash, &job.block_target);
-        if is_block {
-            let display = hex::encode(hash);
-            for _ in 0..BLOCK_FOUND_LOG_LINES {
-                warn!("******** BLOCK FOUND - {display} ********");
-            }
-            crate::submit::found_block(
-                &self.server,
-                job,
-                r.coinbase_id,
-                target_byte,
-                &header.serialize(),
-                &display,
-            );
-        }
-
-        let checked = self.check_share(job, &hash, target_byte, &req.miner_username);
-        if job.is_datum_job && (is_block || checked.is_ok()) {
-            let wire_username = self.credited_username(req, &hash);
-            self.server.pool.submit(QueuedShare {
-                job: Arc::clone(job),
-                coinbase_id: r.coinbase_id,
-                is_block,
-                subsidy_only: r.empty_work,
-                quickdiff: r.quickdiff,
-                target_byte,
-                header,
-                username: wire_username,
-            });
-        }
-        checked
-    }
-
-    fn credited_username(&self, req: &SubmitRequest, hash: &[u8; 32]) -> String {
-        let cfg = &self.server.config;
-        username::apply_modifier(
-            &cfg.stratum.username_modifiers,
-            &cfg.mining.pool_address,
-            &req.miner_username,
-            hash,
-        )
-        .unwrap_or_else(|| req.miner_username.clone())
-    }
-
-    fn check_share(
-        &self,
-        job: &Arc<Job>,
-        hash: &[u8; 32],
-        target_byte: u8,
-        username: &str,
-    ) -> Result<(), StratumError> {
-        let cfg = &self.server.config;
-        if job.is_stale_prevblock() {
-            return Err(STALE_PREVBLK);
-        }
-        if !target::meets_target(hash, &target::target_for_exponent(target_byte)) {
-            return Err(HIGH_HASH);
-        }
-        if job.created.elapsed() > cfg.stale_window() {
-            return Err(STALE_WORK);
-        }
-        if !ratum::lock(&self.server.seen_share_hashes).insert(*hash, job.created) {
-            return Err(DUPLICATE);
-        }
-        if cfg.stratum.require_address_username && !username::is_payable(username) {
-            return Err(UNAUTHORIZED_WORKER);
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::JobBuilder;
-    use crate::stratum::tests::test_server;
-    use crate::template::tests::template;
+    use crate::fixtures::{template, test_server};
+    use crate::job::JobKind;
+    use crate::job::builder::JobBuilder;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::thread::JoinHandle;
@@ -600,7 +449,7 @@ mod tests {
 
     fn a_job(server: &Server) -> Arc<Job> {
         let mut builder = JobBuilder::new(Arc::clone(&server.config));
-        Arc::new(builder.build(Arc::new(template()), false, None, None, None).unwrap())
+        Arc::new(builder.build(Arc::new(template()), JobKind::Full, None, None, None).unwrap())
     }
 
     struct Client {
@@ -671,14 +520,14 @@ mod tests {
         c.subscribe();
         let job = a_job(&c.server);
         let published = Instant::now();
-        c.server.publish(Arc::clone(&job), false);
+        c.server.publish(Arc::clone(&job));
         let notify = c.line("mining.notify");
         assert!(published.elapsed() < DEADLINE, "the job waited for a timed check");
         assert_eq!(notify["method"], "mining.notify");
         let params = notify["params"].as_array().unwrap();
         assert_eq!(
             params[0].as_str().unwrap(),
-            format!("{}{COINBASE_ID_POOLED:02x}", job.job_id),
+            format!("{}{COINBASE_ID_POOLED:02x}", job.stratum_job_id),
             "the notify names the published job and its pooled coinbase"
         );
     }
@@ -686,7 +535,7 @@ mod tests {
     #[test]
     fn a_publication_sends_nothing_before_a_subscription() {
         let mut c = Client::connect();
-        c.server.publish(a_job(&c.server), false);
+        c.server.publish(a_job(&c.server));
         c.subscribe();
         assert_eq!(c.line("mining.notify")["method"], "mining.notify");
     }
@@ -741,8 +590,8 @@ mod tests {
         c.send(r#"{"id":7,"method":"mining.nothing","params":[]}"#);
         let reply = c.line("error reply");
         assert_eq!(reply["id"], 7);
-        assert_eq!(reply["error"][0], METHOD_NOT_FOUND.0);
-        assert_eq!(reply["error"][1], METHOD_NOT_FOUND.1);
+        assert_eq!(reply["error"][0], METHOD_NOT_FOUND.code);
+        assert_eq!(reply["error"][1], METHOD_NOT_FOUND.message);
     }
 
     #[test]

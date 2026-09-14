@@ -1,15 +1,15 @@
 pub const HEADER_LEN: usize = size_of::<u32>();
 
-const CMD_LEN_BITS: u32 = 22;
-pub const MAX_CMD_LEN: u32 = (1 << CMD_LEN_BITS) - 1;
-pub const MAX_CMD_DATA_SIZE: u32 = 1 << CMD_LEN_BITS;
+pub const CMD_LEN_BITS: u32 = 22;
+const CMD_LEN_MASK: u32 = (1 << CMD_LEN_BITS) - 1;
+pub const MAX_CMD_LEN: usize = CMD_LEN_MASK as usize;
+pub const MAX_MINING_PAD_LEN: usize = 100;
 pub const INITIAL_HEADER_KEY: u32 = 0xDC87_1829;
 pub const NONCE_LEN: usize = 24;
 const WORD_SIZE: usize = size_of::<u32>();
 const NONCE_SEED_AT: usize = 7;
 const NONCE_STEP: u32 = 42;
 const SENDER_MASK: u32 = 0x5757_5757;
-pub const STRUCT_END: u8 = 0xFE;
 
 pub mod cmd {
     pub const HELLO_OR_PING: u8 = 1;
@@ -39,7 +39,7 @@ pub struct FrameHeader {
 
 impl FrameHeader {
     pub fn to_bytes(self) -> [u8; HEADER_LEN] {
-        let v = (self.cmd_len & MAX_CMD_LEN)
+        let v = (self.cmd_len & CMD_LEN_MASK)
             | ((u32::from(self.reserved) & RESERVED_MASK) << RESERVED_SHIFT)
             | (u32::from(self.is_signed) << SIGNED_BIT)
             | (u32::from(self.is_encrypted_pubkey) << ENCRYPTED_PUBKEY_BIT)
@@ -51,7 +51,7 @@ impl FrameHeader {
     pub fn from_bytes(b: [u8; HEADER_LEN]) -> Self {
         let v = u32::from_le_bytes(b);
         Self {
-            cmd_len: v & MAX_CMD_LEN,
+            cmd_len: v & CMD_LEN_MASK,
             reserved: ((v >> RESERVED_SHIFT) & RESERVED_MASK) as u8,
             is_signed: v & (1 << SIGNED_BIT) != 0,
             is_encrypted_pubkey: v & (1 << ENCRYPTED_PUBKEY_BIT) != 0,

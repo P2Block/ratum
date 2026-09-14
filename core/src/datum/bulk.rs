@@ -4,7 +4,7 @@ use bytes::BufMut as _;
 pub const ACK_MARKER: [u8; 4] = *b"DBA\x01";
 pub const DBF_MARKER: [u8; 4] = *b"DBF\x01";
 pub const FRAGMENT_DATA_SIZE: usize = 16 * 1024;
-pub const MAX_TRANSFER_SIZE: usize = super::framing::MAX_CMD_DATA_SIZE as usize;
+pub const MAX_TRANSFER_SIZE: usize = 1 << super::framing::CMD_LEN_BITS;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
@@ -220,7 +220,7 @@ mod tests {
                 None => assert!(i < frags.len() - 1),
             }
         }
-        assert!(!r.transfer.is_some());
+        assert!(r.transfer.is_none());
     }
 
     #[test]
@@ -249,12 +249,12 @@ mod tests {
         assert!(matches!(r.accept(&huge), Err(Error::BadSize(_))));
         let tiny = Fragment { id: 1, total_size: 2, offset: 0, data: &[1, 2, 3] };
         assert!(matches!(r.accept(&tiny), Err(Error::BadChunk(3))));
-        assert!(!r.transfer.is_some());
+        assert!(r.transfer.is_none());
         let (_, done) =
             r.accept(&Fragment { id: 1, total_size: 2, offset: 0, data: &[1] }).unwrap();
         assert!(done.is_none());
         assert!(r.transfer.is_some());
         r.reset();
-        assert!(!r.transfer.is_some());
+        assert!(r.transfer.is_none());
     }
 }

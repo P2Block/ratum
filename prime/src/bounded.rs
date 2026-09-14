@@ -13,14 +13,12 @@ impl<K: Clone + Eq + Hash, V> BoundedMap<K, V> {
         Self { entries: HashMap::new(), order: VecDeque::new(), capacity: capacity.max(1) }
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
+    #[cfg(test)]
     pub fn order(&self) -> &VecDeque<K> {
         &self.order
     }
@@ -73,12 +71,9 @@ impl<T: Clone + Eq + Hash> BoundedSet<T> {
         Self(BoundedMap::new(capacity))
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.0.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 
     pub fn insert(&mut self, value: T) -> bool {

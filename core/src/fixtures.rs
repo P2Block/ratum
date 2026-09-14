@@ -1,8 +1,14 @@
-use crate::bitcoin::{TxOut, encode_compact_size, encode_output, encode_push};
+use crate::bitcoin::encode_compact_size;
+use crate::bitcoin::script::encode_push;
+use crate::bitcoin::transaction::{TxOut, encode_output};
 use crate::datum::coinbase::{
     EXTRANONCE_PUSH_OPCODE, UNIQUE_ID_PUSH_TARGET_BYTE_AT, tag_push_data, unique_id_push,
 };
-use crate::datum::share::{self, CoinbaseSection};
+use crate::datum::messages::share::{self, CoinbaseSection};
+
+pub fn ramp(start: u8) -> [u8; 32] {
+    std::array::from_fn(|i| start.wrapping_add(i as u8))
+}
 
 pub fn p2wpkh(b: u8) -> Vec<u8> {
     let mut s = vec![0x00, 0x14];

@@ -1,8 +1,8 @@
+use super::{STRUCT_END, client_subcmd::SUBMIT_POW};
 use crate::header::BlockHeaderV2;
 use crate::reader::{ByteReader, Truncated};
 use bytes::BufMut as _;
 
-use super::messages::client_subcmd::SUBMIT_POW;
 pub const SECTION_JOB: u8 = 0x01;
 pub const SECTION_COINBASE: u8 = 0x02;
 pub const SECTION_BLAKE2B: u8 = 0x03;
@@ -14,18 +14,15 @@ pub const FLAG_SUBSIDY_ONLY: u8 = 0x02;
 pub const FLAG_QUICKDIFF: u8 = 0x04;
 pub const FLAG_BLAKE2B: u8 = 0x08;
 pub const RESERVED_USE_TIME_OFFSET: u8 = 0x01;
-use super::framing::STRUCT_END;
 pub const EXTRANONCE_SIZE: usize = 12;
 pub const HEADER_EXTRANONCE_SIZE: usize = 16;
 pub const HEADER_EXTRANONCE_PAD: usize = HEADER_EXTRANONCE_SIZE - EXTRANONCE_SIZE;
-pub const EXTRANONCE1_SIZE: usize = HEADER_EXTRANONCE_PAD + size_of::<u32>();
-pub const EXTRANONCE2_SIZE: usize = HEADER_EXTRANONCE_SIZE - EXTRANONCE1_SIZE;
 pub const SIA_FIELD_SIZE: usize = 2 * size_of::<u32>();
 pub const SIA_FIELD_HALF: usize = size_of::<u32>();
 pub const RESERVED_SIZE: usize = 4;
 pub const COINBASE_ID_SUBSIDY_ONLY: u8 = 0xFF;
 pub const MAX_JOBS: usize = 256;
-pub const MAX_COINBASE_SECTION_BYTES: usize = crate::datum::messages::MAX_COINBASER_BLOB_LEN + 1024;
+pub const MAX_COINBASE_SECTION_LEN: usize = super::coinbaser::MAX_COINBASER_BLOB_LEN + 1024;
 pub const MAX_MERKLE_BRANCHES: usize = 24;
 pub const MAX_USERNAME_LEN: usize = 384;
 
@@ -232,16 +229,17 @@ fn encode_blake2b_section(out: &mut Vec<u8>, b: &Blake2bSection) {
     out.put_u32_le(b.time_on_wire);
 }
 
-struct Prefix {
-    job_id: u8,
-    coinbase_id: u8,
-    flags: u8,
-    target_byte: u8,
-    ntime: u32,
-    nonce: u32,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharePrefix {
+    pub job_id: u8,
+    pub coinbase_id: u8,
+    pub flags: u8,
+    pub target_byte: u8,
+    pub ntime: u32,
+    pub nonce: u32,
 }
 
-impl Prefix {
+impl SharePrefix {
     fn read(r: &mut ByteReader<'_>) -> Result<Self, Truncated> {
         r.skip_if(SUBMIT_POW);
         Ok(Self {
@@ -284,15 +282,14 @@ impl PowSubmit {
         crate::target::difficulty_for_exponent(self.target_byte)
     }
 
-    pub fn prefix(data: &[u8]) -> Option<(u8, u8, u32)> {
-        let p = Prefix::read(&mut ByteReader::new(data)).ok()?;
-        Some((p.job_id, p.target_byte, p.nonce))
+    pub fn prefix(data: &[u8]) -> Option<SharePrefix> {
+        SharePrefix::read(&mut ByteReader::new(data)).ok()
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
         let mut r = ByteReader::new(data);
-        let Prefix { job_id, coinbase_id, flags, target_byte, ntime, nonce } =
-            Prefix::read(&mut r)?;
+        let SharePrefix { job_id, coinbase_id, flags, target_byte, ntime, nonce } =
+            SharePrefix::read(&mut r)?;
         let version = r.u32("version")?;
         let en_size = r.u8("extranonce size")?;
         if en_size as usize != EXTRANONCE_SIZE {
@@ -515,9 +512,14 @@ mod tests {
         let mut truncated = bytes.clone();
         truncated.truncate(56);
         assert!(matches!(PowSubmit::decode(&truncated), Err(Error::Truncated(_))));
-        assert_eq!(PowSubmit::prefix(&truncated), Some((3, 14, 0xdead_beef)));
+        let prefix = PowSubmit::prefix(&truncated).unwrap();
+        assert_eq!((prefix.job_id, prefix.target_byte, prefix.nonce), (3, 14, 0xdead_beef));
+        assert_eq!(
+            (prefix.coinbase_id, prefix.flags, prefix.ntime),
+            (2, FLAG_BLAKE2B, 0x6543_2100)
+        );
         assert_eq!(PowSubmit::prefix(&bytes[..12]), None, "shorter than the prefix");
-        assert_eq!(PowSubmit::prefix(&bytes[..13]), Some((3, 14, 0xdead_beef)));
+        assert_eq!(PowSubmit::prefix(&bytes[..13]), Some(prefix));
     }
 
     #[test]
