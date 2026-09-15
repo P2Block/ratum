@@ -257,7 +257,17 @@ fn main() {
     #[cfg(unix)]
     signals::install(Arc::clone(&notify));
     let rt = Runtime { config, node, notify, pool };
-    if rt.config.datum.pool_host.is_empty() {
+    if rt.config.datum.pool_host.is_empty() && rt.config.mining.solo {
+        info!(
+            "SOLO MINING (P2Block): every block pays the finding miner's username address, {}% fee to {}",
+            rt.config.mining.solo_fee_bps as f64 / 100.0,
+            if rt.config.mining.solo_fee_address.is_empty() {
+                &rt.config.mining.pool_address
+            } else {
+                &rt.config.mining.solo_fee_address
+            }
+        );
+    } else if rt.config.datum.pool_host.is_empty() {
         info!("NON-POOLED MINING: datum.pool_host is empty; every block pays mining.pool_address");
     } else {
         start_datum(&rt);

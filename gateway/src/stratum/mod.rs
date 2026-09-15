@@ -80,6 +80,27 @@ pub struct ClientSummary {
     pub hashrate_ths: f64,
 }
 
+/// A block this gateway assembled and submitted, kept for the stats API (`blocks_found`), newest last.
+#[derive(Clone, Debug)]
+pub struct FoundBlock {
+    pub hash: String,
+    pub height: u32,
+    pub ts: u64,
+    pub username: String,
+    /// payout address of the coinbase's first output (the miner's own address in solo mode)
+    pub address: String,
+    pub coinbase_id: u8,
+    pub coinbase_value: u64,
+    /// solo mode: what the finder's output pays and what the fee output pays
+    pub miner_sats: u64,
+    pub fee_sats: u64,
+    pub solo: bool,
+    pub submitted: bool,
+}
+
+/// How many found blocks the stats API remembers.
+pub const FOUND_BLOCKS_KEPT: usize = 500;
+
 pub struct Server {
     pub config: Arc<Config>,
     pub datum: Arc<datum::Pool>,
@@ -92,6 +113,7 @@ pub struct Server {
     pub(in crate::stratum) next_unique_id: AtomicU64,
     pub rejecting: AtomicBool,
     pub fee: Mutex<Tally>,
+    pub blocks: Mutex<Vec<FoundBlock>>,
     pub extra_nodes: Vec<ratum::rpc::Client>,
     pub listening: AtomicBool,
 }
@@ -128,6 +150,7 @@ impl Server {
             next_unique_id: AtomicU64::new(1),
             rejecting: AtomicBool::new(false),
             fee: Mutex::new(Tally::default()),
+            blocks: Mutex::new(Vec::new()),
             extra_nodes,
             listening: AtomicBool::new(false),
         })
@@ -261,4 +284,16 @@ pub fn listen(server: Arc<Server>) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+impl Server {
+    /// Remember a found block for the stats API.
+    pub fn record_block(&self, b: FoundBlock) {
+        let mut v = ratum::lock(&self.blocks);
+        v.push(b);
+        if v.len() > FOUND_BLOCKS_KEPT {
+            let drop = v.len() - FOUND_BLOCKS_KEPT;
+            v.drain(..drop);
+        }
+    }
 }

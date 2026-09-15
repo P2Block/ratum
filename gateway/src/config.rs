@@ -122,6 +122,12 @@ pub struct Mining {
     pub coinbase_tag_secondary: String,
     pub coinbase_unique_id: u32,
     pub save_submitblocks_dir: String,
+    /// P2Block solo mode: every miner's coinbase pays the miner's own username address the full
+    /// reward minus `solo_fee_bps`, which goes to `solo_fee_address` (default: `pool_address`).
+    /// Non-pooled only (`datum.pool_host` empty); requires `stratum.require_address_username`.
+    pub solo: bool,
+    pub solo_fee_bps: u32,
+    pub solo_fee_address: String,
 }
 
 impl Default for Mining {
@@ -132,6 +138,9 @@ impl Default for Mining {
             coinbase_tag_secondary: String::new(),
             coinbase_unique_id: 4242,
             save_submitblocks_dir: String::new(),
+            solo: false,
+            solo_fee_bps: 0,
+            solo_fee_address: String::new(),
         }
     }
 }
@@ -248,6 +257,9 @@ pub struct Config {
     pub warnings: Vec<(log::Level, String)>,
     #[serde(skip)]
     pub pool_output_script: Vec<u8>,
+    /// Solo mode fee output script (`mining.solo_fee_address`, or the pool address).
+    #[serde(skip)]
+    pub solo_fee_script: Vec<u8>,
 }
 
 pub const MAX_COINBASE_TAG_SPACE: usize = 86;
@@ -366,6 +378,25 @@ impl Config {
         }
         self.pool_output_script = crate::address::to_output_script(&m.pool_address)
             .ok_or("mining.pool_address is not an address a coinbase output can pay")?;
+        if m.solo {
+            if !self.datum.pool_host.is_empty() {
+                return Err("mining.solo is for non-pooled mining: clear datum.pool_host".into());
+            }
+            if u64::from(m.solo_fee_bps) > ratum::BASIS_POINTS_PER_UNIT {
+                return Err(format!(
+                    "mining.solo_fee_bps must be 0..{}",
+                    ratum::BASIS_POINTS_PER_UNIT
+                ));
+            }
+            let fee_addr =
+                if m.solo_fee_address.is_empty() { &m.pool_address } else { &m.solo_fee_address };
+            self.solo_fee_script = crate::address::to_output_script(fee_addr)
+                .ok_or("mining.solo_fee_address is not an address a coinbase output can pay")?;
+            if !self.stratum.require_address_username {
+                self.stratum.require_address_username = true;
+                self.warn("mining.solo: stratum.require_address_username turned on, a solo miner must be paid to its own address");
+            }
+        }
         Ok(())
     }
 

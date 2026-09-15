@@ -1,3 +1,45 @@
+# RATUM (P2Block fork)
+
+This is [P2Block](https://p2block.com)'s fork of [iohzrd/ratum](https://github.com/iohzrd/ratum),
+the Rust DATUM gateway for BLAKE2b (BTCB2) hardware. It is what runs behind P2Block's hosted
+stratum endpoints. The fork adds one feature, **solo mode**, and otherwise tracks upstream.
+Branch `p2block` carries the fork; `main` mirrors upstream.
+
+## Solo mode (P2Block addition)
+
+Upstream `ratum-gateway` has two ways to build a coinbase: the split the pool dictates over
+DATUM (pooled), and `mining.pool_address` for everything (non-pooled). Solo mode is a third:
+**every connected miner works on a coinbase that pays the miner's own address** the whole block
+reward minus a pool fee, the way ckpool-style solo pools do. Whoever finds the block gets paid
+directly by the coinbase; the gateway operator never holds funds.
+
+```json
+"datum":   { "pool_host": "" },
+"mining":  { "pool_address": "<fee address>", "solo": true, "solo_fee_bps": 100,
+             "solo_fee_address": "" }
+```
+
+- `mining.solo` (default `false`) turns it on. It needs `datum.pool_host` empty: solo work is
+  built locally from the node's template, never from a pool assignment.
+- `mining.solo_fee_bps` (0..10000, default 0) is taken off the miner's output and paid to
+  `mining.solo_fee_address`, or to `mining.pool_address` when that is empty. A fee of 0
+  builds a single-output coinbase.
+- `stratum.require_address_username` is forced on: the username's address part is the payout,
+  so a worker that authorizes without a payable address is refused.
+
+How it works inside the gateway: each template is published as one job, and the job keeps a
+per-address table of coinbases (ids 2..0xFE, so up to 253 distinct payout addresses per
+template; more than that are refused work until the next template). A miner's `mining.notify`
+carries its own coinbase id, a submit is only accepted on an id that belongs to the miner's
+address, and a job is held back until the miner has authorized (before that there is no
+address to build a coinbase for). Everything else, vardiff, bans, the stats API and the
+status page, is unchanged; `stats.json` gains `"solo": {"fee_bps", "fee_address"}` and the
+status line reads `Solo Mode`.
+
+The upstream README follows.
+
+---
+
 # RATUM
 
 ## Gateway

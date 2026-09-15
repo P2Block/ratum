@@ -52,7 +52,8 @@ impl Publisher {
             Ok(job) => {
                 *last = None;
                 let job = Arc::new(job);
-                self.server.publish(Arc::clone(&job), new_block);
+                // solo: the new-block job is a full one (no subsidy-only interlude, which would pay the pool address)
+                self.server.publish(Arc::clone(&job), new_block && job.solo.is_none());
                 if !new_block {
                     info!(
                         "Stratum job {} ready ({what}): height {}, {} coinbaser outputs, {}pooled (sent to {} subscribers)",
@@ -76,6 +77,17 @@ impl Publisher {
     pub fn on_template(self: &Arc<Self>, t: Arc<Template>, new_block: bool) {
         let serial = self.template_serial.fetch_add(1, Ordering::SeqCst) + 1;
         let pool_config = self.pool.pool_config();
+        if pool_config.is_none() && self.server.config.mining.solo {
+            // one full job per template; on a new block it is the clean job
+            self.build_and_publish(
+                &t,
+                new_block,
+                None,
+                None,
+                if new_block { "new-block" } else { "full" },
+            );
+            return;
+        }
         if new_block {
             self.build_and_publish(&t, true, pool_config.as_ref(), None, "new-block");
             std::thread::sleep(EMPTY_JOB_HOLD);

@@ -11,10 +11,10 @@ pub fn found_block(
     pot: u8,
     header: &[u8; ratum::header::HEADER_V2_SIZE],
     hash_hex: &str,
-) {
+) -> bool {
     let Some(block) = assemble(job, coinbase_id, pot, header) else {
         error!("could not assemble the block for {hash_hex}");
-        return;
+        return false;
     };
     debug!("Block Payload: {}", hex::encode(&block));
     let block = Arc::new(block);
@@ -23,9 +23,11 @@ pub fn found_block(
     if !dir.is_empty() {
         save_to_dir(dir, hash_hex, &block);
     }
-    if submit_to(&server.node, "upstream node", &block, hash_hex) {
+    let accepted = submit_to(&server.node, "upstream node", &block, hash_hex);
+    if accepted {
         server.notify.raise_for(hash_hex);
     }
+    accepted
 }
 
 fn assemble(

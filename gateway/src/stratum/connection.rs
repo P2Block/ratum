@@ -84,6 +84,8 @@ pub(super) struct Connection {
     window_started: Instant,
     fee: FeeMeter,
     next_idle_check: Instant,
+    /// Solo mode: the payout script of this connection's username address.
+    solo_script: Option<Vec<u8>>,
 }
 
 impl Connection {
@@ -128,6 +130,7 @@ impl Connection {
             sent_generation: 0,
             connected: now,
             last_accepted: None,
+            solo_script: None,
             window_active: 0,
             window_started: now,
             fee: FeeMeter::default(),
@@ -349,6 +352,22 @@ impl Connection {
             );
             return self.reply(id, Some(UNAUTHORIZED_WORKER), Value::Bool(false));
         }
+        if self.server.config.mining.solo {
+            self.solo_script = crate::address::to_output_script(username::address_of(username));
+            if self.solo_script.is_none() {
+                info!(
+                    "Refusing authorization of {username:?} from {}: solo mode pays the username address and this one cannot be paid by a coinbase",
+                    self.remote
+                );
+                return self.reply(id, Some(UNAUTHORIZED_WORKER), Value::Bool(false));
+            }
+            self.reply_result(id, Value::Bool(true))?;
+            // the job held back at subscribe time (no address yet) goes out now, on this miner's coinbase
+            if self.subscribed {
+                self.send_current_job()?;
+            }
+            return Ok(());
+        }
         self.reply_result(id, Value::Bool(true))
     }
 
@@ -388,7 +407,10 @@ impl Connection {
         let (job, empty, generation) = self.server.current_for_send();
         self.sent_generation = generation;
         match job {
-            Some(job) => self.notify(&job, empty, false, empty),
+            Some(job) => {
+                let clean = empty || (job.solo.is_some() && job.is_new_block);
+                self.notify(&job, clean, false, empty)
+            }
             None => Ok(()),
         }
     }
@@ -401,6 +423,16 @@ impl Connection {
         new_block: bool,
     ) -> io::Result<()> {
         let quickdiff = quickdiff && !new_block;
+        // solo: a miner that has subscribed but not yet authorized has no payout address, so no
+        // coinbase to build a job on. The job goes out right after authorize (see on_authorize).
+        let solo_script = if job.solo.is_some() && !new_block {
+            match self.solo_script.as_deref() {
+                Some(s) => Some(s.to_vec()),
+                None => return Ok(()),
+            }
+        } else {
+            None
+        };
         if !quickdiff {
             self.vardiff.update(true, Instant::now());
         }
@@ -414,12 +446,21 @@ impl Connection {
         if !quickdiff {
             self.job_diffs[job.global_index as usize] = Some(diff);
         }
-        let r = JobRef {
-            global_index: job.global_index,
-            quickdiff,
-            empty: new_block,
-            coinbase: if new_block { COINBASE_SUBSIDY_ONLY } else { COINBASE_POOLED },
+        let coinbase = if new_block {
+            COINBASE_SUBSIDY_ONLY
+        } else if let Some(script) = solo_script.as_deref() {
+            match job.solo_coinbase_id(script) {
+                Some(id) => id,
+                None => {
+                    return Err(io::Error::other(
+                        "solo: this job's coinbase table is full (too many distinct payout addresses on one template)",
+                    ));
+                }
+            }
+        } else {
+            COINBASE_POOLED
         };
+        let r = JobRef { global_index: job.global_index, quickdiff, empty: new_block, coinbase };
         let pot = target::floor_pot(diff.max(1));
         let Some(commitment) = job.commitment(r.coinbase, pot) else {
             return Err(io::Error::other("job has no coinbase for the selection"));
@@ -503,7 +544,13 @@ impl Connection {
         extranonce[sid_at..en2_at].copy_from_slice(&self.sid.to_be_bytes());
         extranonce[en2_at..].copy_from_slice(&en2);
         if !job_ref.empty && job_ref.coinbase != COINBASE_POOLED {
-            return Err(rejected);
+            // solo: the id must be one this connection was sent, i.e. pay its own address
+            let own = job.solo.is_some()
+                && self.solo_script.is_some()
+                && job.solo_script_of(job_ref.coinbase) == self.solo_script;
+            if !own {
+                return Err(rejected);
+            }
         }
         let ntime =
             params.get(3).and_then(Value::as_str).and_then(parse_sia_field).ok_or(rejected)?;
@@ -527,7 +574,7 @@ impl Connection {
             for _ in 0..BLOCK_FOUND_LOG_LINES {
                 warn!("******** BLOCK FOUND - {display} ********");
             }
-            crate::submit::found_block(
+            let submitted = crate::submit::found_block(
                 &self.server,
                 job,
                 r.coinbase,
@@ -535,6 +582,30 @@ impl Connection {
                 &header.serialize(),
                 &display,
             );
+            let solo = job.solo.is_some() && r.coinbase != COINBASE_SUBSIDY_ONLY;
+            let (miner_sats, fee_sats) =
+                if solo { job.solo_split().unwrap_or((0, 0)) } else { (0, 0) };
+            let address = if solo {
+                self.solo_script
+                    .as_deref()
+                    .map(crate::address::output_script_to_display)
+                    .unwrap_or_default()
+            } else {
+                crate::address::output_script_to_display(&job.pool_addr_script)
+            };
+            self.server.record_block(super::FoundBlock {
+                hash: display.clone(),
+                height: job.template.height,
+                ts: ratum::unix_now(),
+                username: req.miner_username.clone(),
+                address,
+                coinbase_id: r.coinbase,
+                coinbase_value: job.template.coinbase_value,
+                miner_sats,
+                fee_sats,
+                solo,
+                submitted,
+            });
         }
 
         let checked = self.check_share(job, &hash, pot, &req.miner_username);

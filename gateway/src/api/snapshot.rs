@@ -102,7 +102,7 @@ fn coinbaser_json(j: &Job) -> Vec<Value> {
         .map(|r| {
             json!({
                 "value_btc": r.value as f64 / ratum::SATS_PER_BTC,
-                "address": address::output_script_to_display(&r.script),
+                "address": if r.script.is_empty() { "each miner's own address".to_string() } else { address::output_script_to_display(&r.script) },
                 "remainder": r.remainder,
             })
         })
@@ -118,6 +118,8 @@ pub(super) fn status_json(ctx: &Context, with_clients: bool) -> Value {
     let current = server.current_job();
     let status = if let Some(e) = &template_error {
         format!("ERROR: {e}")
+    } else if cfg.datum.pool_host.is_empty() && cfg.mining.solo {
+        "Solo Mode (each miner paid to its own address)".to_string()
     } else if cfg.datum.pool_host.is_empty() {
         "Non-Pooled Mode".to_string()
     } else if current.is_none() {
@@ -158,6 +160,12 @@ pub(super) fn status_json(ctx: &Context, with_clients: bool) -> Value {
         "secondary_tag": cfg.mining.coinbase_tag_secondary,
         "pool_min_diff": pool.as_ref().map(|p| p.min_difficulty),
         "pool_motd": datum_stats.motd,
+        "solo": if cfg.mining.solo { json!({ "fee_bps": cfg.mining.solo_fee_bps, "fee_address": if cfg.mining.solo_fee_address.is_empty() { &cfg.mining.pool_address } else { &cfg.mining.solo_fee_address } }) } else { Value::Null },
+        "blocks_found": ratum::lock(&server.blocks).iter().map(|b| json!({
+            "hash": b.hash, "height": b.height, "ts": b.ts, "username": b.username, "address": b.address,
+            "coinbase_id": b.coinbase_id, "coinbase_value": b.coinbase_value, "miner_sats": b.miner_sats, "fee_sats": b.fee_sats,
+            "solo": b.solo, "submitted": b.submitted,
+        })).collect::<Vec<_>>(),
         "gateway_fee_bps": cfg.datum.gateway_fee_bps,
         "gateway_fee_address": if cfg.datum.gateway_fee_bps > 0 { json!(cfg.fee_address()) } else { Value::Null },
         "gateway_fee_collected": ratum::lock(&server.fee).json(),

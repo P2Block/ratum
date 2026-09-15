@@ -35,6 +35,25 @@ pub struct Abw {
     pub key_hash: [u8; 32],
 }
 
+/// P2Block solo mode: what a job needs to build a coinbase for any miner's payout script on demand.
+pub struct SoloSpec {
+    pub script_sig: Vec<u8>,
+    pub pot_in_script: usize,
+    pub enprefix: u16,
+    pub fee_bps: u32,
+    pub fee_script: Vec<u8>,
+}
+
+/// Coinbase ids 2..=SOLO_ID_MAX are per-miner solo coinbases, assigned per job on first use.
+pub const SOLO_ID_FIRST: u8 = 2;
+pub const SOLO_ID_MAX: u8 = COINBASE_SUBSIDY_ONLY - 1;
+
+#[derive(Default)]
+struct SoloIds {
+    by_script: HashMap<Vec<u8>, u8>,
+    coinbases: Vec<(Vec<u8>, Coinbase)>, // index = id - SOLO_ID_FIRST
+}
+
 pub struct Job {
     pub serial: u64,
     pub global_index: u8,
@@ -56,6 +75,8 @@ pub struct Job {
     pub created: Instant,
     pub stale_prevblock: AtomicBool,
     commitments: Mutex<HashMap<(u8, u8), Commitment>>,
+    pub solo: Option<SoloSpec>,
+    solo_ids: Mutex<SoloIds>,
 }
 
 #[derive(Clone, Debug)]
@@ -76,12 +97,85 @@ impl Job {
         if id == COINBASE_SUBSIDY_ONLY { &self.subsidy_only } else { &self.pooled }
     }
 
+    /// The coinbase for an id, including the per-miner solo ones (cloned: they live behind a lock).
+    fn coinbase_owned(&self, id: u8) -> Option<Coinbase> {
+        if self.solo.is_some() && (SOLO_ID_FIRST..=SOLO_ID_MAX).contains(&id) {
+            let ids = ratum::lock(&self.solo_ids);
+            return ids.coinbases.get(usize::from(id - SOLO_ID_FIRST)).map(|(_, c)| c.clone());
+        }
+        Some(self.coinbase(id).clone())
+    }
+
+    /// Solo mode: the coinbase id that pays `script` on this job, built and assigned on first use.
+    /// `None` when the job is not solo or has run out of ids (253 distinct payout scripts per job).
+    pub fn solo_coinbase_id(&self, script: &[u8]) -> Option<u8> {
+        let spec = self.solo.as_ref()?;
+        let mut ids = ratum::lock(&self.solo_ids);
+        if let Some(&id) = ids.by_script.get(script) {
+            return Some(id);
+        }
+        let next = SOLO_ID_FIRST.checked_add(u8::try_from(ids.coinbases.len()).ok()?)?;
+        if next > SOLO_ID_MAX {
+            return None;
+        }
+        let cb = self.build_solo_coinbase(spec, script);
+        ids.coinbases.push((script.to_vec(), cb));
+        ids.by_script.insert(script.to_vec(), next);
+        Some(next)
+    }
+
+    /// Which payout script a solo coinbase id pays (for share/submit checks).
+    /// Solo mode: (miner output, fee output) in sats for this template.
+    pub fn solo_split(&self) -> Option<(u64, u64)> {
+        let spec = self.solo.as_ref()?;
+        let value = self.template.coinbase_value;
+        let fee = ((u128::from(value) * u128::from(spec.fee_bps))
+            / u128::from(ratum::BASIS_POINTS_PER_UNIT)) as u64;
+        Some((value - fee, fee))
+    }
+
+    pub fn solo_script_of(&self, id: u8) -> Option<Vec<u8>> {
+        if !(SOLO_ID_FIRST..=SOLO_ID_MAX).contains(&id) {
+            return None;
+        }
+        ratum::lock(&self.solo_ids)
+            .coinbases
+            .get(usize::from(id - SOLO_ID_FIRST))
+            .map(|(s, _)| s.clone())
+    }
+
+    fn build_solo_coinbase(&self, spec: &SoloSpec, miner_script: &[u8]) -> Coinbase {
+        let t = &self.template;
+        let value = t.coinbase_value;
+        let fee = ((u128::from(value) * u128::from(spec.fee_bps))
+            / u128::from(ratum::BASIS_POINTS_PER_UNIT)) as u64;
+        let outputs = [CoinbaseOutput { value: value - fee, script: miner_script.to_vec() }];
+        let fixed = coinbase::fixed_bytes(
+            spec.script_sig.len(),
+            spec.fee_script.len(),
+            t.witness_commitment.len(),
+        );
+        let (cb, included) = coinbase::build(&coinbase::Spec {
+            script_sig: &spec.script_sig,
+            pot_index_in_script: spec.pot_in_script,
+            enprefix: spec.enprefix,
+            witness_commitment: Some(&t.witness_commitment),
+            pool_script: &spec.fee_script,
+            coinbase_value: value,
+            outputs: &outputs,
+            output_budget: coinbase::output_budget(fixed, t).max(miner_script.len() + 64),
+            sigop_budget: u64::MAX,
+        });
+        debug_assert_eq!(included.len(), 1, "the miner's output always fits");
+        cb
+    }
+
     pub fn is_stale_prevblock(&self) -> bool {
         self.stale_prevblock.load(Ordering::Relaxed)
     }
 
     pub fn full_coinbase(&self, id: u8, pot: u8) -> Option<Vec<u8>> {
-        let coinbase = self.coinbase(id);
+        let coinbase = self.coinbase_owned(id)?;
         let mut tx = coinbase.assemble(&[0u8; EXTRANONCE_SIZE]);
         *tx.get_mut(coinbase.pot_index)? = pot;
         Some(tx)
@@ -146,6 +240,21 @@ impl Job {
     }
 
     pub fn payout_rows(&self) -> Vec<PayoutRow> {
+        if let Some(spec) = &self.solo {
+            let value = self.template.coinbase_value;
+            let fee = ((u128::from(value) * u128::from(spec.fee_bps))
+                / u128::from(ratum::BASIS_POINTS_PER_UNIT)) as u64;
+            let mut rows =
+                vec![PayoutRow { value: value - fee, script: Vec::new(), remainder: false }];
+            if fee > 0 {
+                rows.push(PayoutRow {
+                    value: fee,
+                    script: spec.fee_script.clone(),
+                    remainder: true,
+                });
+            }
+            return rows;
+        }
         let mut rows: Vec<PayoutRow> = self
             .coinbaser_outputs
             .iter()
@@ -265,6 +374,13 @@ impl Builder {
         let (coinbaser_id, outputs) = filter_coinbaser(&template, coinbaser);
         let set =
             coinbase_set(&template, &script, pot_in_script, enprefix, &pool_addr_script, &outputs);
+        let solo = (pool.is_none() && c.mining.solo).then(|| SoloSpec {
+            script_sig: script.clone(),
+            pot_in_script,
+            enprefix,
+            fee_bps: c.mining.solo_fee_bps,
+            fee_script: c.solo_fee_script.clone(),
+        });
 
         let txids: Vec<[u8; 32]> = template.txns.iter().map(|t| t.txid).collect();
         let merkle_branches = merkle_branches(&txids);
@@ -294,6 +410,8 @@ impl Builder {
             created: Instant::now(),
             stale_prevblock: AtomicBool::new(false),
             commitments: Mutex::new(HashMap::new()),
+            solo,
+            solo_ids: Mutex::new(SoloIds::default()),
             template,
         })
     }
@@ -620,6 +738,45 @@ mod tests {
             }
             assert!(most > 252, "{most} outputs at most: the three-byte count was not reached");
         }
+    }
+
+    #[test]
+    fn solo_jobs_pay_each_miner_its_own_coinbase_minus_the_fee() {
+        use crate::template::tests::{config, template};
+        let mut c = config();
+        c.mining.solo = true;
+        c.mining.solo_fee_bps = 100; // 1%
+        c.solo_fee_script = ratum::fixtures::p2wpkh(0xfe);
+        let t = template();
+        let value = t.coinbase_value;
+        let job = Builder::new(Arc::new(c)).build(Arc::new(t), false, None, None, None).unwrap();
+        assert!(job.solo.is_some());
+        let a = ratum::fixtures::p2wpkh(0x01);
+        let b = ratum::fixtures::p2wpkh(0x02);
+        let ida = job.solo_coinbase_id(&a).unwrap();
+        let idb = job.solo_coinbase_id(&b).unwrap();
+        assert_eq!(ida, SOLO_ID_FIRST);
+        assert_eq!(idb, SOLO_ID_FIRST + 1);
+        assert_eq!(job.solo_coinbase_id(&a), Some(ida), "same script, same id");
+        assert_eq!(job.solo_script_of(idb).as_deref(), Some(&b[..]));
+        let tx = job.full_coinbase(ida, 20).unwrap();
+        let parsed = ratum::bitcoin::parse_coinbase(&tx).unwrap();
+        let fee = value / 100;
+        let outs: Vec<(u64, Vec<u8>)> =
+            parsed.outputs.iter().map(|o| (o.value, o.script.clone())).collect();
+        assert_eq!(outs[0], (value - fee, a.clone()), "miner gets value minus fee");
+        assert_eq!(outs[1], (fee, ratum::fixtures::p2wpkh(0xfe)), "fee to the fee script");
+        assert!(outs.len() >= 3, "witness commitment follows");
+        // commitments differ per miner: different merkle roots on the same template
+        let ca = job.commitment(ida, 20).unwrap();
+        let cb = job.commitment(idb, 20).unwrap();
+        assert_ne!(ca.merkle_root, cb.merkle_root);
+        // pooled/subsidy ids still work and payout rows describe the solo split
+        assert!(job.full_coinbase(COINBASE_SUBSIDY_ONLY, 20).is_some());
+        let rows = job.payout_rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].value, value - fee);
+        assert!(rows[1].remainder && rows[1].value == fee);
     }
 
     #[test]
