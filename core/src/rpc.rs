@@ -218,9 +218,7 @@ impl Client {
             .ok_or_else(|| Error::BadResponse("no bestblockhash".into()))?;
         let height =
             info["blocks"].as_u64().ok_or_else(|| Error::BadResponse("no blocks".into()))? as u32;
-        let difficulty = info["difficulty"]
-            .as_f64()
-            .ok_or_else(|| Error::BadResponse("no difficulty".into()))?;
+        let difficulty = node_difficulty(&info)?;
         let chain = Chain::parse(
             info["chain"].as_str().ok_or_else(|| Error::BadResponse("no chain".into()))?,
         );
@@ -333,5 +331,57 @@ mod tests {
         ] {
             assert!(!other.is_method_not_found(), "{other} is not a missing method");
         }
+    }
+}
+
+/// The tip difficulty in the unit `getblockchaininfo.difficulty` had before Knots 29.4.2, which
+/// omits the field on a BLAKE2b (header v2) tip and prints `difficulty_blake2b`, the expected
+/// hash count, instead. Read `difficulty` verbatim, else derive from `bits`, else
+/// `difficulty_blake2b / 2^32` scaled to the node's unit (within 0.01% of 29.4.1).
+pub(crate) fn node_difficulty(v: &serde_json::Value) -> Result<f64, Error> {
+    if let Some(d) = v["difficulty"].as_f64() {
+        return Ok(d);
+    }
+    let from_bits = v["bits"]
+        .as_str()
+        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        .and_then(crate::target::difficulty_from_bits)
+        .map(|d| d * NODE_DIFFICULTY_PER_SHARE_DIFFICULTY);
+    if let Some(d) = from_bits {
+        return Ok(d);
+    }
+    if let Some(work) = v["difficulty_blake2b"].as_f64() {
+        return Ok(work / 4_294_967_296.0 * NODE_DIFFICULTY_PER_SHARE_DIFFICULTY);
+    }
+    Err(Error::BadResponse("no difficulty, bits or difficulty_blake2b".into()))
+}
+
+/// `target::difficulty_from_bits` measures against share difficulty 1 (`2^224`); the node
+/// measures against the target of bits `0x1d00ffff` (`0xffff * 2^208`). This converts the first
+/// into the second.
+const NODE_DIFFICULTY_PER_SHARE_DIFFICULTY: f64 = 65_535.0 / 65_536.0;
+
+#[cfg(test)]
+mod node_difficulty_tests {
+    use super::node_difficulty;
+    use serde_json::json;
+
+    #[test]
+    fn the_field_first_then_bits_then_the_work() {
+        assert_eq!(
+            node_difficulty(&json!({ "difficulty": 7.0, "bits": "190141c0" })).unwrap(),
+            7.0
+        );
+        let from_bits = node_difficulty(&json!({ "bits": "190141c0" })).unwrap();
+        let rel = (from_bits - 3_417_233_412.77).abs() / 3_417_233_412.77;
+        assert!(rel < 1e-4, "{from_bits}");
+        let from_work =
+            node_difficulty(&json!({ "difficulty_blake2b": 1.4677129705888563e19 })).unwrap();
+        let rel = (from_work - from_bits).abs() / from_bits;
+        assert!(rel < 1e-4, "{from_work} vs {from_bits}");
+        assert_eq!(
+            node_difficulty(&json!({})).unwrap_err().to_string(),
+            "malformed rpc response: no difficulty, bits or difficulty_blake2b"
+        );
     }
 }
